@@ -6,7 +6,7 @@ The name comes from the Russian word *самиздат* — the clandestine copy
 
 ## Why Samizdat?
 
-Russian DPI infrastructure (TSPU) has evolved to block nearly every existing circumvention protocol. A user running Lantern 9.0.10 can connect to proxy servers but cannot browse any websites — only empty frames load. Log analysis reveals the following active blocking techniques:
+Russian DPI infrastructure (TSPU) has evolved to block nearly every existing circumvention protocol. Live testing reveals the following active blocking techniques:
 
 - **First-packet entropy detection** fingerprinting Shadowsocks and other encrypted protocols
 - **All UDP blocked** at the network level
