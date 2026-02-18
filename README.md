@@ -167,6 +167,54 @@ go run ./cmd/samizdat-server \
     -shortid <hex short id>
 ```
 
+## Architecture
+
+Samizdat is split across two repositories:
+
+### `getlantern/samizdat` (this repo)
+
+The standalone protocol library. Zero sing-box dependencies. Can be integrated into any Go application.
+
+```
+samizdat/
+├── samizdat.go          # Config types and defaults
+├── auth.go              # PSK-based HMAC authentication
+├── client.go            # Client dialer (uTLS + H2 CONNECT)
+├── server.go            # Server listener (auth check + H2 proxy)
+├── h2transport.go       # HTTP/2 multiplexed CONNECT transport
+├── streamconn.go        # net.Conn wrapper over H2 stream
+├── connpool.go          # H2 connection pooling
+├── fragmenter.go        # Geneva-inspired TCP fragmentation
+├── shaper.go            # Traffic shaping (padding + jitter)
+├── masquerade.go        # TCP-level transparent proxy for active probes
+├── samizdat_test.go     # Unit tests
+├── integration_test.go  # Client-server integration tests
+└── cmd/samizdat-server/ # Standalone server binary
+```
+
+### [`getlantern/lantern-box`](https://github.com/getlantern/lantern-box)
+
+Thin wiring layer that registers samizdat as a sing-box outbound/inbound. Only adapter code — maps sing-box options to samizdat config.
+
+## Dependencies
+
+```
+golang.org/x/net/http2                    # HTTP/2 implementation
+golang.org/x/crypto/curve25519           # X25519 for key generation
+golang.org/x/crypto/hkdf                 # Key derivation
+github.com/refraction-networking/utls    # Chrome TLS fingerprint
+```
+
+## References
+
+- Wang et al., "How China Detects and Blocks Shadowsocks," IMC 2020
+- Wu et al., "Detecting TLS-over-TLS with Cross-Layer Analysis," USENIX Security 2024
+- Xue et al., "Cross-Layer RTT Fingerprinting of Encrypted Tunnels," NDSS 2025
+- Bock et al., "Geneva: Evolving Censorship Evasion Strategies," ACM CCS 2019
+- Hoang et al., "Measuring I2P Censorship at a Global Scale," FOCI 2019
+- net4people/bbs #490 — Russia DPI data threshold analysis
+- net4people/bbs #546 — TLS connection count policing
+
 ## Minimal End-to-End Example
 
 The following is a self-contained program that starts a Samizdat server, connects a client through it, and sends data through the tunnel. It generates all credentials and a self-signed certificate on the fly.
@@ -326,54 +374,6 @@ func selfSignedCert() (certPEM, keyPEM []byte) {
 	return
 }
 ```
-
-## Architecture
-
-Samizdat is split across two repositories:
-
-### `getlantern/samizdat` (this repo)
-
-The standalone protocol library. Zero sing-box dependencies. Can be integrated into any Go application.
-
-```
-samizdat/
-├── samizdat.go          # Config types and defaults
-├── auth.go              # PSK-based HMAC authentication
-├── client.go            # Client dialer (uTLS + H2 CONNECT)
-├── server.go            # Server listener (auth check + H2 proxy)
-├── h2transport.go       # HTTP/2 multiplexed CONNECT transport
-├── streamconn.go        # net.Conn wrapper over H2 stream
-├── connpool.go          # H2 connection pooling
-├── fragmenter.go        # Geneva-inspired TCP fragmentation
-├── shaper.go            # Traffic shaping (padding + jitter)
-├── masquerade.go        # TCP-level transparent proxy for active probes
-├── samizdat_test.go     # Unit tests
-├── integration_test.go  # Client-server integration tests
-└── cmd/samizdat-server/ # Standalone server binary
-```
-
-### [`getlantern/lantern-box`](https://github.com/getlantern/lantern-box)
-
-Thin wiring layer that registers samizdat as a sing-box outbound/inbound. Only adapter code — maps sing-box options to samizdat config.
-
-## Dependencies
-
-```
-golang.org/x/net/http2                    # HTTP/2 implementation
-golang.org/x/crypto/curve25519           # X25519 for key generation
-golang.org/x/crypto/hkdf                 # Key derivation
-github.com/refraction-networking/utls    # Chrome TLS fingerprint
-```
-
-## References
-
-- Wang et al., "How China Detects and Blocks Shadowsocks," IMC 2020
-- Wu et al., "Detecting TLS-over-TLS with Cross-Layer Analysis," USENIX Security 2024
-- Xue et al., "Cross-Layer RTT Fingerprinting of Encrypted Tunnels," NDSS 2025
-- Bock et al., "Geneva: Evolving Censorship Evasion Strategies," ACM CCS 2019
-- Hoang et al., "Measuring I2P Censorship at a Global Scale," FOCI 2019
-- net4people/bbs #490 — Russia DPI data threshold analysis
-- net4people/bbs #546 — TLS connection count policing
 
 ## License
 
