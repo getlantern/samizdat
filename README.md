@@ -167,6 +167,166 @@ go run ./cmd/samizdat-server \
     -shortid <hex short id>
 ```
 
+## Minimal End-to-End Example
+
+The following is a self-contained program that starts a Samizdat server, connects a client through it, and sends data through the tunnel. It generates all credentials and a self-signed certificate on the fly.
+
+```go
+package main
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
+	"net"
+	"sync"
+	"time"
+
+	samizdat "github.com/getlantern/samizdat"
+)
+
+func main() {
+	// --- 1. Generate credentials ---
+
+	serverPriv, serverPub, err := samizdat.GenerateKeyPair()
+	if err != nil {
+		log.Fatal(err)
+	}
+	shortID, err := samizdat.GenerateShortID()
+	if err != nil {
+		log.Fatal(err)
+	}
+	certPEM, keyPEM := selfSignedCert()
+
+	// --- 2. Start a TCP echo server (the "destination" behind the proxy) ---
+
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer echoLn.Close()
+
+	go func() {
+		for {
+			c, err := echoLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				io.Copy(c, c) // echo back everything
+			}()
+		}
+	}()
+
+	// --- 3. Start the Samizdat server ---
+
+	server, err := samizdat.NewServer(samizdat.ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{shortID},
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		Handler: func(ctx context.Context, conn net.Conn, destination string) {
+			defer conn.Close()
+			target, err := net.DialTimeout("tcp", destination, 5*time.Second)
+			if err != nil {
+				return
+			}
+			defer target.Close()
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() { defer wg.Done(); io.Copy(target, conn) }()
+			go func() { defer wg.Done(); io.Copy(conn, target) }()
+			wg.Wait()
+		},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	go server.ListenAndServe()
+	defer server.Close()
+	time.Sleep(100 * time.Millisecond) // wait for listener
+
+	// --- 4. Create a Samizdat client ---
+
+	client, err := samizdat.NewClient(samizdat.ClientConfig{
+		ServerAddr:       server.Addr().String(),
+		ServerName:       "localhost",
+		PublicKey:        serverPub,
+		ShortID:          shortID,
+		Fingerprint:      "chrome",
+		Padding:          true,
+		Jitter:           true,
+		TCPFragmentation: false, // disabled for localhost test
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer client.Close()
+
+	// --- 5. Dial through the tunnel to the echo server ---
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := client.DialContext(ctx, "tcp", echoLn.Addr().String())
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	// --- 6. Send and receive data ---
+
+	msg := []byte("Hello from the other side of the tunnel!")
+	if _, err := conn.Write(msg); err != nil {
+		log.Fatal(err)
+	}
+
+	buf := make([]byte, 256)
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Sent:     %s\n", msg)
+	fmt.Printf("Received: %s\n", buf[:n])
+	// Output:
+	// Sent:     Hello from the other side of the tunnel!
+	// Received: Hello from the other side of the tunnel!
+}
+
+// selfSignedCert generates a self-signed TLS certificate for testing.
+func selfSignedCert() (certPEM, keyPEM []byte) {
+	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, _ := x509.MarshalECPrivateKey(priv)
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	return
+}
+```
+
 ## Architecture
 
 Samizdat is split across two repositories:
