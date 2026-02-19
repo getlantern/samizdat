@@ -37,9 +37,6 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if len(config.ShortIDs) == 0 {
 		return nil, fmt.Errorf("at least one ShortID is required")
 	}
-	if config.ListenAddr == "" {
-		return nil, fmt.Errorf("ListenAddr is required")
-	}
 	if config.Handler == nil {
 		return nil, fmt.Errorf("Handler is required")
 	}
@@ -72,12 +69,22 @@ func NewServer(config ServerConfig) (*Server, error) {
 	return s, nil
 }
 
-// ListenAndServe starts accepting connections on the configured address.
+// ListenAndServe creates a TCP listener on the configured ListenAddr and
+// calls Serve. ListenAddr must be set in the ServerConfig.
 func (s *Server) ListenAndServe() error {
+	if s.config.ListenAddr == "" {
+		return fmt.Errorf("ListenAddr is required")
+	}
 	ln, err := net.Listen("tcp", s.config.ListenAddr)
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", s.config.ListenAddr, err)
 	}
+	return s.Serve(ln)
+}
+
+// Serve accepts connections on the given listener. This is useful when the
+// caller manages the listener (e.g. sing-box's listener.Listener).
+func (s *Server) Serve(ln net.Listener) error {
 	s.listener = ln
 
 	for {
