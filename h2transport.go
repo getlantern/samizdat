@@ -172,3 +172,10 @@ func (s *h2StreamRWC) Close() error {
 	})
 	return errors.Join(errs...)
 }
+
+// CloseWrite closes only the write side (pipe writer), sending END_STREAM on
+// the H2 request body while keeping the response body (reader) open to receive
+// remaining data from the server.
+func (s *h2StreamRWC) CloseWrite() error {
+	return s.writer.Close()
+}
