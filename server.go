@@ -244,6 +244,21 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 		}
 
 		s.config.Handler(r.Context(), streamConn, destination)
+
+		// Drain r.Body to ensure the client sends END_STREAM before the
+		// handler returns. Without this, if the stream is still in stateOpen
+		// (client hasn't sent END_STREAM), the H2 server sends RST_STREAM
+		// which can cause the client to lose in-flight response data.
+		// Use a timeout to avoid blocking forever if the client disappears.
+		drainDone := make(chan struct{})
+		go func() {
+			io.Copy(io.Discard, r.Body)
+			close(drainDone)
+		}()
+		select {
+		case <-drainDone:
+		case <-time.After(5 * time.Second):
+		}
 	})
 
 	// Serve directly using the http2.Server
@@ -333,7 +348,10 @@ func (sc *serverStreamConn) Write(b []byte) (int, error) {
 
 func (sc *serverStreamConn) Close() error {
 	sc.once.Do(func() { close(sc.done) })
-	return sc.reader.Close()
+	// Don't close r.Body here. The HTTP handler needs to drain it after
+	// the proxy handler returns to ensure the client sends END_STREAM
+	// before the handler exits (preventing RST_STREAM).
+	return nil
 }
 
 // CloseWrite signals that no more data will be written. For the server-side
