@@ -40,11 +40,8 @@ func NewClient(config ClientConfig) (*Client, error) {
 
 	// Create shaper based on config
 	c.shaper = NewShaper(
-		config.Padding,
 		config.Jitter,
 		config.MaxJitterMs,
-		config.DataThreshold,
-		config.PaddingProfile,
 	)
 
 	// Create connection pool

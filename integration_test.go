@@ -141,7 +141,6 @@ func TestIntegrationClientServer(t *testing.T) {
 		PublicKey:        serverPub,
 		ShortID:          shortID,
 		Fingerprint:      "chrome",
-		Padding:          false, // Disable for test simplicity
 		Jitter:           false,
 		TCPFragmentation: false,
 	})
@@ -378,7 +377,6 @@ func TestIntegrationMultipleStreams(t *testing.T) {
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
-		Padding:          false,
 		Jitter:           false,
 		TCPFragmentation: false,
 	})
@@ -524,7 +522,6 @@ func TestIntegrationHTTPS(t *testing.T) {
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
-		Padding:          false,
 		Jitter:           false,
 		TCPFragmentation: false,
 	})
@@ -652,7 +649,6 @@ func TestIntegrationUpstreamCloseBeforeClientEND(t *testing.T) {
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
-		Padding:          false,
 		Jitter:           false,
 		TCPFragmentation: false,
 	})
@@ -785,7 +781,6 @@ func TestIntegrationSequentialHTTPThenHTTPS(t *testing.T) {
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
-		Padding:          false,
 		Jitter:           false,
 		TCPFragmentation: false,
 	})

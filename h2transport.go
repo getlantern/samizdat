@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -17,8 +18,7 @@ import (
 // h2Transport manages a single TLS+HTTP/2 connection to the server and
 // multiplexes CONNECT tunnels over it as separate H2 streams.
 type h2Transport struct {
-	tlsConn    net.Conn
-	h2Client   *http.Client
+	tlsConn     net.Conn
 	h2Roundtrip http.RoundTripper
 	serverAddr string
 	localAddr  net.Addr
@@ -70,8 +70,20 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 	// Issue CONNECT request
 	pr, pw := io.Pipe()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+t.serverAddr, pr)
+	// Create a detachable context for the H2 CONNECT request. During
+	// RoundTrip we propagate cancellation from the caller's ctx so that
+	// DialContext timeouts are respected. After RoundTrip succeeds, we
+	// stop propagation so that post-establishment context cancellation
+	// (e.g. sing-box canceling ctx when bidirectional copy finishes)
+	// doesn't reach the H2 transport's writeRequest goroutine — which
+	// would send RST_STREAM and disrupt other multiplexed streams.
+	tunnelCtx, tunnelCancel := context.WithCancel(context.Background())
+	stop := context.AfterFunc(ctx, func() { tunnelCancel() })
+
+	req, err := http.NewRequestWithContext(tunnelCtx, http.MethodConnect, "https://"+t.serverAddr, pr)
 	if err != nil {
+		stop()
+		tunnelCancel()
 		pw.Close()
 		return nil, fmt.Errorf("creating CONNECT request: %w", err)
 	}
@@ -80,9 +92,15 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 
 	resp, err := t.h2Roundtrip.RoundTrip(req)
 	if err != nil {
+		stop()
+		tunnelCancel()
 		pw.Close()
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
 	}
+
+	// Detach: stop propagating caller's context cancellation into the
+	// H2 stream now that the tunnel is established.
+	stop()
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -94,9 +112,10 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 
 	// Create a ReadWriteCloser that reads from the response body and writes to the pipe
 	rwc := &h2StreamRWC{
-		reader:    resp.Body,
-		writer:    pw,
-		transport: t,
+		reader:       resp.Body,
+		writer:       pw,
+		transport:    t,
+		tunnelCancel: tunnelCancel,
 	}
 
 	conn := newStreamConn(
@@ -145,11 +164,12 @@ func (t *h2Transport) isClosed() bool {
 // h2StreamRWC wraps a response body (reader) and pipe writer as an
 // io.ReadWriteCloser for use as a bidirectional stream.
 type h2StreamRWC struct {
-	reader      io.ReadCloser
-	writer      io.WriteCloser
-	transport   *h2Transport
-	once        sync.Once
-	writerOnce  sync.Once
+	reader       io.ReadCloser
+	writer       io.WriteCloser
+	transport    *h2Transport
+	tunnelCancel context.CancelFunc // releases the detached tunnel context
+	once         sync.Once
+	writerOnce   sync.Once
 }
 
 func (s *h2StreamRWC) Read(b []byte) (int, error) {
@@ -161,17 +181,33 @@ func (s *h2StreamRWC) Write(b []byte) (int, error) {
 }
 
 func (s *h2StreamRWC) Close() error {
-	var errs []error
+	var closeErr error
 	s.once.Do(func() {
-		s.transport.activeStreams.Add(-1)
-		if err := s.closeWriter(); err != nil {
-			errs = append(errs, err)
-		}
-		if err := s.reader.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		closeErr = s.closeWriter()
+
+		// Do NOT close s.reader (resp.Body) synchronously — that calls
+		// abortStream which sends RST_STREAM, disrupting other multiplexed
+		// streams. Instead, drain resp.Body to EOF in the background so the
+		// H2 stream completes cleanly (server sends END_STREAM, writeRequest
+		// goroutine finishes via forgetStreamID). The drain also ensures the
+		// response body is closed and resources are released promptly even if
+		// the caller didn't read to EOF.
+		go func() {
+			// Use a timeout to prevent permanent goroutine leak if the
+			// server never sends END_STREAM (crash, network partition).
+			timer := time.AfterFunc(5*time.Second, func() {
+				s.reader.Close()
+			})
+			io.Copy(io.Discard, s.reader)
+			timer.Stop()
+			s.reader.Close()
+			if s.tunnelCancel != nil {
+				s.tunnelCancel()
+			}
+			s.transport.activeStreams.Add(-1)
+		}()
 	})
-	return errors.Join(errs...)
+	return closeErr
 }
 
 // closeWriter closes the writer at most once, safe to call from both

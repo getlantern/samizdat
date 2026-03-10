@@ -3,6 +3,7 @@ package samizdat
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,9 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// ErrServerClosed is the cause set on the server's context when Close is called.
+var ErrServerClosed = errors.New("server closed")
+
 // Server accepts Samizdat connections, authenticates them via Reality-style
 // auth in the TLS ClientHello, and proxies authenticated HTTP/2 CONNECT
 // tunnels. Non-authenticated connections are transparently proxied to the
@@ -25,7 +29,7 @@ type Server struct {
 	listener     net.Listener
 	masquerade   *Masquerade
 	ctx          context.Context
-	cancel       context.CancelFunc
+	cancel       context.CancelCauseFunc
 	wg           sync.WaitGroup
 }
 
@@ -49,7 +53,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("deriving server public key: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 
 	s := &Server{
 		config:       config,
@@ -110,7 +114,7 @@ func (s *Server) Serve(ln net.Listener) error {
 
 // Close shuts down the server.
 func (s *Server) Close() error {
-	s.cancel()
+	s.cancel(ErrServerClosed)
 	var err error
 	if s.listener != nil {
 		err = s.listener.Close()
@@ -250,7 +254,6 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 		streamConn := &serverStreamConn{
 			reader: body,
 			writer: flushWriter{w: w, flusher: flusher},
-			done:   make(chan struct{}),
 		}
 
 		s.config.Handler(r.Context(), streamConn, destination)
@@ -268,10 +271,12 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 			log.Printf("[samizdat] CONNECT %s: drain finished, n=%d, err=%v", destination, n, err)
 			close(drainDone)
 		}()
+		timer := time.NewTimer(5 * time.Second)
 		select {
 		case <-drainDone:
+			timer.Stop()
 			log.Printf("[samizdat] CONNECT %s: drain completed, handler returning cleanly", destination)
-		case <-time.After(5 * time.Second):
+		case <-timer.C:
 			log.Printf("[samizdat] CONNECT %s: drain timeout, closing body", destination)
 			// Timeout: close the body to unblock the drain goroutine.
 			body.Close()
@@ -350,8 +355,6 @@ func (rc *replayConn) Read(b []byte) (int, error) {
 type serverStreamConn struct {
 	reader io.ReadCloser
 	writer flushWriter
-	done   chan struct{}
-	once   sync.Once
 	closed atomic.Bool
 }
 
@@ -375,7 +378,6 @@ func (sc *serverStreamConn) Write(b []byte) (int, error) {
 
 func (sc *serverStreamConn) Close() error {
 	sc.closed.Store(true)
-	sc.once.Do(func() { close(sc.done) })
 	// Do NOT close r.Body here. The HTTP handler holds its own reference
 	// to the body and will drain it after the proxy handler returns, waiting
 	// for the client to send END_STREAM. Closing it here would defeat the
