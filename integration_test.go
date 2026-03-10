@@ -694,6 +694,148 @@ func TestIntegrationUpstreamCloseBeforeClientEND(t *testing.T) {
 	}
 }
 
+// TestIntegrationSequentialHTTPThenHTTPS mimics the e2e test scenario:
+// first an HTTP request, then an HTTPS request through the same H2 connection.
+// This catches issues where the first stream's cleanup disrupts the second stream.
+func TestIntegrationSequentialHTTPThenHTTPS(t *testing.T) {
+	serverPriv, serverPub, _ := GenerateKeyPair()
+	shortID, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+
+	// Start a plain HTTP server
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "Hello from HTTP!")
+	})
+	httpServer := &http.Server{Handler: httpMux}
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("HTTP listen: %v", err)
+	}
+	defer httpLn.Close()
+	go httpServer.Serve(httpLn)
+	defer httpServer.Close()
+
+	// Start an HTTPS server
+	destCertPEM, destKeyPEM := generateSelfSignedCert(t)
+	destCert, err := tls.X509KeyPair(destCertPEM, destKeyPEM)
+	if err != nil {
+		t.Fatalf("loading dest cert: %v", err)
+	}
+	httpsMux := http.NewServeMux()
+	httpsMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "Hello from HTTPS!")
+	})
+	httpsServer := &http.Server{
+		Handler: httpsMux,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{destCert},
+		},
+	}
+	httpsLn, err := tls.Listen("tcp", "127.0.0.1:0", httpsServer.TLSConfig)
+	if err != nil {
+		t.Fatalf("HTTPS listen: %v", err)
+	}
+	defer httpsLn.Close()
+	go httpsServer.Serve(httpsLn)
+	defer httpsServer.Close()
+
+	// Start Samizdat server
+	server, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{shortID},
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		Handler: func(ctx context.Context, conn net.Conn, destination string) {
+			defer conn.Close()
+			target, err := net.DialTimeout("tcp", destination, 5*time.Second)
+			if err != nil {
+				return
+			}
+			defer target.Close()
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				io.Copy(target, conn)
+				if cw, ok := target.(interface{ CloseWrite() error }); ok {
+					cw.CloseWrite()
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				io.Copy(conn, target)
+				if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+					cw.CloseWrite()
+				}
+			}()
+			wg.Wait()
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	go server.ListenAndServe()
+	defer server.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := NewClient(ClientConfig{
+		ServerAddr:       server.Addr().String(),
+		ServerName:       "test.example.com",
+		PublicKey:        serverPub,
+		ShortID:          shortID,
+		Padding:          false,
+		Jitter:           false,
+		TCPFragmentation: false,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: client.DialContext,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	// Sequential: HTTP first, then HTTPS (same H2 connection)
+	for i := 0; i < 5; i++ {
+		// HTTP request
+		resp, err := httpClient.Get("http://" + httpLn.Addr().String() + "/")
+		if err != nil {
+			t.Fatalf("iteration %d HTTP GET: %v", i, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("iteration %d HTTP read: %v", i, err)
+		}
+		if string(body) != "Hello from HTTP!" {
+			t.Fatalf("iteration %d HTTP body = %q, want %q", i, body, "Hello from HTTP!")
+		}
+
+		// HTTPS request (same client, same H2 connection to server)
+		resp, err = httpClient.Get("https://" + httpsLn.Addr().String() + "/")
+		if err != nil {
+			t.Fatalf("iteration %d HTTPS GET: %v", i, err)
+		}
+		body, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("iteration %d HTTPS read: %v", i, err)
+		}
+		if string(body) != "Hello from HTTPS!" {
+			t.Fatalf("iteration %d HTTPS body = %q, want %q", i, body, "Hello from HTTPS!")
+		}
+	}
+}
+
 // Verify TLS cert is used but not PKI-verified (InsecureSkipVerify)
 func TestIntegrationTLSConfig(t *testing.T) {
 	serverPriv, _, _ := GenerateKeyPair()

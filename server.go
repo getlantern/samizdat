@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -230,6 +231,8 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 			return
 		}
 
+		log.Printf("[samizdat] CONNECT %s: handler started", destination)
+
 		// Hijack the connection to get raw bidirectional stream
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
@@ -252,6 +255,8 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 
 		s.config.Handler(r.Context(), streamConn, destination)
 
+		log.Printf("[samizdat] CONNECT %s: handler returned, starting drain", destination)
+
 		// Drain r.Body to ensure the client sends END_STREAM before the
 		// handler returns. Without this, if the stream is still in stateOpen
 		// (client hasn't sent END_STREAM), the H2 server sends RST_STREAM
@@ -259,12 +264,15 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 		// Use a timeout to avoid blocking forever if the client disappears.
 		drainDone := make(chan struct{})
 		go func() {
-			io.Copy(io.Discard, body)
+			n, err := io.Copy(io.Discard, body)
+			log.Printf("[samizdat] CONNECT %s: drain finished, n=%d, err=%v", destination, n, err)
 			close(drainDone)
 		}()
 		select {
 		case <-drainDone:
+			log.Printf("[samizdat] CONNECT %s: drain completed, handler returning cleanly", destination)
 		case <-time.After(5 * time.Second):
+			log.Printf("[samizdat] CONNECT %s: drain timeout, closing body", destination)
 			// Timeout: close the body to unblock the drain goroutine.
 			body.Close()
 			<-drainDone
@@ -272,9 +280,11 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 	})
 
 	// Serve directly using the http2.Server
+	log.Printf("[samizdat] serveH2: starting ServeConn")
 	h2Server.ServeConn(tlsConn, &http2.ServeConnOpts{
 		Handler: handler,
 	})
+	log.Printf("[samizdat] serveH2: ServeConn returned")
 }
 
 // readClientHelloRecord reads a complete TLS record from the connection.
