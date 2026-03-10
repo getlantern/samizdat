@@ -70,13 +70,20 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 	// Issue CONNECT request
 	pr, pw := io.Pipe()
 
-	// Use a detached context for the H2 CONNECT request. The caller's ctx
-	// (from sing-box's DialContext) may be canceled when the connection's
-	// bidirectional copy finishes. If that cancellation reaches the H2
-	// transport's writeRequest goroutine, it sends RST_STREAM which kills
-	// the entire H2 connection — disrupting other active streams.
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, "https://"+t.serverAddr, pr)
+	// Create a detachable context for the H2 CONNECT request. During
+	// RoundTrip we propagate cancellation from the caller's ctx so that
+	// DialContext timeouts are respected. After RoundTrip succeeds, we
+	// stop propagation so that post-establishment context cancellation
+	// (e.g. sing-box canceling ctx when bidirectional copy finishes)
+	// doesn't reach the H2 transport's writeRequest goroutine — which
+	// would send RST_STREAM and disrupt other multiplexed streams.
+	tunnelCtx, tunnelCancel := context.WithCancel(context.Background())
+	stop := context.AfterFunc(ctx, func() { tunnelCancel() })
+
+	req, err := http.NewRequestWithContext(tunnelCtx, http.MethodConnect, "https://"+t.serverAddr, pr)
 	if err != nil {
+		stop()
+		tunnelCancel()
 		pw.Close()
 		return nil, fmt.Errorf("creating CONNECT request: %w", err)
 	}
@@ -85,9 +92,15 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 
 	resp, err := t.h2Roundtrip.RoundTrip(req)
 	if err != nil {
+		stop()
+		tunnelCancel()
 		pw.Close()
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
 	}
+
+	// Detach: stop propagating caller's context cancellation into the
+	// H2 stream now that the tunnel is established.
+	stop()
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -99,9 +112,10 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 
 	// Create a ReadWriteCloser that reads from the response body and writes to the pipe
 	rwc := &h2StreamRWC{
-		reader:    resp.Body,
-		writer:    pw,
-		transport: t,
+		reader:       resp.Body,
+		writer:       pw,
+		transport:    t,
+		tunnelCancel: tunnelCancel,
 	}
 
 	conn := newStreamConn(
@@ -150,11 +164,12 @@ func (t *h2Transport) isClosed() bool {
 // h2StreamRWC wraps a response body (reader) and pipe writer as an
 // io.ReadWriteCloser for use as a bidirectional stream.
 type h2StreamRWC struct {
-	reader      io.ReadCloser
-	writer      io.WriteCloser
-	transport   *h2Transport
-	once        sync.Once
-	writerOnce  sync.Once
+	reader       io.ReadCloser
+	writer       io.WriteCloser
+	transport    *h2Transport
+	tunnelCancel context.CancelFunc // releases the detached tunnel context
+	once         sync.Once
+	writerOnce   sync.Once
 }
 
 func (s *h2StreamRWC) Read(b []byte) (int, error) {
@@ -170,19 +185,21 @@ func (s *h2StreamRWC) Close() error {
 	s.once.Do(func() {
 		s.transport.activeStreams.Add(-1)
 		closeErr = s.closeWriter()
-		// Do NOT close s.reader (resp.Body) here. Closing resp.Body calls
-		// abortStream(errClosedResponseBody) which sends RST_STREAM on the
-		// H2 stream. This disrupts the clean stream lifecycle: the Go http2
-		// transport's writeRequest goroutine is waiting for the server's
-		// END_STREAM (peerClosed), and aborting it causes RST_STREAM which
-		// can interfere with other streams on the same H2 connection.
-		//
-		// Instead, we only close the pipe writer (via closeWriter) to send
-		// END_STREAM on the request body. The writeRequest goroutine then
-		// waits for the server's END_STREAM, completes cleanly, and removes
-		// the stream from cc.streams via forgetStreamID. The resp.Body's
-		// backing bufPipe is closed during cleanupWriteRequest, so resources
-		// are properly released.
+
+		// Do NOT close s.reader (resp.Body) synchronously — that calls
+		// abortStream which sends RST_STREAM, disrupting other multiplexed
+		// streams. Instead, drain resp.Body to EOF in the background so the
+		// H2 stream completes cleanly (server sends END_STREAM, writeRequest
+		// goroutine finishes via forgetStreamID). The drain also ensures the
+		// response body is closed and resources are released promptly even if
+		// the caller didn't read to EOF.
+		go func() {
+			io.Copy(io.Discard, s.reader)
+			s.reader.Close()
+			if s.tunnelCancel != nil {
+				s.tunnelCancel()
+			}
+		}()
 	})
 	return closeErr
 }

@@ -15,6 +15,9 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// ErrServerClosed is the cause set on the server's context when Close is called.
+var ErrServerClosed = errors.New("server closed")
+
 // Server accepts Samizdat connections, authenticates them via Reality-style
 // auth in the TLS ClientHello, and proxies authenticated HTTP/2 CONNECT
 // tunnels. Non-authenticated connections are transparently proxied to the
@@ -110,7 +113,7 @@ func (s *Server) Serve(ln net.Listener) error {
 
 // Close shuts down the server.
 func (s *Server) Close() error {
-	s.cancel(errors.New("server closed"))
+	s.cancel(ErrServerClosed)
 	var err error
 	if s.listener != nil {
 		err = s.listener.Close()
