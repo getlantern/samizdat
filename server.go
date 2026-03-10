@@ -366,10 +366,13 @@ func (sc *serverStreamConn) Write(b []byte) (int, error) {
 func (sc *serverStreamConn) Close() error {
 	sc.closed.Store(true)
 	sc.once.Do(func() { close(sc.done) })
-	// Close r.Body to unblock any in-flight Read calls. The HTTP handler
-	// will still drain any remaining buffered data from r.Body after this
-	// returns (it holds its own reference to the body).
-	return sc.reader.Close()
+	// Do NOT close r.Body here. The HTTP handler holds its own reference
+	// to the body and will drain it after the proxy handler returns, waiting
+	// for the client to send END_STREAM. Closing it here would defeat the
+	// drain and cause the H2 server to send RST_STREAM.
+	// The upload goroutine exits due to a write error (not a blocked read),
+	// so there are no in-flight reads on r.Body to unblock.
+	return nil
 }
 
 // CloseWrite signals that no more data will be written. For the server-side
