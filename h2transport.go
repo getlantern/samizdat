@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -17,8 +18,7 @@ import (
 // h2Transport manages a single TLS+HTTP/2 connection to the server and
 // multiplexes CONNECT tunnels over it as separate H2 streams.
 type h2Transport struct {
-	tlsConn    net.Conn
-	h2Client   *http.Client
+	tlsConn     net.Conn
 	h2Roundtrip http.RoundTripper
 	serverAddr string
 	localAddr  net.Addr
@@ -183,7 +183,6 @@ func (s *h2StreamRWC) Write(b []byte) (int, error) {
 func (s *h2StreamRWC) Close() error {
 	var closeErr error
 	s.once.Do(func() {
-		s.transport.activeStreams.Add(-1)
 		closeErr = s.closeWriter()
 
 		// Do NOT close s.reader (resp.Body) synchronously — that calls
@@ -194,11 +193,18 @@ func (s *h2StreamRWC) Close() error {
 		// response body is closed and resources are released promptly even if
 		// the caller didn't read to EOF.
 		go func() {
+			// Use a timeout to prevent permanent goroutine leak if the
+			// server never sends END_STREAM (crash, network partition).
+			timer := time.AfterFunc(5*time.Second, func() {
+				s.reader.Close()
+			})
 			io.Copy(io.Discard, s.reader)
+			timer.Stop()
 			s.reader.Close()
 			if s.tunnelCancel != nil {
 				s.tunnelCancel()
 			}
+			s.transport.activeStreams.Add(-1)
 		}()
 	})
 	return closeErr

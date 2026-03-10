@@ -251,7 +251,6 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 		streamConn := &serverStreamConn{
 			reader: body,
 			writer: flushWriter{w: w, flusher: flusher},
-			done:   make(chan struct{}),
 		}
 
 		s.config.Handler(r.Context(), streamConn, destination)
@@ -266,9 +265,11 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 			io.Copy(io.Discard, body)
 			close(drainDone)
 		}()
+		timer := time.NewTimer(5 * time.Second)
 		select {
 		case <-drainDone:
-		case <-time.After(5 * time.Second):
+			timer.Stop()
+		case <-timer.C:
 			// Timeout: close the body to unblock the drain goroutine.
 			body.Close()
 			<-drainDone
@@ -344,8 +345,6 @@ func (rc *replayConn) Read(b []byte) (int, error) {
 type serverStreamConn struct {
 	reader io.ReadCloser
 	writer flushWriter
-	done   chan struct{}
-	once   sync.Once
 	closed atomic.Bool
 }
 
@@ -369,7 +368,6 @@ func (sc *serverStreamConn) Write(b []byte) (int, error) {
 
 func (sc *serverStreamConn) Close() error {
 	sc.closed.Store(true)
-	sc.once.Do(func() { close(sc.done) })
 	// Do NOT close r.Body here. The HTTP handler holds its own reference
 	// to the body and will drain it after the proxy handler returns, waiting
 	// for the client to send END_STREAM. Closing it here would defeat the

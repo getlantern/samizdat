@@ -415,11 +415,12 @@ func TestStreamConnCloseWriteNoSupport(t *testing.T) {
 func TestH2StreamRWCCloseWriteThenClose(t *testing.T) {
 	pr, pw := io.Pipe()
 	rwc := &h2StreamRWC{
-		reader: io.NopCloser(pr),
+		reader: pr,
 		writer: pw,
 		transport: &h2Transport{
 			maxStreams: 100,
 		},
+		tunnelCancel: func() {},
 	}
 	rwc.transport.activeStreams.Add(1)
 
