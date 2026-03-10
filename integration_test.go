@@ -564,6 +564,136 @@ func TestIntegrationHTTPS(t *testing.T) {
 	}
 }
 
+// TestIntegrationUpstreamCloseBeforeClientEND tests the RST_STREAM race:
+// when the upstream (destination) closes quickly after sending a response,
+// the H2 handler may return before the client sends END_STREAM on its
+// request body. Without the r.Body drain, this causes RST_STREAM which
+// can truncate in-flight response data on the client side.
+func TestIntegrationUpstreamCloseBeforeClientEND(t *testing.T) {
+	serverPriv, serverPub, _ := GenerateKeyPair()
+	shortID, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+
+	// Start a TCP server that sends a response and immediately closes,
+	// simulating a destination that finishes before the client.
+	responseLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("response listener: %v", err)
+	}
+	defer responseLn.Close()
+
+	responseData := []byte("RESPONSE-DATA-THAT-MUST-NOT-BE-LOST")
+	go func() {
+		for {
+			conn, err := responseLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				// Read a small amount (simulating request receipt)
+				buf := make([]byte, 256)
+				conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				conn.Read(buf)
+				// Send response and close immediately (upstream done)
+				conn.Write(responseData)
+				conn.Close()
+			}()
+		}
+	}()
+
+	responseAddr := responseLn.Addr().String()
+
+	// Start Samizdat server with a handler that does bidirectional copy.
+	// The upload direction will get a write error when trying to forward
+	// data to the already-closed upstream, which is the trigger for the
+	// RST_STREAM race.
+	server, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{shortID},
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		Handler: func(ctx context.Context, conn net.Conn, destination string) {
+			defer conn.Close()
+			target, err := net.DialTimeout("tcp", destination, 5*time.Second)
+			if err != nil {
+				return
+			}
+			defer target.Close()
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				io.Copy(target, conn)
+				if cw, ok := target.(interface{ CloseWrite() error }); ok {
+					cw.CloseWrite()
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				io.Copy(conn, target)
+				if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+					cw.CloseWrite()
+				}
+			}()
+			wg.Wait()
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	go server.ListenAndServe()
+	defer server.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := NewClient(ClientConfig{
+		ServerAddr:       server.Addr().String(),
+		ServerName:       "test.example.com",
+		PublicKey:        serverPub,
+		ShortID:          shortID,
+		Padding:          false,
+		Jitter:           false,
+		TCPFragmentation: false,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	// Run multiple iterations to exercise the race.
+	for i := 0; i < 10; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		conn, err := client.DialContext(ctx, "tcp", responseAddr)
+		if err != nil {
+			cancel()
+			t.Fatalf("iteration %d: DialContext: %v", i, err)
+		}
+
+		// Send a request, then half-close the write side. This sends
+		// END_STREAM on the H2 request body, which is what happens when
+		// curl finishes sending and closes its TCP connection.
+		conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
+		if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		}
+
+		// Read the full response — this is where RST_STREAM would cause
+		// an error or truncated data without the fix.
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		got, err := io.ReadAll(conn)
+		cancel()
+		conn.Close()
+
+		if err != nil {
+			t.Fatalf("iteration %d: ReadAll: %v", i, err)
+		}
+		if string(got) != string(responseData) {
+			t.Fatalf("iteration %d: got %q, want %q", i, got, responseData)
+		}
+	}
+}
+
 // Verify TLS cert is used but not PKI-verified (InsecureSkipVerify)
 func TestIntegrationTLSConfig(t *testing.T) {
 	serverPriv, _, _ := GenerateKeyPair()
