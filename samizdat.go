@@ -34,10 +34,8 @@ type ClientConfig struct {
 	Fingerprint string // "chrome" (default), "firefox", "safari"
 
 	// Traffic shaping
-	Padding        bool   // enable H2 DATA frame padding (default: true)
-	Jitter         bool   // enable timing jitter (default: true)
-	MaxJitterMs    int    // max jitter in ms (default: 30)
-	PaddingProfile string // "chrome", "firefox" (default: "chrome")
+	Jitter      bool // enable timing jitter (default: true)
+	MaxJitterMs int  // max jitter in ms (default: 30)
 
 	// TCP fragmentation (Geneva-inspired)
 	TCPFragmentation    bool // fragment ClientHello across TCP segments (default: true)
@@ -47,9 +45,6 @@ type ClientConfig struct {
 	MaxStreamsPerConn int           // max H2 streams per TCP conn (default: 100)
 	IdleTimeout      time.Duration // close idle connections after (default: 5m)
 	ConnectTimeout   time.Duration // TCP+TLS connect timeout (default: 15s)
-
-	// Russia-specific evasion
-	DataThreshold int // bytes before aggressive padding (default: 14000)
 
 	// Optional: custom dialer for the underlying TCP connection
 	Dialer DialFunc
@@ -63,9 +58,6 @@ func (c *ClientConfig) applyDefaults() {
 	if c.MaxJitterMs == 0 {
 		c.MaxJitterMs = 30
 	}
-	if c.PaddingProfile == "" {
-		c.PaddingProfile = "chrome"
-	}
 	if c.MaxStreamsPerConn == 0 {
 		c.MaxStreamsPerConn = 100
 	}
@@ -74,9 +66,6 @@ func (c *ClientConfig) applyDefaults() {
 	}
 	if c.ConnectTimeout == 0 {
 		c.ConnectTimeout = 15 * time.Second
-	}
-	if c.DataThreshold == 0 {
-		c.DataThreshold = 14000
 	}
 }
 

@@ -75,9 +75,7 @@ The ClientHello is split across multiple TCP segments at the SNI field boundary 
 
 ### Traffic Shaping
 
-- **Padding**: H2 DATA frames are padded to match Chrome's traffic size distribution (4 buckets: small 0-128B, medium 128-1KB, large 1-4KB, XL 4-16KB)
 - **Timing jitter**: 1-30ms random delay on outgoing frames defeats cross-layer RTT fingerprinting (NDSS 2025)
-- **Threshold evasion**: After ~14KB on a connection, padding ratio increases and noise frames are interleaved
 
 ### H2 Multiplexing
 
@@ -118,7 +116,6 @@ client, err := samizdat.NewClient(samizdat.ClientConfig{
     PublicKey:   serverPublicKey,             // 32-byte X25519 public key
     ShortID:     shortID,                    // 8-byte pre-shared identifier
     Fingerprint: "chrome",                   // uTLS fingerprint
-    Padding:     true,                       // traffic shaping
     Jitter:      true,                       // timing jitter
     TCPFragmentation: true,                  // Geneva-style fragmentation
 })
@@ -313,7 +310,6 @@ func main() {
 		PublicKey:        serverPub,
 		ShortID:          shortID,
 		Fingerprint:      "chrome",
-		Padding:          true,
 		Jitter:           true,
 		TCPFragmentation: false, // disabled for localhost test
 	})

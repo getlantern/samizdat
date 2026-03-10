@@ -181,7 +181,7 @@ func TestFragmenterFragments(t *testing.T) {
 // --- Shaper tests ---
 
 func TestShaperNoOp(t *testing.T) {
-	shaper := NewShaper(false, false, 30, 14000, "chrome")
+	shaper := NewShaper(false, 30)
 	var buf bytes.Buffer
 	data := []byte("test data")
 
@@ -197,22 +197,6 @@ func TestShaperNoOp(t *testing.T) {
 	}
 }
 
-func TestShaperPadding(t *testing.T) {
-	shaper := NewShaper(true, false, 30, 14000, "chrome")
-	var buf bytes.Buffer
-	data := []byte("short")
-
-	n, err := shaper.Write(&buf, data)
-	if err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if n != len(data) {
-		t.Errorf("reported write = %d, want original length %d", n, len(data))
-	}
-	if buf.Len() < len(data) {
-		t.Errorf("padded size %d should be >= original size %d", buf.Len(), len(data))
-	}
-}
 
 func TestRecordFragmenter(t *testing.T) {
 	rf := NewRecordFragmenter(true)
@@ -511,9 +495,6 @@ func TestClientConfigDefaults(t *testing.T) {
 	}
 	if config.ConnectTimeout != 15*time.Second {
 		t.Errorf("ConnectTimeout = %v, want 15s", config.ConnectTimeout)
-	}
-	if config.DataThreshold != 14000 {
-		t.Errorf("DataThreshold = %d, want 14000", config.DataThreshold)
 	}
 }
 

@@ -2,138 +2,39 @@ package samizdat
 
 import (
 	"io"
-	"sync"
-	"sync/atomic"
 	"time"
 )
 
-// Shaper implements traffic shaping for H2 DATA frames to make traffic
-// patterns match those of a real browser. It adds padding to frames and
-// introduces timing jitter to defeat cross-layer RTT fingerprinting.
+// Shaper implements traffic shaping for H2 streams. It introduces timing
+// jitter to defeat cross-layer RTT fingerprinting.
 type Shaper struct {
-	padding        bool
-	jitter         bool
-	maxJitterMs    int
-	dataThreshold  int
-	paddingProfile string
-
-	totalBytes atomic.Int64
-
-	mu sync.Mutex
+	jitter      bool
+	maxJitterMs int
 }
 
 // NewShaper creates a traffic shaper with the given configuration.
-func NewShaper(padding, jitter bool, maxJitterMs, dataThreshold int, paddingProfile string) *Shaper {
+func NewShaper(jitter bool, maxJitterMs int) *Shaper {
 	if maxJitterMs <= 0 {
 		maxJitterMs = 30
 	}
-	if dataThreshold <= 0 {
-		dataThreshold = 14000
-	}
-	if paddingProfile == "" {
-		paddingProfile = "chrome"
-	}
 	return &Shaper{
-		padding:        padding,
-		jitter:         jitter,
-		maxJitterMs:    maxJitterMs,
-		dataThreshold:  dataThreshold,
-		paddingProfile: paddingProfile,
+		jitter:      jitter,
+		maxJitterMs: maxJitterMs,
 	}
 }
 
-// Write shapes the outgoing data: adds padding and timing jitter, then
+// Write shapes the outgoing data by introducing timing jitter, then
 // writes to the underlying writer. This is called from streamConn.Write.
 func (s *Shaper) Write(w io.Writer, data []byte) (int, error) {
-	if !s.padding && !s.jitter {
+	if !s.jitter {
 		return w.Write(data)
 	}
 
-	totalSent := s.totalBytes.Load()
-
 	// Apply timing jitter (1-maxJitterMs random delay)
-	if s.jitter {
-		jitterMs := randomInt(1, s.maxJitterMs+1)
-		time.Sleep(time.Duration(jitterMs) * time.Millisecond)
-	}
+	jitterMs := randomInt(1, s.maxJitterMs+1)
+	time.Sleep(time.Duration(jitterMs) * time.Millisecond)
 
-	dataLen := len(data)
-
-	// Determine if we've crossed the threshold for aggressive padding
-	aggressive := totalSent > int64(s.dataThreshold)
-
-	if s.padding && dataLen > 0 {
-		paddedData := s.padData(data, aggressive)
-		n, err := w.Write(paddedData)
-		if err != nil {
-			return 0, err
-		}
-		// Report original data length as written
-		if n >= dataLen {
-			s.totalBytes.Add(int64(n))
-			return dataLen, nil
-		}
-		return n, err
-	}
-
-	n, err := w.Write(data)
-	s.totalBytes.Add(int64(n))
-	return n, err
-}
-
-// padData adds padding to match Chrome traffic size distribution.
-// Chrome H2 DATA frame size buckets:
-//   - Small: 0-128B (15% of frames)
-//   - Medium: 128-1024B (25%)
-//   - Large: 1-4KB (35%)
-//   - XL: 4-16KB (25%)
-//
-// When aggressive=true (above data threshold), padding increases by 50%.
-func (s *Shaper) padData(data []byte, aggressive bool) []byte {
-	targetSize := s.chooseTargetSize(len(data), aggressive)
-	if targetSize <= len(data) {
-		return data
-	}
-
-	// Pad with zero bytes to reach the target size
-	padded := make([]byte, targetSize)
-	copy(padded, data)
-	// Remaining bytes are zero-padded
-	return padded
-}
-
-// chooseTargetSize picks a target frame size based on the Chrome traffic
-// profile distribution.
-func (s *Shaper) chooseTargetSize(dataLen int, aggressive bool) int {
-	// If data already exceeds our largest bucket, don't pad further
-	if dataLen >= 16384 {
-		return dataLen
-	}
-
-	// Pick a target size from the next bucket up
-	var target int
-	switch {
-	case dataLen < 128:
-		// Pad small frames to a random size in [dataLen, 256)
-		target = randomInt(dataLen, 256)
-	case dataLen < 1024:
-		// Pad medium frames to a random size in [dataLen, 2048)
-		target = randomInt(dataLen, 2048)
-	case dataLen < 4096:
-		// Pad large frames to a random size in [dataLen, 8192)
-		target = randomInt(dataLen, 8192)
-	default:
-		// XL: pad to a random size in [dataLen, 16384)
-		target = randomInt(dataLen, 16384)
-	}
-
-	if aggressive {
-		// Increase padding by ~50% when above data threshold
-		extra := randomInt(target/4, target/2+1)
-		target += extra
-	}
-
-	return target
+	return w.Write(data)
 }
 
 // RecordFragmenter splits inner TLS records across multiple H2 DATA frames
