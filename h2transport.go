@@ -70,7 +70,12 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 	// Issue CONNECT request
 	pr, pw := io.Pipe()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+t.serverAddr, pr)
+	// Use a detached context for the H2 CONNECT request. The caller's ctx
+	// (from sing-box's DialContext) may be canceled when the connection's
+	// bidirectional copy finishes. If that cancellation reaches the H2
+	// transport's writeRequest goroutine, it sends RST_STREAM which kills
+	// the entire H2 connection — disrupting other active streams.
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodConnect, "https://"+t.serverAddr, pr)
 	if err != nil {
 		pw.Close()
 		return nil, fmt.Errorf("creating CONNECT request: %w", err)
@@ -161,17 +166,25 @@ func (s *h2StreamRWC) Write(b []byte) (int, error) {
 }
 
 func (s *h2StreamRWC) Close() error {
-	var errs []error
+	var closeErr error
 	s.once.Do(func() {
 		s.transport.activeStreams.Add(-1)
-		if err := s.closeWriter(); err != nil {
-			errs = append(errs, err)
-		}
-		if err := s.reader.Close(); err != nil {
-			errs = append(errs, err)
-		}
+		closeErr = s.closeWriter()
+		// Do NOT close s.reader (resp.Body) here. Closing resp.Body calls
+		// abortStream(errClosedResponseBody) which sends RST_STREAM on the
+		// H2 stream. This disrupts the clean stream lifecycle: the Go http2
+		// transport's writeRequest goroutine is waiting for the server's
+		// END_STREAM (peerClosed), and aborting it causes RST_STREAM which
+		// can interfere with other streams on the same H2 connection.
+		//
+		// Instead, we only close the pipe writer (via closeWriter) to send
+		// END_STREAM on the request body. The writeRequest goroutine then
+		// waits for the server's END_STREAM, completes cleanly, and removes
+		// the stream from cc.streams via forgetStreamID. The resp.Body's
+		// backing bufPipe is closed during cleanupWriteRequest, so resources
+		// are properly released.
 	})
-	return errors.Join(errs...)
+	return closeErr
 }
 
 // closeWriter closes the writer at most once, safe to call from both

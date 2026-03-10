@@ -3,6 +3,7 @@ package samizdat
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -24,7 +25,7 @@ type Server struct {
 	listener     net.Listener
 	masquerade   *Masquerade
 	ctx          context.Context
-	cancel       context.CancelFunc
+	cancel       context.CancelCauseFunc
 	wg           sync.WaitGroup
 }
 
@@ -48,7 +49,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("deriving server public key: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancelCause(context.Background())
 
 	s := &Server{
 		config:       config,
@@ -109,7 +110,7 @@ func (s *Server) Serve(ln net.Listener) error {
 
 // Close shuts down the server.
 func (s *Server) Close() error {
-	s.cancel()
+	s.cancel(errors.New("server closed"))
 	var err error
 	if s.listener != nil {
 		err = s.listener.Close()
@@ -366,10 +367,13 @@ func (sc *serverStreamConn) Write(b []byte) (int, error) {
 func (sc *serverStreamConn) Close() error {
 	sc.closed.Store(true)
 	sc.once.Do(func() { close(sc.done) })
-	// Close r.Body to unblock any in-flight Read calls. The HTTP handler
-	// will still drain any remaining buffered data from r.Body after this
-	// returns (it holds its own reference to the body).
-	return sc.reader.Close()
+	// Do NOT close r.Body here. The HTTP handler holds its own reference
+	// to the body and will drain it after the proxy handler returns, waiting
+	// for the client to send END_STREAM. Closing it here would defeat the
+	// drain and cause the H2 server to send RST_STREAM.
+	// The upload goroutine exits due to a write error (not a blocked read),
+	// so there are no in-flight reads on r.Body to unblock.
+	return nil
 }
 
 // CloseWrite signals that no more data will be written. For the server-side
