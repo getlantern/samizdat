@@ -85,6 +85,22 @@ func (sc *streamConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
+// CloseWrite performs a half-close on the write side of the connection,
+// signaling EOF to the remote peer while keeping the read side open.
+// This is critical for protocols like TLS where the server sends remaining
+// data after the client signals it's done writing.
+func (sc *streamConn) CloseWrite() error {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.closed {
+		return nil
+	}
+	if cw, ok := sc.rwc.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
 // deadlineTimer supports net.Conn deadline semantics.
 type deadlineTimer struct {
 	mu      sync.Mutex

@@ -325,6 +325,136 @@ func TestStreamConnDeadline(t *testing.T) {
 	}
 }
 
+func TestStreamConnCloseWrite(t *testing.T) {
+	// Use TCP connections instead of net.Pipe() because net.Pipe doesn't
+	// support half-close (CloseWrite). TCP connections do.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverCh := make(chan net.Conn, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		serverCh <- conn
+	}()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer client.Close()
+
+	server := <-serverCh
+	defer server.Close()
+
+	sc := newStreamConn(
+		client,
+		&streamAddr{"tcp", "127.0.0.1:1234"},
+		&streamAddr{"tcp", "example.com:443"},
+		"example.com:443",
+		nil,
+	)
+	defer sc.Close()
+
+	// Write data before half-close
+	go func() {
+		sc.Write([]byte("before"))
+		sc.CloseWrite()
+	}()
+
+	buf := make([]byte, 64)
+	n, readErr := server.Read(buf)
+	if readErr != nil {
+		t.Fatalf("Read: %v", readErr)
+	}
+	if string(buf[:n]) != "before" {
+		t.Errorf("got %q, want %q", buf[:n], "before")
+	}
+
+	// After CloseWrite, the server side should get EOF
+	server.SetReadDeadline(time.Now().Add(time.Second))
+	_, readErr = server.Read(buf)
+	if readErr != io.EOF {
+		t.Fatalf("expected EOF after CloseWrite, got %v", readErr)
+	}
+
+	// Read side should still work — server can send data back
+	go func() {
+		server.Write([]byte("after"))
+		server.Close()
+	}()
+
+	sc.SetReadDeadline(time.Now().Add(time.Second))
+	n, readErr = sc.Read(buf)
+	if readErr != nil {
+		t.Fatalf("Read after CloseWrite: %v", readErr)
+	}
+	if string(buf[:n]) != "after" {
+		t.Errorf("got %q, want %q", buf[:n], "after")
+	}
+
+	// Full Close after CloseWrite should not error
+	if err := sc.Close(); err != nil {
+		t.Fatalf("Close after CloseWrite: %v", err)
+	}
+}
+
+func TestStreamConnCloseWriteNoSupport(t *testing.T) {
+	// Test with an rwc that does NOT support CloseWrite — should be a no-op
+	pr, pw := io.Pipe()
+	rwc := struct {
+		io.Reader
+		io.Writer
+		io.Closer
+	}{pr, pw, pw}
+
+	sc := newStreamConn(
+		rwc,
+		&streamAddr{"tcp", "local"},
+		&streamAddr{"tcp", "remote"},
+		"remote",
+		nil,
+	)
+	defer sc.Close()
+
+	err := sc.CloseWrite()
+	if err != nil {
+		t.Fatalf("CloseWrite on unsupported rwc should return nil, got %v", err)
+	}
+}
+
+func TestH2StreamRWCCloseWriteThenClose(t *testing.T) {
+	pr, pw := io.Pipe()
+	rwc := &h2StreamRWC{
+		reader: io.NopCloser(pr),
+		writer: pw,
+		transport: &h2Transport{
+			maxStreams: 100,
+		},
+	}
+	rwc.transport.activeStreams.Add(1)
+
+	// CloseWrite should succeed
+	if err := rwc.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+
+	// Close after CloseWrite should not error (writer already closed)
+	if err := rwc.Close(); err != nil {
+		t.Fatalf("Close after CloseWrite should not error, got: %v", err)
+	}
+
+	// Double Close should also be safe
+	if err := rwc.Close(); err != nil {
+		t.Fatalf("Double Close should not error, got: %v", err)
+	}
+}
+
 // --- ConnPool tests ---
 
 func TestConnPoolBasic(t *testing.T) {

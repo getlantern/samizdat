@@ -145,10 +145,11 @@ func (t *h2Transport) isClosed() bool {
 // h2StreamRWC wraps a response body (reader) and pipe writer as an
 // io.ReadWriteCloser for use as a bidirectional stream.
 type h2StreamRWC struct {
-	reader    io.ReadCloser
-	writer    io.WriteCloser
-	transport *h2Transport
-	once      sync.Once
+	reader      io.ReadCloser
+	writer      io.WriteCloser
+	transport   *h2Transport
+	once        sync.Once
+	writerOnce  sync.Once
 }
 
 func (s *h2StreamRWC) Read(b []byte) (int, error) {
@@ -163,7 +164,7 @@ func (s *h2StreamRWC) Close() error {
 	var errs []error
 	s.once.Do(func() {
 		s.transport.activeStreams.Add(-1)
-		if err := s.writer.Close(); err != nil {
+		if err := s.closeWriter(); err != nil {
 			errs = append(errs, err)
 		}
 		if err := s.reader.Close(); err != nil {
@@ -171,4 +172,21 @@ func (s *h2StreamRWC) Close() error {
 		}
 	})
 	return errors.Join(errs...)
+}
+
+// closeWriter closes the writer at most once, safe to call from both
+// CloseWrite and Close.
+func (s *h2StreamRWC) closeWriter() error {
+	var err error
+	s.writerOnce.Do(func() {
+		err = s.writer.Close()
+	})
+	return err
+}
+
+// CloseWrite closes only the write side (pipe writer), sending END_STREAM on
+// the H2 request body while keeping the response body (reader) open to receive
+// remaining data from the server.
+func (s *h2StreamRWC) CloseWrite() error {
+	return s.closeWriter()
 }

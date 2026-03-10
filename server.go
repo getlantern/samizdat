@@ -336,6 +336,15 @@ func (sc *serverStreamConn) Close() error {
 	return sc.reader.Close()
 }
 
+// CloseWrite signals that no more data will be written. For the server-side
+// H2 stream this is a no-op — the response writer stays open until the HTTP
+// handler returns. Implementing this prevents sing-box's bidirectional copy
+// from calling Close() (which kills the entire stream) when one copy direction
+// finishes.
+func (sc *serverStreamConn) CloseWrite() error {
+	return nil
+}
+
 func (sc *serverStreamConn) LocalAddr() net.Addr  { return &streamAddr{"tcp", "server"} }
 func (sc *serverStreamConn) RemoteAddr() net.Addr { return &streamAddr{"tcp", "client"} }
 func (sc *serverStreamConn) SetDeadline(t time.Time) error      { return nil }

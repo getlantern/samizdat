@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -429,6 +430,137 @@ func TestIntegrationMultipleStreams(t *testing.T) {
 
 	for err := range errors {
 		t.Error(err)
+	}
+}
+
+// TestIntegrationHTTPS verifies that HTTPS (TLS-over-tunnel) works correctly.
+// This is the key regression test for the CloseWrite fix: without CloseWrite(),
+// sing-box's bidirectional copy calls Close() when one direction finishes,
+// killing the H2 stream before TLS can complete. This test catches that by
+// running a real HTTPS server behind the Samizdat tunnel.
+func TestIntegrationHTTPS(t *testing.T) {
+	serverPriv, serverPub, _ := GenerateKeyPair()
+	shortID, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+
+	// Start a real HTTPS server as the "destination"
+	destCertPEM, destKeyPEM := generateSelfSignedCert(t)
+	destCert, err := tls.X509KeyPair(destCertPEM, destKeyPEM)
+	if err != nil {
+		t.Fatalf("loading dest cert: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "Hello from HTTPS!")
+	})
+
+	httpsServer := &http.Server{
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{destCert},
+		},
+	}
+
+	httpsLn, err := tls.Listen("tcp", "127.0.0.1:0", httpsServer.TLSConfig)
+	if err != nil {
+		t.Fatalf("HTTPS listen: %v", err)
+	}
+	defer httpsLn.Close()
+
+	go httpsServer.Serve(httpsLn)
+	defer httpsServer.Close()
+
+	httpsAddr := httpsLn.Addr().String()
+
+	// Start Samizdat server with a handler that does bidirectional copy
+	// (mimicking what sing-box does, including CloseWrite behavior)
+	server, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{shortID},
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		Handler: func(ctx context.Context, conn net.Conn, destination string) {
+			defer conn.Close()
+			target, err := net.DialTimeout("tcp", destination, 5*time.Second)
+			if err != nil {
+				return
+			}
+			defer target.Close()
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				io.Copy(target, conn)
+				// Half-close the write side of target if possible
+				if cw, ok := target.(interface{ CloseWrite() error }); ok {
+					cw.CloseWrite()
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				io.Copy(conn, target)
+				// Half-close the write side of conn if possible
+				if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+					cw.CloseWrite()
+				}
+			}()
+			wg.Wait()
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	go server.ListenAndServe()
+	defer server.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := NewClient(ClientConfig{
+		ServerAddr:       server.Addr().String(),
+		ServerName:       "test.example.com",
+		PublicKey:        serverPub,
+		ShortID:          shortID,
+		Padding:          false,
+		Jitter:           false,
+		TCPFragmentation: false,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	// Create an HTTP client that dials through the Samizdat tunnel
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			DialContext: client.DialContext,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // self-signed cert
+			},
+		},
+		Timeout: 15 * time.Second,
+	}
+
+	resp, err := httpClient.Get("https://" + httpsAddr + "/")
+	if err != nil {
+		t.Fatalf("HTTPS GET through tunnel: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+
+	if string(body) != "Hello from HTTPS!" {
+		t.Errorf("body = %q, want %q", body, "Hello from HTTPS!")
 	}
 }
 
