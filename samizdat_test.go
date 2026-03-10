@@ -347,6 +347,7 @@ func TestStreamConnCloseWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
+	defer client.Close()
 
 	server := <-serverCh
 	defer server.Close()
@@ -358,6 +359,7 @@ func TestStreamConnCloseWrite(t *testing.T) {
 		"example.com:443",
 		nil,
 	)
+	defer sc.Close()
 
 	// Write data before half-close
 	go func() {
