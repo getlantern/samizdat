@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -236,9 +237,15 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 			flusher.Flush()
 		}
 
+		// Keep a direct reference to r.Body for draining after the handler
+		// returns. serverStreamConn.Close() will close r.Body to unblock
+		// in-flight reads, but we still need to drain any remaining data
+		// to ensure the client sends END_STREAM.
+		body := r.Body
+
 		// Create a net.Conn from the H2 stream
 		streamConn := &serverStreamConn{
-			reader: r.Body,
+			reader: body,
 			writer: flushWriter{w: w, flusher: flusher},
 			done:   make(chan struct{}),
 		}
@@ -252,12 +259,15 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 		// Use a timeout to avoid blocking forever if the client disappears.
 		drainDone := make(chan struct{})
 		go func() {
-			io.Copy(io.Discard, r.Body)
+			io.Copy(io.Discard, body)
 			close(drainDone)
 		}()
 		select {
 		case <-drainDone:
 		case <-time.After(5 * time.Second):
+			// Timeout: close the body to unblock the drain goroutine.
+			body.Close()
+			<-drainDone
 		}
 	})
 
@@ -332,13 +342,20 @@ type serverStreamConn struct {
 	writer flushWriter
 	done   chan struct{}
 	once   sync.Once
+	closed atomic.Bool
 }
 
 func (sc *serverStreamConn) Read(b []byte) (int, error) {
+	if sc.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	return sc.reader.Read(b)
 }
 
 func (sc *serverStreamConn) Write(b []byte) (int, error) {
+	if sc.closed.Load() {
+		return 0, net.ErrClosed
+	}
 	n, err := sc.writer.Write(b)
 	if err == nil {
 		sc.writer.Flush()
@@ -347,11 +364,12 @@ func (sc *serverStreamConn) Write(b []byte) (int, error) {
 }
 
 func (sc *serverStreamConn) Close() error {
+	sc.closed.Store(true)
 	sc.once.Do(func() { close(sc.done) })
-	// Don't close r.Body here. The HTTP handler needs to drain it after
-	// the proxy handler returns to ensure the client sends END_STREAM
-	// before the handler exits (preventing RST_STREAM).
-	return nil
+	// Close r.Body to unblock any in-flight Read calls. The HTTP handler
+	// will still drain any remaining buffered data from r.Body after this
+	// returns (it holds its own reference to the body).
+	return sc.reader.Close()
 }
 
 // CloseWrite signals that no more data will be written. For the server-side
