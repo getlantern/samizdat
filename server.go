@@ -256,13 +256,14 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 			writer: flushWriter{w: w, flusher: flusher},
 		}
 
-		s.config.Handler(r.Context(), streamConn, destination)
+		// Defer marking the stream as closed and waiting for any in-flight
+		// writes to finish until just before this HTTP handler returns.
+		// This prevents the "Write called after Handler finished" panic
+		// while still allowing writes to complete during the drain/timeout
+		// block below.
+		defer streamConn.shutdown()
 
-		// Mark the stream as closed and wait for any in-flight writes to
-		// finish. This prevents the "Write called after Handler finished"
-		// panic — sing-box may have a lingering copy goroutine that hasn't
-		// observed the connection closure yet.
-		streamConn.shutdown()
+		s.config.Handler(r.Context(), streamConn, destination)
 
 		log.Printf("[samizdat] CONNECT %s: handler returned, starting drain", destination)
 

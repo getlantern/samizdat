@@ -925,6 +925,7 @@ func TestIntegrationFireAndForgetHandler(t *testing.T) {
 
 	// Run multiple iterations to exercise the race. Without the fix,
 	// this panics with "Write called after Handler finished".
+	successCount := 0
 	for i := 0; i < 10; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		conn, err := client.DialContext(ctx, "tcp", slowAddr)
@@ -944,13 +945,16 @@ func TestIntegrationFireAndForgetHandler(t *testing.T) {
 		conn.Read(buf)
 		conn.Close()
 		cancel()
+		successCount++
 
 		// Brief pause to let the write goroutine hit the shutdown path
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// If we get here without panicking, the fix works.
-	t.Log("all iterations completed without panic")
+	if successCount == 0 {
+		t.Fatal("no iterations successfully connected — test did not exercise the write-after-return scenario")
+	}
+	t.Logf("%d/10 iterations completed successfully without panic", successCount)
 }
 
 // Verify TLS cert is used but not PKI-verified (InsecureSkipVerify)

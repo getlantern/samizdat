@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -589,11 +590,14 @@ func TestServerStreamConn_WriteAfterShutdown(t *testing.T) {
 type slowResponseWriter struct {
 	delay   time.Duration
 	written int
+	started chan struct{}
+	once    sync.Once
 }
 
 func (sw *slowResponseWriter) Header() http.Header       { return http.Header{} }
 func (sw *slowResponseWriter) WriteHeader(statusCode int) {}
 func (sw *slowResponseWriter) Write(b []byte) (int, error) {
+	sw.once.Do(func() { close(sw.started) })
 	time.Sleep(sw.delay)
 	sw.written += len(b)
 	return len(b), nil
@@ -603,7 +607,7 @@ func (sw *slowResponseWriter) Write(b []byte) (int, error) {
 // shutdown() blocks until an in-progress Write completes, preventing the
 // race between the handler returning and the copy goroutine writing.
 func TestServerStreamConn_ShutdownWaitsForInflightWrite(t *testing.T) {
-	sw := &slowResponseWriter{delay: 200 * time.Millisecond}
+	sw := &slowResponseWriter{delay: 200 * time.Millisecond, started: make(chan struct{})}
 	sc := &serverStreamConn{
 		reader: io.NopCloser(&bytes.Reader{}),
 		writer: flushWriter{w: sw},
@@ -616,8 +620,8 @@ func TestServerStreamConn_ShutdownWaitsForInflightWrite(t *testing.T) {
 		close(writeDone)
 	}()
 
-	// Let the write start and acquire the mutex
-	time.Sleep(50 * time.Millisecond)
+	// Wait for the write to enter slowResponseWriter (mutex is held at this point)
+	<-sw.started
 
 	// shutdown() should block until the write releases the mutex
 	shutdownStart := time.Now()
