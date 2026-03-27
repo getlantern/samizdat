@@ -5,6 +5,8 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/http"
+	"sync"
 	"testing"
 	"time"
 )
@@ -526,6 +528,131 @@ func TestMasqueradeDefaults(t *testing.T) {
 	}
 	if m.DialTimeout != 10*time.Second {
 		t.Errorf("DialTimeout = %v, want 10s", m.DialTimeout)
+	}
+}
+
+// --- serverStreamConn tests ---
+
+// panicResponseWriter simulates an http2.ResponseWriter after the handler
+// has returned. It panics on Write with the exact message the real HTTP/2
+// stack produces.
+type panicResponseWriter struct{}
+
+func (pw *panicResponseWriter) Header() http.Header        { return http.Header{} }
+func (pw *panicResponseWriter) WriteHeader(statusCode int)  {}
+func (pw *panicResponseWriter) Write(b []byte) (int, error) {
+	panic("Write called after Handler finished")
+}
+
+// TestServerStreamConn_WriteRecoversPanic verifies that a Write to a
+// serverStreamConn backed by an invalid ResponseWriter returns
+// net.ErrClosed instead of panicking. Before the fix, this test would
+// crash the process with an unrecovered panic.
+func TestServerStreamConn_WriteRecoversPanic(t *testing.T) {
+	sc := &serverStreamConn{
+		reader: io.NopCloser(&bytes.Reader{}),
+		writer: flushWriter{w: &panicResponseWriter{}},
+	}
+
+	n, err := sc.Write([]byte("test data"))
+	if n != 0 {
+		t.Errorf("n = %d, want 0", n)
+	}
+	if err != net.ErrClosed {
+		t.Errorf("err = %v, want net.ErrClosed", err)
+	}
+	// After recovery, the conn should be marked closed
+	if !sc.closed.Load() {
+		t.Error("conn should be marked closed after recovered panic")
+	}
+}
+
+// TestServerStreamConn_WriteAfterShutdown verifies that Write returns
+// net.ErrClosed after shutdown() is called.
+func TestServerStreamConn_WriteAfterShutdown(t *testing.T) {
+	sc := &serverStreamConn{
+		reader: io.NopCloser(&bytes.Reader{}),
+		writer: flushWriter{w: &panicResponseWriter{}},
+	}
+
+	sc.shutdown()
+
+	n, err := sc.Write([]byte("test"))
+	if n != 0 {
+		t.Errorf("n = %d, want 0", n)
+	}
+	if err != net.ErrClosed {
+		t.Errorf("err = %v, want net.ErrClosed", err)
+	}
+}
+
+// slowResponseWriter delays each Write to simulate a slow HTTP/2 flush.
+type slowResponseWriter struct {
+	delay   time.Duration
+	written int
+	started chan struct{}
+	once    sync.Once
+}
+
+func (sw *slowResponseWriter) Header() http.Header       { return http.Header{} }
+func (sw *slowResponseWriter) WriteHeader(statusCode int) {}
+func (sw *slowResponseWriter) Write(b []byte) (int, error) {
+	sw.once.Do(func() { close(sw.started) })
+	time.Sleep(sw.delay)
+	sw.written += len(b)
+	return len(b), nil
+}
+
+// TestServerStreamConn_ShutdownWaitsForInflightWrite verifies that
+// shutdown() blocks until an in-progress Write completes, preventing the
+// race between the handler returning and the copy goroutine writing.
+func TestServerStreamConn_ShutdownWaitsForInflightWrite(t *testing.T) {
+	sw := &slowResponseWriter{delay: 200 * time.Millisecond, started: make(chan struct{})}
+	sc := &serverStreamConn{
+		reader: io.NopCloser(&bytes.Reader{}),
+		writer: flushWriter{w: sw},
+	}
+
+	// Start a slow write in a goroutine
+	writeDone := make(chan struct{})
+	go func() {
+		sc.Write([]byte("inflight data"))
+		close(writeDone)
+	}()
+
+	// Wait for the write to enter slowResponseWriter (mutex is held at this point)
+	<-sw.started
+
+	// shutdown() should block until the write releases the mutex
+	shutdownStart := time.Now()
+	shutdownDone := make(chan struct{})
+	go func() {
+		sc.shutdown()
+		close(shutdownDone)
+	}()
+
+	// Shutdown should NOT complete before the write finishes
+	select {
+	case <-shutdownDone:
+		elapsed := time.Since(shutdownStart)
+		if elapsed < 100*time.Millisecond {
+			t.Fatalf("shutdown returned too quickly (%v) — didn't wait for write", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown timed out")
+	}
+
+	<-writeDone
+
+	// Verify the write completed
+	if sw.written == 0 {
+		t.Error("slow writer should have been written to")
+	}
+
+	// After shutdown, new writes should fail immediately
+	n, err := sc.Write([]byte("after shutdown"))
+	if n != 0 || err != net.ErrClosed {
+		t.Errorf("Write after shutdown: n=%d, err=%v, want 0/net.ErrClosed", n, err)
 	}
 }
 
