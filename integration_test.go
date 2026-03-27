@@ -831,6 +831,128 @@ func TestIntegrationSequentialHTTPThenHTTPS(t *testing.T) {
 	}
 }
 
+// TestIntegrationFireAndForgetHandler reproduces the "panic: Write called
+// after Handler finished" bug. The handler spawns goroutines that write to the
+// conn and returns immediately — mimicking sing-box's NewConnection which
+// starts two copy goroutines and returns without waiting. Without the
+// shutdown() + recover() fix, the orphaned goroutines write to the
+// ResponseWriter after the HTTP handler returns, causing a panic.
+func TestIntegrationFireAndForgetHandler(t *testing.T) {
+	serverPriv, serverPub, _ := GenerateKeyPair()
+	shortID, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+
+	// A slow TCP server that sends data over 500ms. The download goroutine
+	// will still be writing to the H2 stream after the handler returns.
+	slowLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("slow listener: %v", err)
+	}
+	defer slowLn.Close()
+
+	go func() {
+		for {
+			conn, err := slowLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				// Read the request
+				buf := make([]byte, 256)
+				conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				conn.Read(buf)
+				// Send data in chunks with delays, so the copy goroutine
+				// is mid-write when the handler returns.
+				for i := 0; i < 10; i++ {
+					conn.Write([]byte("chunk-data-that-keeps-the-write-goroutine-alive\n"))
+					time.Sleep(50 * time.Millisecond)
+				}
+			}()
+		}
+	}()
+
+	slowAddr := slowLn.Addr().String()
+
+	// Samizdat server with a fire-and-forget handler: spawns goroutines and
+	// returns immediately, just like sing-box's NewConnection.
+	server, err := NewServer(ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{shortID},
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		Handler: func(ctx context.Context, conn net.Conn, destination string) {
+			target, err := net.DialTimeout("tcp", destination, 5*time.Second)
+			if err != nil {
+				conn.Close()
+				return
+			}
+			// Fire-and-forget: spawn copy goroutines and return immediately.
+			// This is the pattern that causes the panic without the fix.
+			go func() {
+				io.Copy(target, conn)
+				target.Close()
+			}()
+			go func() {
+				io.Copy(conn, target)
+				conn.Close()
+			}()
+			// Return immediately — handler done, ResponseWriter about to
+			// become invalid, but goroutines are still writing.
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	go server.ListenAndServe()
+	defer server.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	client, err := NewClient(ClientConfig{
+		ServerAddr:       server.Addr().String(),
+		ServerName:       "test.example.com",
+		PublicKey:        serverPub,
+		ShortID:          shortID,
+		Jitter:           false,
+		TCPFragmentation: false,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	// Run multiple iterations to exercise the race. Without the fix,
+	// this panics with "Write called after Handler finished".
+	for i := 0; i < 10; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		conn, err := client.DialContext(ctx, "tcp", slowAddr)
+		if err != nil {
+			cancel()
+			t.Logf("iteration %d: DialContext: %v (expected after repeated races)", i, err)
+			continue
+		}
+
+		// Send a request to trigger the slow response
+		conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
+
+		// Read a little, then close abruptly — this creates the
+		// scenario where the handler returns while data is still flowing.
+		buf := make([]byte, 64)
+		conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		conn.Read(buf)
+		conn.Close()
+		cancel()
+
+		// Brief pause to let the write goroutine hit the shutdown path
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// If we get here without panicking, the fix works.
+	t.Log("all iterations completed without panic")
+}
+
 // Verify TLS cert is used but not PKI-verified (InsecureSkipVerify)
 func TestIntegrationTLSConfig(t *testing.T) {
 	serverPriv, _, _ := GenerateKeyPair()
