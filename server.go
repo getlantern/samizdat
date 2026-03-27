@@ -26,6 +26,7 @@ var ErrServerClosed = errors.New("server closed")
 type Server struct {
 	config       ServerConfig
 	serverPubKey []byte // derived from config.PrivateKey
+	listenerMu   sync.Mutex
 	listener     net.Listener
 	masquerade   *Masquerade
 	ctx          context.Context
@@ -91,7 +92,9 @@ func (s *Server) ListenAndServe() error {
 // Serve accepts connections on the given listener. This is useful when the
 // caller manages the listener (e.g. sing-box's listener.Listener).
 func (s *Server) Serve(ln net.Listener) error {
+	s.listenerMu.Lock()
 	s.listener = ln
+	s.listenerMu.Unlock()
 
 	for {
 		conn, err := ln.Accept()
@@ -115,9 +118,12 @@ func (s *Server) Serve(ln net.Listener) error {
 // Close shuts down the server.
 func (s *Server) Close() error {
 	s.cancel(ErrServerClosed)
+	s.listenerMu.Lock()
+	ln := s.listener
+	s.listenerMu.Unlock()
 	var err error
-	if s.listener != nil {
-		err = s.listener.Close()
+	if ln != nil {
+		err = ln.Close()
 	}
 	s.wg.Wait()
 	return err
@@ -125,8 +131,11 @@ func (s *Server) Close() error {
 
 // Addr returns the server's listen address, or nil if not listening.
 func (s *Server) Addr() net.Addr {
-	if s.listener != nil {
-		return s.listener.Addr()
+	s.listenerMu.Lock()
+	ln := s.listener
+	s.listenerMu.Unlock()
+	if ln != nil {
+		return ln.Addr()
 	}
 	return nil
 }
@@ -250,9 +259,15 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 		// to ensure the client sends END_STREAM.
 		body := r.Body
 
+		// Wrap body in a syncReader so the drain and any lingering handler
+		// goroutines serialize their reads. Without this, fire-and-forget
+		// handlers (which return before their copy goroutines finish) cause
+		// a data race on body.Read().
+		sr := &syncReader{r: body}
+
 		// Create a net.Conn from the H2 stream
 		streamConn := &serverStreamConn{
-			reader: body,
+			reader: io.NopCloser(sr),
 			writer: flushWriter{w: w, flusher: flusher},
 		}
 
@@ -274,7 +289,7 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 		// Use a timeout to avoid blocking forever if the client disappears.
 		drainDone := make(chan struct{})
 		go func() {
-			n, err := io.Copy(io.Discard, body)
+			n, err := io.Copy(io.Discard, sr)
 			log.Printf("[samizdat] CONNECT %s: drain finished, n=%d, err=%v", destination, n, err)
 			close(drainDone)
 		}()
@@ -439,6 +454,20 @@ func (sc *serverStreamConn) RemoteAddr() net.Addr { return &streamAddr{"tcp", "c
 func (sc *serverStreamConn) SetDeadline(t time.Time) error      { return nil }
 func (sc *serverStreamConn) SetReadDeadline(t time.Time) error   { return nil }
 func (sc *serverStreamConn) SetWriteDeadline(t time.Time) error  { return nil }
+
+// syncReader serializes concurrent reads with a mutex. This prevents a data
+// race when both a handler's copy goroutine and the drain goroutine read from
+// the same http2 request body.
+type syncReader struct {
+	mu sync.Mutex
+	r  io.Reader
+}
+
+func (sr *syncReader) Read(b []byte) (int, error) {
+	sr.mu.Lock()
+	defer sr.mu.Unlock()
+	return sr.r.Read(b)
+}
 
 // flushWriter wraps an http.ResponseWriter with a Flusher for immediate writes.
 type flushWriter struct {

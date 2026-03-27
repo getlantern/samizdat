@@ -55,6 +55,26 @@ func generateSelfSignedCert(t *testing.T) (certPEM, keyPEM []byte) {
 	return certPEM, keyPEM
 }
 
+// startTestServer creates a TCP listener and starts the server in a background
+// goroutine. Returns the server and listener. Use ln.Addr() instead of
+// server.Addr() to avoid a data race.
+func startTestServer(t *testing.T, config ServerConfig) (*Server, net.Listener) {
+	t.Helper()
+	ln, err := net.Listen("tcp", config.ListenAddr)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	config.ListenAddr = ""
+	server, err := NewServer(config)
+	if err != nil {
+		ln.Close()
+		t.Fatalf("NewServer: %v", err)
+	}
+	go server.Serve(ln)
+	t.Cleanup(func() { server.Close() })
+	return server, ln
+}
+
 func TestIntegrationClientServer(t *testing.T) {
 	// Generate server credentials
 	serverPriv, serverPub, err := GenerateKeyPair()
@@ -92,7 +112,7 @@ func TestIntegrationClientServer(t *testing.T) {
 	echoAddr := echoLn.Addr().String()
 
 	// Start Samizdat server
-	server, err := NewServer(ServerConfig{
+	_, ln := startTestServer(t, ServerConfig{
 		ListenAddr:       "127.0.0.1:0",
 		PrivateKey:       serverPriv,
 		ShortIDs:         [][8]byte{shortID},
@@ -121,17 +141,8 @@ func TestIntegrationClientServer(t *testing.T) {
 			wg.Wait()
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
 
-	go server.ListenAndServe()
-	defer server.Close()
-
-	// Wait for server to start listening
-	time.Sleep(100 * time.Millisecond)
-
-	serverAddr := server.Addr().String()
+	serverAddr := ln.Addr().String()
 	t.Logf("Server listening on %s, echo on %s", serverAddr, echoAddr)
 
 	// Create client
@@ -220,7 +231,7 @@ func TestIntegrationMasquerade(t *testing.T) {
 	certPEM, keyPEM := generateSelfSignedCert(t)
 
 	// Start Samizdat server with masquerade pointing to our fake domain
-	server, err := NewServer(ServerConfig{
+	_, ln := startTestServer(t, ServerConfig{
 		ListenAddr:       "127.0.0.1:0",
 		PrivateKey:       serverPriv,
 		ShortIDs:         [][8]byte{shortID},
@@ -232,15 +243,8 @@ func TestIntegrationMasquerade(t *testing.T) {
 			defer conn.Close()
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
 
-	go server.ListenAndServe()
-	defer server.Close()
-
-	time.Sleep(100 * time.Millisecond)
-	serverAddr := server.Addr().String()
+	serverAddr := ln.Addr().String()
 
 	// Connect without Samizdat auth (like an active probe)
 	probeConn, err := net.DialTimeout("tcp", serverAddr, 5*time.Second)
@@ -347,7 +351,7 @@ func TestIntegrationMultipleStreams(t *testing.T) {
 
 	echoAddr := echoLn.Addr().String()
 
-	server, _ := NewServer(ServerConfig{
+	_, ln := startTestServer(t, ServerConfig{
 		ListenAddr: "127.0.0.1:0",
 		PrivateKey: serverPriv,
 		ShortIDs:   [][8]byte{shortID},
@@ -368,12 +372,8 @@ func TestIntegrationMultipleStreams(t *testing.T) {
 		},
 	})
 
-	go server.ListenAndServe()
-	defer server.Close()
-	time.Sleep(100 * time.Millisecond)
-
 	client, _ := NewClient(ClientConfig{
-		ServerAddr:       server.Addr().String(),
+		ServerAddr:       ln.Addr().String(),
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
@@ -474,7 +474,7 @@ func TestIntegrationHTTPS(t *testing.T) {
 
 	// Start Samizdat server with a handler that does bidirectional copy
 	// (mimicking what sing-box does, including CloseWrite behavior)
-	server, err := NewServer(ServerConfig{
+	_, ln := startTestServer(t, ServerConfig{
 		ListenAddr: "127.0.0.1:0",
 		PrivateKey: serverPriv,
 		ShortIDs:   [][8]byte{shortID},
@@ -509,16 +509,9 @@ func TestIntegrationHTTPS(t *testing.T) {
 			wg.Wait()
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	go server.ListenAndServe()
-	defer server.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	client, err := NewClient(ClientConfig{
-		ServerAddr:       server.Addr().String(),
+		ServerAddr:       ln.Addr().String(),
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
@@ -604,7 +597,7 @@ func TestIntegrationUpstreamCloseBeforeClientEND(t *testing.T) {
 	// The upload direction will get a write error when trying to forward
 	// data to the already-closed upstream, which is the trigger for the
 	// RST_STREAM race.
-	server, err := NewServer(ServerConfig{
+	_, ln := startTestServer(t, ServerConfig{
 		ListenAddr: "127.0.0.1:0",
 		PrivateKey: serverPriv,
 		ShortIDs:   [][8]byte{shortID},
@@ -636,16 +629,9 @@ func TestIntegrationUpstreamCloseBeforeClientEND(t *testing.T) {
 			wg.Wait()
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	go server.ListenAndServe()
-	defer server.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	client, err := NewClient(ClientConfig{
-		ServerAddr:       server.Addr().String(),
+		ServerAddr:       ln.Addr().String(),
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
@@ -737,7 +723,7 @@ func TestIntegrationSequentialHTTPThenHTTPS(t *testing.T) {
 	defer httpsServer.Close()
 
 	// Start Samizdat server
-	server, err := NewServer(ServerConfig{
+	_, ln := startTestServer(t, ServerConfig{
 		ListenAddr: "127.0.0.1:0",
 		PrivateKey: serverPriv,
 		ShortIDs:   [][8]byte{shortID},
@@ -769,15 +755,9 @@ func TestIntegrationSequentialHTTPThenHTTPS(t *testing.T) {
 			wg.Wait()
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-	go server.ListenAndServe()
-	defer server.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	client, err := NewClient(ClientConfig{
-		ServerAddr:       server.Addr().String(),
+		ServerAddr:       ln.Addr().String(),
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
@@ -876,7 +856,7 @@ func TestIntegrationFireAndForgetHandler(t *testing.T) {
 
 	// Samizdat server with a fire-and-forget handler: spawns goroutines and
 	// returns immediately, just like sing-box's NewConnection.
-	server, err := NewServer(ServerConfig{
+	_, ln := startTestServer(t, ServerConfig{
 		ListenAddr: "127.0.0.1:0",
 		PrivateKey: serverPriv,
 		ShortIDs:   [][8]byte{shortID},
@@ -902,16 +882,9 @@ func TestIntegrationFireAndForgetHandler(t *testing.T) {
 			// become invalid, but goroutines are still writing.
 		},
 	})
-	if err != nil {
-		t.Fatalf("NewServer: %v", err)
-	}
-
-	go server.ListenAndServe()
-	defer server.Close()
-	time.Sleep(100 * time.Millisecond)
 
 	client, err := NewClient(ClientConfig{
-		ServerAddr:       server.Addr().String(),
+		ServerAddr:       ln.Addr().String(),
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
@@ -963,7 +936,7 @@ func TestIntegrationTLSConfig(t *testing.T) {
 	shortID, _ := GenerateShortID()
 	certPEM, keyPEM := generateSelfSignedCert(t)
 
-	server, _ := NewServer(ServerConfig{
+	_, ln := startTestServer(t, ServerConfig{
 		ListenAddr: "127.0.0.1:0",
 		PrivateKey: serverPriv,
 		ShortIDs:   [][8]byte{shortID},
@@ -972,15 +945,11 @@ func TestIntegrationTLSConfig(t *testing.T) {
 		Handler:    func(ctx context.Context, conn net.Conn, destination string) { conn.Close() },
 	})
 
-	go server.ListenAndServe()
-	defer server.Close()
-	time.Sleep(100 * time.Millisecond)
-
 	// Connect with standard TLS to verify the server presents a valid TLS endpoint
 	tlsConn, err := tls.DialWithDialer(
 		&net.Dialer{Timeout: 5 * time.Second},
 		"tcp",
-		server.Addr().String(),
+		ln.Addr().String(),
 		&tls.Config{InsecureSkipVerify: true},
 	)
 	if err != nil {
