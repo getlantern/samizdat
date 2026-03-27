@@ -384,9 +384,17 @@ func (sc *serverStreamConn) Write(b []byte) (n int, err error) {
 	// recover() is defense-in-depth.
 	defer func() {
 		if r := recover(); r != nil {
-			sc.closed.Store(true)
-			n = 0
-			err = net.ErrClosed
+			s, ok := r.(string)
+			if ok && s == "Write called after Handler finished" {
+				log.Printf("[samizdat] recovered expected panic in Write: %v", r)
+				sc.closed.Store(true)
+				n = 0
+				err = net.ErrClosed
+				return
+			}
+			// Unexpected panic — log and re-panic so real bugs aren't masked.
+			log.Printf("[samizdat] unexpected panic in Write: %v", r)
+			panic(r)
 		}
 	}()
 	n, err = sc.writer.Write(b)
