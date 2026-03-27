@@ -258,6 +258,12 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 
 		s.config.Handler(r.Context(), streamConn, destination)
 
+		// Mark the stream as closed and wait for any in-flight writes to
+		// finish. This prevents the "Write called after Handler finished"
+		// panic — sing-box may have a lingering copy goroutine that hasn't
+		// observed the connection closure yet.
+		streamConn.shutdown()
+
 		log.Printf("[samizdat] CONNECT %s: handler returned, starting drain", destination)
 
 		// Drain r.Body to ensure the client sends END_STREAM before the
@@ -356,6 +362,7 @@ type serverStreamConn struct {
 	reader io.ReadCloser
 	writer flushWriter
 	closed atomic.Bool
+	mu     sync.Mutex // guards writes; shutdown() takes this to wait for in-flight writes
 }
 
 func (sc *serverStreamConn) Read(b []byte) (int, error) {
@@ -365,11 +372,24 @@ func (sc *serverStreamConn) Read(b []byte) (int, error) {
 	return sc.reader.Read(b)
 }
 
-func (sc *serverStreamConn) Write(b []byte) (int, error) {
+func (sc *serverStreamConn) Write(b []byte) (n int, err error) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
 	if sc.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	n, err := sc.writer.Write(b)
+	// Recover from "Write called after Handler finished" panics that occur
+	// when the HTTP/2 handler returns while a sing-box copy goroutine is
+	// still writing. The mutex + shutdown() prevents new races, but
+	// recover() is defense-in-depth.
+	defer func() {
+		if r := recover(); r != nil {
+			sc.closed.Store(true)
+			n = 0
+			err = net.ErrClosed
+		}
+	}()
+	n, err = sc.writer.Write(b)
 	if err == nil {
 		sc.writer.Flush()
 	}
@@ -385,6 +405,15 @@ func (sc *serverStreamConn) Close() error {
 	// The upload goroutine exits due to a write error (not a blocked read),
 	// so there are no in-flight reads on r.Body to unblock.
 	return nil
+}
+
+// shutdown marks the conn as closed and waits for any in-flight Write to
+// finish. The HTTP handler must call this before returning so that no
+// goroutine can write to the ResponseWriter after it becomes invalid.
+func (sc *serverStreamConn) shutdown() {
+	sc.mu.Lock()
+	sc.closed.Store(true)
+	sc.mu.Unlock()
 }
 
 // CloseWrite signals that no more data will be written. For the server-side
