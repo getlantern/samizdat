@@ -265,10 +265,15 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 		// a data race on body.Read().
 		sr := &syncReader{r: body}
 
-		// Create a net.Conn from the H2 stream
+		// Create a net.Conn from the H2 stream. Carry the underlying TLS
+		// conn's addresses so RemoteAddr() surfaces the real peer instead
+		// of a placeholder — consumers (e.g. Lantern's Share My Connection
+		// UI) key per-connection state on RemoteAddr.
 		streamConn := &serverStreamConn{
-			reader: io.NopCloser(sr),
-			writer: flushWriter{w: w, flusher: flusher},
+			reader:     io.NopCloser(sr),
+			writer:     flushWriter{w: w, flusher: flusher},
+			localAddr:  tlsConn.LocalAddr(),
+			remoteAddr: tlsConn.RemoteAddr(),
 		}
 
 		// Defer marking the stream as closed and waiting for any in-flight
@@ -373,12 +378,16 @@ func (rc *replayConn) Read(b []byte) (int, error) {
 }
 
 // serverStreamConn wraps an HTTP/2 stream (request body + response writer)
-// as a net.Conn for use by the ConnHandler.
+// as a net.Conn for use by the ConnHandler. localAddr/remoteAddr are the
+// underlying TLS conn's addresses, so multiplexed streams over the same
+// TLS conn share addresses but Handlers can still distinguish peers.
 type serverStreamConn struct {
-	reader io.ReadCloser
-	writer flushWriter
-	closed atomic.Bool
-	mu     sync.Mutex // guards writes; shutdown() takes this to wait for in-flight writes
+	reader     io.ReadCloser
+	writer     flushWriter
+	closed     atomic.Bool
+	mu         sync.Mutex // guards writes; shutdown() takes this to wait for in-flight writes
+	localAddr  net.Addr
+	remoteAddr net.Addr
 }
 
 func (sc *serverStreamConn) Read(b []byte) (int, error) {
@@ -449,8 +458,18 @@ func (sc *serverStreamConn) CloseWrite() error {
 	return nil
 }
 
-func (sc *serverStreamConn) LocalAddr() net.Addr  { return &streamAddr{"tcp", "server"} }
-func (sc *serverStreamConn) RemoteAddr() net.Addr { return &streamAddr{"tcp", "client"} }
+func (sc *serverStreamConn) LocalAddr() net.Addr {
+	if sc.localAddr != nil {
+		return sc.localAddr
+	}
+	return &streamAddr{"tcp", "server"}
+}
+func (sc *serverStreamConn) RemoteAddr() net.Addr {
+	if sc.remoteAddr != nil {
+		return sc.remoteAddr
+	}
+	return &streamAddr{"tcp", "client"}
+}
 func (sc *serverStreamConn) SetDeadline(t time.Time) error      { return nil }
 func (sc *serverStreamConn) SetReadDeadline(t time.Time) error   { return nil }
 func (sc *serverStreamConn) SetWriteDeadline(t time.Time) error  { return nil }
