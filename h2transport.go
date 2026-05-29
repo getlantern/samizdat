@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -95,6 +96,14 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		stop()
 		tunnelCancel()
 		pw.Close()
+		// This transport wraps a single, non-redialable conn (see
+		// newH2Transport's DialTLSContext). A conn-fatal error poisons every
+		// subsequent RoundTrip, so retire the transport here; otherwise the
+		// pool keeps handing back the dead transport on each getTransport
+		// until a later cleanup tick, producing sustained error bursts.
+		if connFatal(err) {
+			t.close()
+		}
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
 	}
 
@@ -127,6 +136,22 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 	)
 
 	return conn, nil
+}
+
+// connFatal reports whether a RoundTrip error means the transport's underlying
+// connection is dead and should be retired. Caller-driven cancellation is
+// excluded — it reflects the caller abandoning a single request, not a broken
+// conn, and retiring the transport would tear down the healthy sibling streams
+// multiplexed over it.
+func connFatal(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
 // hasCapacity returns true if the transport can accept more streams.

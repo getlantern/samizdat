@@ -478,6 +478,48 @@ func TestConnPoolBasic(t *testing.T) {
 	}
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+func newTestTransport(rt http.RoundTripper) *h2Transport {
+	_, client := net.Pipe()
+	return &h2Transport{
+		tlsConn:     client,
+		h2Roundtrip: rt,
+		serverAddr:  "test:443",
+		maxStreams:  100,
+		localAddr:   &streamAddr{"tcp", "local"},
+		remoteAddr:  &streamAddr{"tcp", "remote"},
+	}
+}
+
+func TestOpenTunnelRetiresTransportOnDeadConn(t *testing.T) {
+	tr := newTestTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, net.ErrClosed
+	}))
+
+	if _, err := tr.openTunnel(ctx(t), "example.com:443"); err == nil {
+		t.Fatal("openTunnel: expected error")
+	}
+	if !tr.isClosed() {
+		t.Fatal("transport not retired after conn-fatal RoundTrip error; pool would keep reusing the dead conn")
+	}
+}
+
+func TestOpenTunnelKeepsTransportOnCallerCancel(t *testing.T) {
+	tr := newTestTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, context.Canceled
+	}))
+
+	if _, err := tr.openTunnel(ctx(t), "example.com:443"); err == nil {
+		t.Fatal("openTunnel: expected error")
+	}
+	if tr.isClosed() {
+		t.Fatal("transport retired on caller cancellation; would tear down healthy multiplexed siblings")
+	}
+}
+
 // --- Config tests ---
 
 func TestClientConfigDefaults(t *testing.T) {
