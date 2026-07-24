@@ -199,7 +199,6 @@ func TestShaperNoOp(t *testing.T) {
 	}
 }
 
-
 func TestRecordFragmenter(t *testing.T) {
 	rf := NewRecordFragmenter(true)
 
@@ -311,6 +310,224 @@ func TestStreamConnDeadline(t *testing.T) {
 	}
 }
 
+func TestStreamConnDeadlineInterruptsBlockedRead(t *testing.T) {
+	// The server side is never written to, so the underlying read blocks
+	// indefinitely — the exact failure mode the deadline must interrupt.
+	server, client := net.Pipe()
+	defer server.Close()
+
+	sc := newStreamConn(
+		client,
+		&streamAddr{"tcp", "local"},
+		&streamAddr{"tcp", "remote"},
+		"remote",
+		nil,
+	)
+	defer sc.Close()
+
+	sc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	buf := make([]byte, 16)
+	start := time.Now()
+	_, err := sc.Read(buf)
+	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("read blocked %v; deadline did not interrupt it", elapsed)
+	}
+
+	// The timeout is recoverable: extending the deadline lets a subsequent
+	// read succeed on the same conn.
+	go func() {
+		server.Write([]byte("late"))
+	}()
+	sc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := sc.Read(buf)
+	if err != nil {
+		t.Fatalf("read after extending deadline: %v", err)
+	}
+	if string(buf[:n]) != "late" {
+		t.Errorf("got %q, want %q", buf[:n], "late")
+	}
+}
+
+func TestStreamConnReadDeliversDataSplitAcrossBuffers(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+
+	sc := newStreamConn(
+		client,
+		&streamAddr{"tcp", "local"},
+		&streamAddr{"tcp", "remote"},
+		"remote",
+		nil,
+	)
+	defer sc.Close()
+
+	go func() {
+		server.Write([]byte("abcdef"))
+	}()
+
+	// Read with a buffer smaller than the delivered chunk; the remainder must
+	// survive to the next read rather than being dropped.
+	buf := make([]byte, 4)
+	n, err := sc.Read(buf)
+	if err != nil || string(buf[:n]) != "abcd" {
+		t.Fatalf("first read: got %q err %v", buf[:n], err)
+	}
+	n, err = sc.Read(buf)
+	if err != nil || string(buf[:n]) != "ef" {
+		t.Fatalf("second read: got %q err %v", buf[:n], err)
+	}
+}
+
+func TestStreamConnReadDeliversFinalDataThenError(t *testing.T) {
+	// A reader that returns data and io.EOF together on its final read; the
+	// pump must not block on a second send, and reads past EOF must keep
+	// returning the error rather than hanging.
+	sc := newStreamConn(
+		&dataThenEOF{data: []byte("bye")},
+		&streamAddr{"tcp", "local"},
+		&streamAddr{"tcp", "remote"},
+		"remote",
+		nil,
+	)
+	defer sc.Close()
+
+	buf := make([]byte, 16)
+	n, err := sc.Read(buf)
+	if err != nil || string(buf[:n]) != "bye" {
+		t.Fatalf("first read: got %q err %v, want \"bye\" nil", buf[:n], err)
+	}
+
+	// The pump has exited; these must return EOF promptly, not block.
+	for i := 0; i < 3; i++ {
+		done := make(chan struct{})
+		go func() {
+			_, err = sc.Read(buf)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("read past EOF blocked")
+		}
+		if err != io.EOF {
+			t.Fatalf("read past EOF: got %v, want io.EOF", err)
+		}
+	}
+}
+
+// dataThenEOF returns its data and io.EOF on the first read, then io.EOF.
+type dataThenEOF struct {
+	data []byte
+	done bool
+}
+
+func (d *dataThenEOF) Read(p []byte) (int, error) {
+	if d.done {
+		return 0, io.EOF
+	}
+	d.done = true
+	return copy(p, d.data), io.EOF
+}
+func (d *dataThenEOF) Write(p []byte) (int, error) { return len(p), nil }
+func (d *dataThenEOF) Close() error                { return nil }
+
+// blockingReadCloser has no CloseWrite; its Read blocks until Close.
+type blockingReadCloser struct {
+	closeCh   chan struct{}
+	closeOnce sync.Once
+	closed    bool
+}
+
+func (b *blockingReadCloser) Read(p []byte) (int, error) {
+	<-b.closeCh
+	return 0, io.EOF
+}
+func (b *blockingReadCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (b *blockingReadCloser) Close() error {
+	b.closeOnce.Do(func() {
+		b.closed = true
+		close(b.closeCh)
+	})
+	return nil
+}
+
+func TestStreamConnZeroLengthReadReturnsImmediately(t *testing.T) {
+	// A silent stream: nothing is ever written. A zero-length read must return
+	// (0, nil) at once rather than blocking on the pump.
+	_, client := net.Pipe()
+	sc := newStreamConn(client, &streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil)
+	defer sc.Close()
+
+	done := make(chan struct{})
+	var n int
+	var err error
+	go func() {
+		n, err = sc.Read(nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("zero-length Read blocked")
+	}
+	if n != 0 || err != nil {
+		t.Fatalf("zero-length Read = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+func TestStreamConnReadAfterCloseFails(t *testing.T) {
+	sc := newStreamConn(
+		&blockingReadCloser{closeCh: make(chan struct{})},
+		&streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil,
+	)
+	sc.Close()
+
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = sc.Read(make([]byte, 8))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read after Close blocked")
+	}
+	if err == nil {
+		t.Fatal("Read after Close returned nil error, want failure")
+	}
+}
+
+func TestStreamConnWriteAfterCloseFails(t *testing.T) {
+	sc := newStreamConn(
+		&blockingReadCloser{closeCh: make(chan struct{})},
+		&streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil,
+	)
+	sc.Close()
+	if _, err := sc.Write([]byte("data")); err == nil {
+		t.Fatal("Write after Close returned nil error, want failure")
+	}
+}
+
+func TestStreamConnCloseWithoutHalfCloseClosesImmediately(t *testing.T) {
+	// An rwc with no CloseWrite can't elicit a clean remote EOF, so Close must
+	// close it right away instead of waiting out drainForceTimeout.
+	b := &blockingReadCloser{closeCh: make(chan struct{})}
+	sc := newStreamConn(b, &streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil)
+
+	start := time.Now()
+	sc.Close()
+	if !b.closed {
+		t.Fatal("Close did not close rwc when half-close is unavailable")
+	}
+	if elapsed := time.Since(start); elapsed >= drainForceTimeout {
+		t.Fatalf("Close took %v; expected an immediate close", elapsed)
+	}
+}
+
 func TestStreamConnCloseWrite(t *testing.T) {
 	// Use TCP connections instead of net.Pipe() because net.Pipe doesn't
 	// support half-close (CloseWrite). TCP connections do.
@@ -414,6 +631,50 @@ func TestStreamConnCloseWriteNoSupport(t *testing.T) {
 	}
 }
 
+// trackReadCloser records whether it was drained to EOF and closed.
+type trackReadCloser struct {
+	r       *bytes.Reader
+	readAll bool
+	closed  bool
+}
+
+func (t *trackReadCloser) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err == io.EOF {
+		t.readAll = true
+	}
+	return n, err
+}
+func (t *trackReadCloser) Close() error { t.closed = true; return nil }
+
+type nopWriteCloser struct{}
+
+func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (nopWriteCloser) Close() error                { return nil }
+
+func TestH2StreamRWCCloseDrainsBeforeClosing(t *testing.T) {
+	// Close must drain the response body to EOF before closing it; closing
+	// while data is pending is what makes net/http2 send a fingerprintable RST.
+	trc := &trackReadCloser{r: bytes.NewReader([]byte("leftover data"))}
+	rwc := &h2StreamRWC{
+		reader:       trc,
+		writer:       nopWriteCloser{},
+		transport:    &h2Transport{maxStreams: 100},
+		tunnelCancel: func() {},
+	}
+	rwc.transport.activeStreams.Add(1)
+
+	if err := rwc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !trc.readAll {
+		t.Error("Close did not drain the reader to EOF before closing")
+	}
+	if !trc.closed {
+		t.Error("Close did not close the reader")
+	}
+}
+
 func TestH2StreamRWCCloseWriteThenClose(t *testing.T) {
 	pr, pw := io.Pipe()
 	rwc := &h2StreamRWC{
@@ -453,7 +714,7 @@ func TestConnPoolBasic(t *testing.T) {
 		return &h2Transport{
 			tlsConn:    client,
 			serverAddr: "test:443",
-			maxStreams:  100,
+			maxStreams: 100,
 			localAddr:  &streamAddr{"tcp", "local"},
 			remoteAddr: &streamAddr{"tcp", "remote"},
 		}, nil
@@ -581,7 +842,7 @@ func TestMasqueradeDefaults(t *testing.T) {
 type panicResponseWriter struct{}
 
 func (pw *panicResponseWriter) Header() http.Header        { return http.Header{} }
-func (pw *panicResponseWriter) WriteHeader(statusCode int)  {}
+func (pw *panicResponseWriter) WriteHeader(statusCode int) {}
 func (pw *panicResponseWriter) Write(b []byte) (int, error) {
 	panic("Write called after Handler finished")
 }
@@ -636,7 +897,7 @@ type slowResponseWriter struct {
 	once    sync.Once
 }
 
-func (sw *slowResponseWriter) Header() http.Header       { return http.Header{} }
+func (sw *slowResponseWriter) Header() http.Header        { return http.Header{} }
 func (sw *slowResponseWriter) WriteHeader(statusCode int) {}
 func (sw *slowResponseWriter) Write(b []byte) (int, error) {
 	sw.once.Do(func() { close(sw.started) })

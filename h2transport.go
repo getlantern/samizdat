@@ -21,15 +21,15 @@ import (
 type h2Transport struct {
 	tlsConn     net.Conn
 	h2Roundtrip http.RoundTripper
-	serverAddr string
-	localAddr  net.Addr
-	remoteAddr net.Addr
-	shaper     *Shaper
+	serverAddr  string
+	localAddr   net.Addr
+	remoteAddr  net.Addr
+	shaper      *Shaper
 
-	mu           sync.Mutex
+	mu            sync.Mutex
 	activeStreams atomic.Int32
 	maxStreams    int
-	closed       bool
+	closed        bool
 }
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
@@ -50,7 +50,7 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 		serverAddr:  serverAddr,
 		localAddr:   tlsConn.LocalAddr(),
 		remoteAddr:  tlsConn.RemoteAddr(),
-		maxStreams:   maxStreams,
+		maxStreams:  maxStreams,
 		shaper:      shaper,
 	}
 
@@ -205,32 +205,33 @@ func (s *h2StreamRWC) Write(b []byte) (int, error) {
 	return s.writer.Write(b)
 }
 
+// abort force-closes the response body to unblock a read stalled on a stream
+// the server never ends. This sends RST_STREAM and is a last resort; the
+// graceful path is Close, which drains to EOF first.
+func (s *h2StreamRWC) abort() {
+	s.reader.Close()
+}
+
+// Close finalizes the stream. It drains any remaining response body to EOF
+// before closing the reader: closing resp.Body while data is still pending
+// makes net/http2 abort the stream with RST_STREAM, an abrupt reset a censor
+// could fingerprint, whereas draining first lets the stream end with a normal
+// END_STREAM. A server that never ends the stream is force-closed after
+// drainForceTimeout. streamConn's read pump has normally already drained (or
+// aborted) the body before Close runs, so the copy returns at once; the drain
+// keeps Close self-safe for any direct caller.
 func (s *h2StreamRWC) Close() error {
 	var closeErr error
 	s.once.Do(func() {
 		closeErr = s.closeWriter()
-
-		// Do NOT close s.reader (resp.Body) synchronously — that calls
-		// abortStream which sends RST_STREAM, disrupting other multiplexed
-		// streams. Instead, drain resp.Body to EOF in the background so the
-		// H2 stream completes cleanly (server sends END_STREAM, writeRequest
-		// goroutine finishes via forgetStreamID). The drain also ensures the
-		// response body is closed and resources are released promptly even if
-		// the caller didn't read to EOF.
-		go func() {
-			// Use a timeout to prevent permanent goroutine leak if the
-			// server never sends END_STREAM (crash, network partition).
-			timer := time.AfterFunc(5*time.Second, func() {
-				s.reader.Close()
-			})
-			io.Copy(io.Discard, s.reader)
-			timer.Stop()
-			s.reader.Close()
-			if s.tunnelCancel != nil {
-				s.tunnelCancel()
-			}
-			s.transport.activeStreams.Add(-1)
-		}()
+		timer := time.AfterFunc(drainForceTimeout, func() { s.reader.Close() })
+		io.Copy(io.Discard, s.reader)
+		timer.Stop()
+		s.reader.Close()
+		if s.tunnelCancel != nil {
+			s.tunnelCancel()
+		}
+		s.transport.activeStreams.Add(-1)
 	})
 	return closeErr
 }
