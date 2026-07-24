@@ -57,9 +57,11 @@ type streamConn struct {
 }
 
 // readResult carries a pooled buffer plus the length read and any terminal
-// error. The receiver copies the data out and returns buf to the pool.
+// error. The receiver copies the data out and returns buf to the pool. buf is a
+// *[]byte because sync.Pool must hold pointer-like values to avoid an
+// allocation on every Put (staticcheck SA6002).
 type readResult struct {
-	buf []byte
+	buf *[]byte
 	n   int
 	err error
 }
@@ -78,7 +80,7 @@ func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, desti
 		done:          make(chan struct{}),
 		pumpDone:      make(chan struct{}),
 	}
-	sc.bufPool.New = func() any { return make([]byte, readChunkSize) }
+	sc.bufPool.New = func() any { b := make([]byte, readChunkSize); return &b }
 	go sc.readLoop()
 	return sc
 }
@@ -89,20 +91,20 @@ func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, desti
 func (sc *streamConn) readLoop() {
 	defer close(sc.pumpDone)
 	for {
-		buf := sc.bufPool.Get().([]byte)
-		n, err := sc.rwc.Read(buf)
+		bufp := sc.bufPool.Get().(*[]byte)
+		n, err := sc.rwc.Read(*bufp)
 		if n == 0 && err == nil {
-			sc.bufPool.Put(buf)
+			sc.bufPool.Put(bufp)
 			continue
 		}
 		// Deliver data and a terminal error in one result so the pump can exit
 		// after a single send. A separate error send could block forever if the
 		// caller consumes the final data but never reads again or closes.
 		select {
-		case sc.readResults <- readResult{buf: buf, n: n, err: err}:
-			// Read owns buf now and returns it to the pool.
+		case sc.readResults <- readResult{buf: bufp, n: n, err: err}:
+			// Read owns bufp now and returns it to the pool.
 		case <-sc.done: // draining after Close: discard
-			sc.bufPool.Put(buf)
+			sc.bufPool.Put(bufp)
 		}
 		if err != nil {
 			return
@@ -111,6 +113,12 @@ func (sc *streamConn) readLoop() {
 }
 
 func (sc *streamConn) Read(b []byte) (int, error) {
+	// Per io.Reader/net.Conn convention a zero-length read returns immediately
+	// and must not block on the pump, deadline, or done channels.
+	if len(b) == 0 {
+		return 0, nil
+	}
+
 	sc.readMu.Lock()
 	defer sc.readMu.Unlock()
 
@@ -139,13 +147,14 @@ func (sc *streamConn) Read(b []byte) (int, error) {
 			sc.bufPool.Put(res.buf)
 			return 0, sc.readErr
 		}
-		n := copy(b, res.buf[:res.n])
+		data := (*res.buf)[:res.n]
+		n := copy(b, data)
 		if n < res.n {
 			// Copy the tail into our own buffer so the pooled buffer can be
 			// reused immediately; aliasing it would race with the pump's next
 			// read. Any terminal error stays in readErr and surfaces once this
 			// buffered tail is drained, so the caller sees all bytes first.
-			sc.readBuf = append([]byte(nil), res.buf[n:res.n]...)
+			sc.readBuf = append([]byte(nil), data[n:]...)
 		}
 		sc.bufPool.Put(res.buf)
 		return n, nil
@@ -158,6 +167,8 @@ func (sc *streamConn) Read(b []byte) (int, error) {
 
 func (sc *streamConn) Write(b []byte) (int, error) {
 	select {
+	case <-sc.done:
+		return 0, net.ErrClosed
 	case <-sc.writeDeadline.wait():
 		return 0, &timeoutError{}
 	default:

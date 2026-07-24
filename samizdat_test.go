@@ -454,6 +454,41 @@ func (b *blockingReadCloser) Close() error {
 	return nil
 }
 
+func TestStreamConnZeroLengthReadReturnsImmediately(t *testing.T) {
+	// A silent stream: nothing is ever written. A zero-length read must return
+	// (0, nil) at once rather than blocking on the pump.
+	_, client := net.Pipe()
+	sc := newStreamConn(client, &streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil)
+	defer sc.Close()
+
+	done := make(chan struct{})
+	var n int
+	var err error
+	go func() {
+		n, err = sc.Read(nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("zero-length Read blocked")
+	}
+	if n != 0 || err != nil {
+		t.Fatalf("zero-length Read = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
+func TestStreamConnWriteAfterCloseFails(t *testing.T) {
+	sc := newStreamConn(
+		&blockingReadCloser{closeCh: make(chan struct{})},
+		&streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil,
+	)
+	sc.Close()
+	if _, err := sc.Write([]byte("data")); err == nil {
+		t.Fatal("Write after Close returned nil error, want failure")
+	}
+}
+
 func TestStreamConnCloseWithoutHalfCloseClosesImmediately(t *testing.T) {
 	// An rwc with no CloseWrite can't elicit a clean remote EOF, so Close must
 	// close it right away instead of waiting out drainForceTimeout.
