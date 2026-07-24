@@ -39,11 +39,14 @@ type streamConn struct {
 	done        chan struct{} // closed by Close; stops Read and drains the pump
 	pumpDone    chan struct{} // closed when the pump goroutine exits
 
-	// readBuf and pendingErr hold the tail of a chunk that didn't fit in the
-	// caller's buffer. Accessed only from Read, which net.Conn callers
-	// serialize (concurrent Reads are not supported).
-	readBuf    []byte
-	pendingErr error
+	// readBuf holds the tail of a chunk that didn't fit in the caller's buffer.
+	// readErr is the sticky terminal error from the pump; once set it is
+	// returned by every subsequent Read (matching io.Reader), so a read past
+	// EOF returns the error rather than blocking on the exited pump. Both are
+	// accessed only from Read, which net.Conn callers serialize (concurrent
+	// Reads are not supported).
+	readBuf []byte
+	readErr error
 
 	closeOnce sync.Once
 	mu        sync.Mutex
@@ -81,17 +84,21 @@ func (sc *streamConn) readLoop() {
 	for {
 		buf := make([]byte, readChunkSize)
 		n, err := sc.rwc.Read(buf)
-		if n > 0 {
+		if n > 0 || err != nil {
+			// Deliver data and a terminal error in one result so the pump can
+			// exit after a single send. A separate error send could block
+			// forever if the caller consumes the final data but never reads
+			// again or closes.
+			res := readResult{err: err}
+			if n > 0 {
+				res.data = buf[:n]
+			}
 			select {
-			case sc.readResults <- readResult{data: buf[:n]}:
+			case sc.readResults <- res:
 			case <-sc.done: // draining after Close: discard
 			}
 		}
 		if err != nil {
-			select {
-			case sc.readResults <- readResult{err: err}:
-			case <-sc.done:
-			}
 			return
 		}
 	}
@@ -110,22 +117,24 @@ func (sc *streamConn) Read(b []byte) (int, error) {
 		sc.readBuf = sc.readBuf[n:]
 		return n, nil
 	}
-	if sc.pendingErr != nil {
-		err := sc.pendingErr
-		sc.pendingErr = nil
-		return 0, err
+	if sc.readErr != nil {
+		return 0, sc.readErr
 	}
 
 	select {
 	case res := <-sc.readResults:
+		if res.err != nil {
+			sc.readErr = res.err
+		}
 		if len(res.data) == 0 {
-			return 0, res.err
+			return 0, sc.readErr
 		}
 		n := copy(b, res.data)
 		if n < len(res.data) {
 			sc.readBuf = res.data[n:]
 		}
-		sc.pendingErr = res.err
+		// Any terminal error is held in readErr and surfaces once the buffered
+		// data is drained, so the caller sees all bytes before the error.
 		return n, nil
 	case <-sc.readDeadline.wait():
 		return 0, &timeoutError{}

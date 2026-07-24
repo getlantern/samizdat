@@ -381,6 +381,59 @@ func TestStreamConnReadDeliversDataSplitAcrossBuffers(t *testing.T) {
 	}
 }
 
+func TestStreamConnReadDeliversFinalDataThenError(t *testing.T) {
+	// A reader that returns data and io.EOF together on its final read; the
+	// pump must not block on a second send, and reads past EOF must keep
+	// returning the error rather than hanging.
+	sc := newStreamConn(
+		&dataThenEOF{data: []byte("bye")},
+		&streamAddr{"tcp", "local"},
+		&streamAddr{"tcp", "remote"},
+		"remote",
+		nil,
+	)
+	defer sc.Close()
+
+	buf := make([]byte, 16)
+	n, err := sc.Read(buf)
+	if err != nil || string(buf[:n]) != "bye" {
+		t.Fatalf("first read: got %q err %v, want \"bye\" nil", buf[:n], err)
+	}
+
+	// The pump has exited; these must return EOF promptly, not block.
+	for i := 0; i < 3; i++ {
+		done := make(chan struct{})
+		go func() {
+			_, err = sc.Read(buf)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("read past EOF blocked")
+		}
+		if err != io.EOF {
+			t.Fatalf("read past EOF: got %v, want io.EOF", err)
+		}
+	}
+}
+
+// dataThenEOF returns its data and io.EOF on the first read, then io.EOF.
+type dataThenEOF struct {
+	data []byte
+	done bool
+}
+
+func (d *dataThenEOF) Read(p []byte) (int, error) {
+	if d.done {
+		return 0, io.EOF
+	}
+	d.done = true
+	return copy(p, d.data), io.EOF
+}
+func (d *dataThenEOF) Write(p []byte) (int, error) { return len(p), nil }
+func (d *dataThenEOF) Close() error                { return nil }
+
 func TestStreamConnCloseWrite(t *testing.T) {
 	// Use TCP connections instead of net.Pipe() because net.Pipe doesn't
 	// support half-close (CloseWrite). TCP connections do.
