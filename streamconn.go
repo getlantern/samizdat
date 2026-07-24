@@ -177,17 +177,22 @@ func (sc *streamConn) Close() error {
 		sc.readDeadline.set(time.Time{})
 		sc.writeDeadline.set(time.Time{})
 
-		// Half-close so the server ends the stream; the pump then drains the
-		// response to EOF rather than aborting it with an RST.
-		if cw, ok := sc.rwc.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
-		}
 		close(sc.done)
 
-		// The timer only aborts the read to unblock a stalled pump; it must not
-		// run the graceful drain in closeRWC, which would read rwc concurrently
-		// with the still-blocked pump. Once the pump exits, the goroutine runs
-		// the graceful close.
+		cw, canHalfClose := sc.rwc.(interface{ CloseWrite() error })
+		if !canHalfClose {
+			// Without half-close there's no way to elicit a clean remote EOF, so
+			// draining would just block until the force timer. Close rwc now to
+			// unblock the pump and release resources immediately.
+			sc.closeRWC()
+			return
+		}
+
+		// Half-close so the server ends the stream; the pump then drains the
+		// response to EOF and the goroutine runs the graceful close once the
+		// pump exits. The timer only aborts the read to unblock a stalled pump;
+		// it must not run closeRWC's drain while the pump is still reading rwc.
+		cw.CloseWrite()
 		forceTimer := time.AfterFunc(drainForceTimeout, sc.abortRWC)
 		go func() {
 			<-sc.pumpDone

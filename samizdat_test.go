@@ -434,6 +434,42 @@ func (d *dataThenEOF) Read(p []byte) (int, error) {
 func (d *dataThenEOF) Write(p []byte) (int, error) { return len(p), nil }
 func (d *dataThenEOF) Close() error                { return nil }
 
+// blockingReadCloser has no CloseWrite; its Read blocks until Close.
+type blockingReadCloser struct {
+	closeCh   chan struct{}
+	closeOnce sync.Once
+	closed    bool
+}
+
+func (b *blockingReadCloser) Read(p []byte) (int, error) {
+	<-b.closeCh
+	return 0, io.EOF
+}
+func (b *blockingReadCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (b *blockingReadCloser) Close() error {
+	b.closeOnce.Do(func() {
+		b.closed = true
+		close(b.closeCh)
+	})
+	return nil
+}
+
+func TestStreamConnCloseWithoutHalfCloseClosesImmediately(t *testing.T) {
+	// An rwc with no CloseWrite can't elicit a clean remote EOF, so Close must
+	// close it right away instead of waiting out drainForceTimeout.
+	b := &blockingReadCloser{closeCh: make(chan struct{})}
+	sc := newStreamConn(b, &streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil)
+
+	start := time.Now()
+	sc.Close()
+	if !b.closed {
+		t.Fatal("Close did not close rwc when half-close is unavailable")
+	}
+	if elapsed := time.Since(start); elapsed >= drainForceTimeout {
+		t.Fatalf("Close took %v; expected an immediate close", elapsed)
+	}
+}
+
 func TestStreamConnCloseWrite(t *testing.T) {
 	// Use TCP connections instead of net.Pipe() because net.Pipe doesn't
 	// support half-close (CloseWrite). TCP connections do.
