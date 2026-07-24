@@ -199,7 +199,6 @@ func TestShaperNoOp(t *testing.T) {
 	}
 }
 
-
 func TestRecordFragmenter(t *testing.T) {
 	rf := NewRecordFragmenter(true)
 
@@ -308,6 +307,77 @@ func TestStreamConnDeadline(t *testing.T) {
 	}
 	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
 		t.Errorf("expected timeout error, got %v", err)
+	}
+}
+
+func TestStreamConnDeadlineInterruptsBlockedRead(t *testing.T) {
+	// The server side is never written to, so the underlying read blocks
+	// indefinitely — the exact failure mode the deadline must interrupt.
+	server, client := net.Pipe()
+	defer server.Close()
+
+	sc := newStreamConn(
+		client,
+		&streamAddr{"tcp", "local"},
+		&streamAddr{"tcp", "remote"},
+		"remote",
+		nil,
+	)
+	defer sc.Close()
+
+	sc.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	buf := make([]byte, 16)
+	start := time.Now()
+	_, err := sc.Read(buf)
+	if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("read blocked %v; deadline did not interrupt it", elapsed)
+	}
+
+	// The timeout is recoverable: extending the deadline lets a subsequent
+	// read succeed on the same conn.
+	go func() {
+		server.Write([]byte("late"))
+	}()
+	sc.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := sc.Read(buf)
+	if err != nil {
+		t.Fatalf("read after extending deadline: %v", err)
+	}
+	if string(buf[:n]) != "late" {
+		t.Errorf("got %q, want %q", buf[:n], "late")
+	}
+}
+
+func TestStreamConnReadDeliversDataSplitAcrossBuffers(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+
+	sc := newStreamConn(
+		client,
+		&streamAddr{"tcp", "local"},
+		&streamAddr{"tcp", "remote"},
+		"remote",
+		nil,
+	)
+	defer sc.Close()
+
+	go func() {
+		server.Write([]byte("abcdef"))
+	}()
+
+	// Read with a buffer smaller than the delivered chunk; the remainder must
+	// survive to the next read rather than being dropped.
+	buf := make([]byte, 4)
+	n, err := sc.Read(buf)
+	if err != nil || string(buf[:n]) != "abcd" {
+		t.Fatalf("first read: got %q err %v", buf[:n], err)
+	}
+	n, err = sc.Read(buf)
+	if err != nil || string(buf[:n]) != "ef" {
+		t.Fatalf("second read: got %q err %v", buf[:n], err)
 	}
 }
 
@@ -453,7 +523,7 @@ func TestConnPoolBasic(t *testing.T) {
 		return &h2Transport{
 			tlsConn:    client,
 			serverAddr: "test:443",
-			maxStreams:  100,
+			maxStreams: 100,
 			localAddr:  &streamAddr{"tcp", "local"},
 			remoteAddr: &streamAddr{"tcp", "remote"},
 		}, nil
@@ -581,7 +651,7 @@ func TestMasqueradeDefaults(t *testing.T) {
 type panicResponseWriter struct{}
 
 func (pw *panicResponseWriter) Header() http.Header        { return http.Header{} }
-func (pw *panicResponseWriter) WriteHeader(statusCode int)  {}
+func (pw *panicResponseWriter) WriteHeader(statusCode int) {}
 func (pw *panicResponseWriter) Write(b []byte) (int, error) {
 	panic("Write called after Handler finished")
 }
@@ -636,7 +706,7 @@ type slowResponseWriter struct {
 	once    sync.Once
 }
 
-func (sw *slowResponseWriter) Header() http.Header       { return http.Header{} }
+func (sw *slowResponseWriter) Header() http.Header        { return http.Header{} }
 func (sw *slowResponseWriter) WriteHeader(statusCode int) {}
 func (sw *slowResponseWriter) Write(b []byte) (int, error) {
 	sw.once.Do(func() { close(sw.started) })

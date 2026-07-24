@@ -11,7 +11,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -21,15 +20,15 @@ import (
 type h2Transport struct {
 	tlsConn     net.Conn
 	h2Roundtrip http.RoundTripper
-	serverAddr string
-	localAddr  net.Addr
-	remoteAddr net.Addr
-	shaper     *Shaper
+	serverAddr  string
+	localAddr   net.Addr
+	remoteAddr  net.Addr
+	shaper      *Shaper
 
-	mu           sync.Mutex
+	mu            sync.Mutex
 	activeStreams atomic.Int32
 	maxStreams    int
-	closed       bool
+	closed        bool
 }
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
@@ -50,7 +49,7 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 		serverAddr:  serverAddr,
 		localAddr:   tlsConn.LocalAddr(),
 		remoteAddr:  tlsConn.RemoteAddr(),
-		maxStreams:   maxStreams,
+		maxStreams:  maxStreams,
 		shaper:      shaper,
 	}
 
@@ -205,32 +204,19 @@ func (s *h2StreamRWC) Write(b []byte) (int, error) {
 	return s.writer.Write(b)
 }
 
+// Close finalizes the stream. streamConn drains the response body to EOF (or
+// force-closes it after a timeout) via its read pump before calling Close, so
+// closing the reader here does not abort an in-flight stream with an RST that
+// a censor could fingerprint.
 func (s *h2StreamRWC) Close() error {
 	var closeErr error
 	s.once.Do(func() {
 		closeErr = s.closeWriter()
-
-		// Do NOT close s.reader (resp.Body) synchronously — that calls
-		// abortStream which sends RST_STREAM, disrupting other multiplexed
-		// streams. Instead, drain resp.Body to EOF in the background so the
-		// H2 stream completes cleanly (server sends END_STREAM, writeRequest
-		// goroutine finishes via forgetStreamID). The drain also ensures the
-		// response body is closed and resources are released promptly even if
-		// the caller didn't read to EOF.
-		go func() {
-			// Use a timeout to prevent permanent goroutine leak if the
-			// server never sends END_STREAM (crash, network partition).
-			timer := time.AfterFunc(5*time.Second, func() {
-				s.reader.Close()
-			})
-			io.Copy(io.Discard, s.reader)
-			timer.Stop()
-			s.reader.Close()
-			if s.tunnelCancel != nil {
-				s.tunnelCancel()
-			}
-			s.transport.activeStreams.Add(-1)
-		}()
+		s.reader.Close()
+		if s.tunnelCancel != nil {
+			s.tunnelCancel()
+		}
+		s.transport.activeStreams.Add(-1)
 	})
 	return closeErr
 }
