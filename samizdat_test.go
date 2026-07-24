@@ -478,6 +478,29 @@ func TestStreamConnZeroLengthReadReturnsImmediately(t *testing.T) {
 	}
 }
 
+func TestStreamConnReadAfterCloseFails(t *testing.T) {
+	sc := newStreamConn(
+		&blockingReadCloser{closeCh: make(chan struct{})},
+		&streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil,
+	)
+	sc.Close()
+
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = sc.Read(make([]byte, 8))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Read after Close blocked")
+	}
+	if err == nil {
+		t.Fatal("Read after Close returned nil error, want failure")
+	}
+}
+
 func TestStreamConnWriteAfterCloseFails(t *testing.T) {
 	sc := newStreamConn(
 		&blockingReadCloser{closeCh: make(chan struct{})},

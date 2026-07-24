@@ -122,6 +122,14 @@ func (sc *streamConn) Read(b []byte) (int, error) {
 	sc.readMu.Lock()
 	defer sc.readMu.Unlock()
 
+	// Once closed, reads stop promptly with an error rather than draining any
+	// buffered tail or sticky error (net.Conn semantics).
+	select {
+	case <-sc.done:
+		return 0, net.ErrClosed
+	default:
+	}
+
 	// An already-expired deadline takes precedence over buffered or new data.
 	select {
 	case <-sc.readDeadline.wait():
@@ -161,7 +169,7 @@ func (sc *streamConn) Read(b []byte) (int, error) {
 	case <-sc.readDeadline.wait():
 		return 0, &timeoutError{}
 	case <-sc.done:
-		return 0, io.EOF
+		return 0, net.ErrClosed
 	}
 }
 
