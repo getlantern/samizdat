@@ -39,6 +39,8 @@ type streamConn struct {
 	done        chan struct{} // closed by Close; stops Read and drains the pump
 	pumpDone    chan struct{} // closed when the pump goroutine exits
 
+	bufPool sync.Pool // reusable readChunkSize buffers for the pump
+
 	// readMu serializes Read so concurrent callers (which net.Conn permits)
 	// don't race on readBuf/readErr. readBuf holds the tail of a chunk that
 	// didn't fit in the caller's buffer; readErr is the sticky terminal error
@@ -48,14 +50,18 @@ type streamConn struct {
 	readBuf []byte
 	readErr error
 
-	closeOnce sync.Once
-	mu        sync.Mutex
-	closed    bool
+	closeOnce    sync.Once
+	rwcCloseOnce sync.Once
+	mu           sync.Mutex
+	closed       bool
 }
 
+// readResult carries a pooled buffer plus the length read and any terminal
+// error. The receiver copies the data out and returns buf to the pool.
 type readResult struct {
-	data []byte
-	err  error
+	buf []byte
+	n   int
+	err error
 }
 
 // newStreamConn creates a net.Conn backed by the given ReadWriteCloser.
@@ -72,6 +78,7 @@ func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, desti
 		done:          make(chan struct{}),
 		pumpDone:      make(chan struct{}),
 	}
+	sc.bufPool.New = func() any { return make([]byte, readChunkSize) }
 	go sc.readLoop()
 	return sc
 }
@@ -82,21 +89,20 @@ func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, desti
 func (sc *streamConn) readLoop() {
 	defer close(sc.pumpDone)
 	for {
-		buf := make([]byte, readChunkSize)
+		buf := sc.bufPool.Get().([]byte)
 		n, err := sc.rwc.Read(buf)
-		if n > 0 || err != nil {
-			// Deliver data and a terminal error in one result so the pump can
-			// exit after a single send. A separate error send could block
-			// forever if the caller consumes the final data but never reads
-			// again or closes.
-			res := readResult{err: err}
-			if n > 0 {
-				res.data = buf[:n]
-			}
-			select {
-			case sc.readResults <- res:
-			case <-sc.done: // draining after Close: discard
-			}
+		if n == 0 && err == nil {
+			sc.bufPool.Put(buf)
+			continue
+		}
+		// Deliver data and a terminal error in one result so the pump can exit
+		// after a single send. A separate error send could block forever if the
+		// caller consumes the final data but never reads again or closes.
+		select {
+		case sc.readResults <- readResult{buf: buf, n: n, err: err}:
+			// Read owns buf now and returns it to the pool.
+		case <-sc.done: // draining after Close: discard
+			sc.bufPool.Put(buf)
 		}
 		if err != nil {
 			return
@@ -129,15 +135,19 @@ func (sc *streamConn) Read(b []byte) (int, error) {
 		if res.err != nil {
 			sc.readErr = res.err
 		}
-		if len(res.data) == 0 {
+		if res.n == 0 {
+			sc.bufPool.Put(res.buf)
 			return 0, sc.readErr
 		}
-		n := copy(b, res.data)
-		if n < len(res.data) {
-			sc.readBuf = res.data[n:]
+		n := copy(b, res.buf[:res.n])
+		if n < res.n {
+			// Copy the tail into our own buffer so the pooled buffer can be
+			// reused immediately; aliasing it would race with the pump's next
+			// read. Any terminal error stays in readErr and surfaces once this
+			// buffered tail is drained, so the caller sees all bytes first.
+			sc.readBuf = append([]byte(nil), res.buf[n:res.n]...)
 		}
-		// Any terminal error is held in readErr and surfaces once the buffered
-		// data is drained, so the caller sees all bytes before the error.
+		sc.bufPool.Put(res.buf)
 		return n, nil
 	case <-sc.readDeadline.wait():
 		return 0, &timeoutError{}
@@ -174,14 +184,21 @@ func (sc *streamConn) Close() error {
 		}
 		close(sc.done)
 
-		forceTimer := time.AfterFunc(drainForceTimeout, func() { sc.rwc.Close() })
+		// The timer force-closes rwc to unblock a stalled pump; the goroutine
+		// closes it after the pump drains normally. Both funnel through
+		// rwcCloseOnce so rwc.Close is called exactly once even if they race.
+		forceTimer := time.AfterFunc(drainForceTimeout, sc.closeRWC)
 		go func() {
 			<-sc.pumpDone
 			forceTimer.Stop()
-			sc.rwc.Close()
+			sc.closeRWC()
 		}()
 	})
 	return nil
+}
+
+func (sc *streamConn) closeRWC() {
+	sc.rwcCloseOnce.Do(func() { sc.rwc.Close() })
 }
 
 func (sc *streamConn) LocalAddr() net.Addr  { return sc.localAddr }
@@ -266,7 +283,7 @@ func (d *pipeDeadline) set(t time.Time) {
 }
 
 // wait returns a channel that is closed when the deadline is reached.
-func (d *pipeDeadline) wait() chan struct{} {
+func (d *pipeDeadline) wait() <-chan struct{} {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.cancel
