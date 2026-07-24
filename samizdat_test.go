@@ -537,6 +537,50 @@ func TestStreamConnCloseWriteNoSupport(t *testing.T) {
 	}
 }
 
+// trackReadCloser records whether it was drained to EOF and closed.
+type trackReadCloser struct {
+	r       *bytes.Reader
+	readAll bool
+	closed  bool
+}
+
+func (t *trackReadCloser) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err == io.EOF {
+		t.readAll = true
+	}
+	return n, err
+}
+func (t *trackReadCloser) Close() error { t.closed = true; return nil }
+
+type nopWriteCloser struct{}
+
+func (nopWriteCloser) Write(p []byte) (int, error) { return len(p), nil }
+func (nopWriteCloser) Close() error                { return nil }
+
+func TestH2StreamRWCCloseDrainsBeforeClosing(t *testing.T) {
+	// Close must drain the response body to EOF before closing it; closing
+	// while data is pending is what makes net/http2 send a fingerprintable RST.
+	trc := &trackReadCloser{r: bytes.NewReader([]byte("leftover data"))}
+	rwc := &h2StreamRWC{
+		reader:       trc,
+		writer:       nopWriteCloser{},
+		transport:    &h2Transport{maxStreams: 100},
+		tunnelCancel: func() {},
+	}
+	rwc.transport.activeStreams.Add(1)
+
+	if err := rwc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !trc.readAll {
+		t.Error("Close did not drain the reader to EOF before closing")
+	}
+	if !trc.closed {
+		t.Error("Close did not close the reader")
+	}
+}
+
 func TestH2StreamRWCCloseWriteThenClose(t *testing.T) {
 	pr, pw := io.Pipe()
 	rwc := &h2StreamRWC{

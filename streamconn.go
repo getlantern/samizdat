@@ -184,10 +184,11 @@ func (sc *streamConn) Close() error {
 		}
 		close(sc.done)
 
-		// The timer force-closes rwc to unblock a stalled pump; the goroutine
-		// closes it after the pump drains normally. Both funnel through
-		// rwcCloseOnce so rwc.Close is called exactly once even if they race.
-		forceTimer := time.AfterFunc(drainForceTimeout, sc.closeRWC)
+		// The timer only aborts the read to unblock a stalled pump; it must not
+		// run the graceful drain in closeRWC, which would read rwc concurrently
+		// with the still-blocked pump. Once the pump exits, the goroutine runs
+		// the graceful close.
+		forceTimer := time.AfterFunc(drainForceTimeout, sc.abortRWC)
 		go func() {
 			<-sc.pumpDone
 			forceTimer.Stop()
@@ -195,6 +196,23 @@ func (sc *streamConn) Close() error {
 		}()
 	})
 	return nil
+}
+
+// readAborter can force its read side closed to unblock a stalled read,
+// bypassing the drain that Close performs.
+type readAborter interface {
+	abort()
+}
+
+// abortRWC unblocks a pump stalled in rwc.Read. A readAborter (the H2 stream)
+// closes just its reader; a plain conn is closed outright, since that is its
+// only way to interrupt a blocked read.
+func (sc *streamConn) abortRWC() {
+	if a, ok := sc.rwc.(readAborter); ok {
+		a.abort()
+		return
+	}
+	sc.closeRWC()
 }
 
 func (sc *streamConn) closeRWC() {

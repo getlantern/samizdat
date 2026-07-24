@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -204,14 +205,28 @@ func (s *h2StreamRWC) Write(b []byte) (int, error) {
 	return s.writer.Write(b)
 }
 
-// Close finalizes the stream. streamConn drains the response body to EOF (or
-// force-closes it after a timeout) via its read pump before calling Close, so
-// closing the reader here does not abort an in-flight stream with an RST that
-// a censor could fingerprint.
+// abort force-closes the response body to unblock a read stalled on a stream
+// the server never ends. This sends RST_STREAM and is a last resort; the
+// graceful path is Close, which drains to EOF first.
+func (s *h2StreamRWC) abort() {
+	s.reader.Close()
+}
+
+// Close finalizes the stream. It drains any remaining response body to EOF
+// before closing the reader: closing resp.Body while data is still pending
+// makes net/http2 abort the stream with RST_STREAM, an abrupt reset a censor
+// could fingerprint, whereas draining first lets the stream end with a normal
+// END_STREAM. A server that never ends the stream is force-closed after
+// drainForceTimeout. streamConn's read pump has normally already drained (or
+// aborted) the body before Close runs, so the copy returns at once; the drain
+// keeps Close self-safe for any direct caller.
 func (s *h2StreamRWC) Close() error {
 	var closeErr error
 	s.once.Do(func() {
 		closeErr = s.closeWriter()
+		timer := time.AfterFunc(drainForceTimeout, func() { s.reader.Close() })
+		io.Copy(io.Discard, s.reader)
+		timer.Stop()
 		s.reader.Close()
 		if s.tunnelCancel != nil {
 			s.tunnelCancel()
