@@ -39,12 +39,12 @@ type streamConn struct {
 	done        chan struct{} // closed by Close; stops Read and drains the pump
 	pumpDone    chan struct{} // closed when the pump goroutine exits
 
-	// readBuf holds the tail of a chunk that didn't fit in the caller's buffer.
-	// readErr is the sticky terminal error from the pump; once set it is
-	// returned by every subsequent Read (matching io.Reader), so a read past
-	// EOF returns the error rather than blocking on the exited pump. Both are
-	// accessed only from Read, which net.Conn callers serialize (concurrent
-	// Reads are not supported).
+	// readMu serializes Read so concurrent callers (which net.Conn permits)
+	// don't race on readBuf/readErr. readBuf holds the tail of a chunk that
+	// didn't fit in the caller's buffer; readErr is the sticky terminal error
+	// from the pump, returned by every subsequent Read (matching io.Reader) so
+	// a read past EOF returns the error rather than blocking on the exited pump.
+	readMu  sync.Mutex
 	readBuf []byte
 	readErr error
 
@@ -105,6 +105,9 @@ func (sc *streamConn) readLoop() {
 }
 
 func (sc *streamConn) Read(b []byte) (int, error) {
+	sc.readMu.Lock()
+	defer sc.readMu.Unlock()
+
 	// An already-expired deadline takes precedence over buffered or new data.
 	select {
 	case <-sc.readDeadline.wait():
