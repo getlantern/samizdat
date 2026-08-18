@@ -71,6 +71,12 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 
 	var err error
 	for attempt := 0; attempt < maxDialAttempts; attempt++ {
+		// A conn-fatal error can race with caller cancellation; stop before
+		// spending another transport on an already-abandoned dial.
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		var transport *h2Transport
 		transport, err = c.pool.getTransport(ctx)
 		if err != nil {

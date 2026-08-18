@@ -3,6 +3,7 @@ package samizdat
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -831,6 +832,29 @@ func TestDialContextNoRetryOnCallerCancel(t *testing.T) {
 	}
 	if createCount != 1 {
 		t.Errorf("createCount = %d, want 1 (caller cancellation must not trigger a redial)", createCount)
+	}
+}
+
+func TestDialContextStopsRetryOnCanceledContext(t *testing.T) {
+	dialCtx, cancel := context.WithCancel(context.Background())
+	createCount := 0
+	pool := newConnPool(100, 5*time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		createCount++
+		return newTestTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			// Cancel the caller's context, then fail conn-fatally — the race the
+			// per-attempt ctx check guards against. Without it the loop redials.
+			cancel()
+			return nil, net.ErrClosed
+		})), nil
+	})
+	defer pool.close()
+	c := &Client{pool: pool}
+
+	if _, err := c.DialContext(dialCtx, "tcp", "example.com:443"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if createCount != 1 {
+		t.Errorf("createCount = %d, want 1 (cancellation must stop retries)", createCount)
 	}
 }
 
