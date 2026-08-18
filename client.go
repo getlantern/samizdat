@@ -50,8 +50,17 @@ func NewClient(config ClientConfig) (*Client, error) {
 	return c, nil
 }
 
+// maxDialAttempts caps DialContext's redials after a conn-fatal failure. Each
+// conn-fatal openTunnel retires its dead transport, so a retry gets a fresh one;
+// the cap bounds the reconnect burst when the server is genuinely unreachable.
+const maxDialAttempts = 3
+
 // DialContext opens a proxied connection to the destination through the server.
 // Multiple calls share the same underlying TLS+H2 connection via multiplexing.
+//
+// A network that resets the shared connection can leave a pooled transport dead
+// but not yet marked closed; DialContext retries such conn-fatal failures on a
+// fresh transport, up to maxDialAttempts, rather than surfacing them.
 func (c *Client) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	c.mu.Lock()
 	if c.closed {
@@ -60,19 +69,26 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 	}
 	c.mu.Unlock()
 
-	// Get an H2 transport with available capacity
-	transport, err := c.pool.getTransport(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting transport: %w", err)
-	}
+	var err error
+	for attempt := 0; attempt < maxDialAttempts; attempt++ {
+		var transport *h2Transport
+		transport, err = c.pool.getTransport(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("getting transport: %w", err)
+		}
 
-	// Open a CONNECT tunnel through the H2 connection
-	conn, err := transport.openTunnel(ctx, address)
-	if err != nil {
-		return nil, fmt.Errorf("opening tunnel to %s: %w", address, err)
+		var conn net.Conn
+		conn, err = transport.openTunnel(ctx, address)
+		if err == nil {
+			return conn, nil
+		}
+		// A conn-fatal error retired this transport, so a retry gets a fresh
+		// one; any other error is not transport-recoverable.
+		if !connFatal(err) {
+			break
+		}
 	}
-
-	return conn, nil
+	return nil, fmt.Errorf("opening tunnel to %s: %w", address, err)
 }
 
 // Close shuts down all connections.

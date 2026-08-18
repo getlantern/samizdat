@@ -781,6 +781,91 @@ func TestOpenTunnelKeepsTransportOnCallerCancel(t *testing.T) {
 	}
 }
 
+func okRoundTripper() http.RoundTripper {
+	return roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
+	})
+}
+
+func deadConnRoundTripper() http.RoundTripper {
+	return roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, net.ErrClosed
+	})
+}
+
+func TestDialContextRetriesAfterConnFatal(t *testing.T) {
+	createCount := 0
+	pool := newConnPool(100, 5*time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		createCount++
+		if createCount == 1 {
+			return newTestTransport(deadConnRoundTripper()), nil
+		}
+		return newTestTransport(okRoundTripper()), nil
+	})
+	defer pool.close()
+	c := &Client{pool: pool}
+
+	conn, err := c.DialContext(ctx(t), "tcp", "example.com:443")
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	conn.Close()
+	if createCount != 2 {
+		t.Errorf("createCount = %d, want 2 (dead transport retired, fresh one dialed)", createCount)
+	}
+}
+
+func TestDialContextNoRetryOnCallerCancel(t *testing.T) {
+	createCount := 0
+	pool := newConnPool(100, 5*time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		createCount++
+		return newTestTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, context.Canceled
+		})), nil
+	})
+	defer pool.close()
+	c := &Client{pool: pool}
+
+	if _, err := c.DialContext(ctx(t), "tcp", "example.com:443"); err == nil {
+		t.Fatal("DialContext: expected error")
+	}
+	if createCount != 1 {
+		t.Errorf("createCount = %d, want 1 (caller cancellation must not trigger a redial)", createCount)
+	}
+}
+
+func TestDialContextGivesUpAfterMaxAttempts(t *testing.T) {
+	createCount := 0
+	pool := newConnPool(100, 5*time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		createCount++
+		return newTestTransport(deadConnRoundTripper()), nil
+	})
+	defer pool.close()
+	c := &Client{pool: pool}
+
+	if _, err := c.DialContext(ctx(t), "tcp", "example.com:443"); err == nil {
+		t.Fatal("DialContext: expected error after exhausting retries")
+	}
+	if createCount != maxDialAttempts {
+		t.Errorf("createCount = %d, want %d (one fresh transport per attempt)", createCount, maxDialAttempts)
+	}
+}
+
+func TestOpenTunnelOnClosedTransportIsConnFatal(t *testing.T) {
+	tr := newTestTransport(okRoundTripper())
+	tr.close()
+
+	_, err := tr.openTunnel(ctx(t), "example.com:443")
+	if err == nil {
+		t.Fatal("openTunnel on closed transport: expected error")
+	}
+	// Must read as connFatal, or DialContext hard-fails the concurrent-retirement
+	// race instead of redialing.
+	if !connFatal(err) {
+		t.Errorf("openTunnel-on-closed error not connFatal: %v", err)
+	}
+}
+
 // --- Config tests ---
 
 func TestClientConfigDefaults(t *testing.T) {
