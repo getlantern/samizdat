@@ -64,7 +64,10 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
-		return nil, errors.New("transport closed")
+		// Wrap net.ErrClosed so a transport retired concurrently between
+		// getTransport and this check reads as connFatal, letting DialContext
+		// redial on a fresh transport instead of hard-failing.
+		return nil, fmt.Errorf("transport closed: %w", net.ErrClosed)
 	}
 	t.mu.Unlock()
 
