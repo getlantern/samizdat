@@ -221,12 +221,25 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte) {
 	}
 
 	// Serve HTTP/2 with CONNECT handler
-	s.serveH2(tlsConn)
+	s.serveH2(tlsConn, conn)
+}
+
+type sessionConnKey struct{}
+
+// SessionConnFromContext returns the client's underlying connection, as
+// accepted from the listener, from the ctx a Handler receives. Every stream
+// of a session shares it, so it must not be closed, written to, or given
+// deadlines on behalf of one stream. It is exposed so a handler can read
+// socket state (e.g. TCP_INFO) that the stream itself cannot reach.
+func SessionConnFromContext(ctx context.Context) (net.Conn, bool) {
+	conn, ok := ctx.Value(sessionConnKey{}).(net.Conn)
+	return conn, ok
 }
 
 // serveH2 serves HTTP/2 over the authenticated TLS connection, handling
-// CONNECT requests to establish proxy tunnels.
-func (s *Server) serveH2(tlsConn net.Conn) {
+// CONNECT requests to establish proxy tunnels. rawConn is the accepted
+// connection beneath TLS, exposed to handlers via SessionConnFromContext.
+func (s *Server) serveH2(tlsConn, rawConn net.Conn) {
 	h2Server := &http2.Server{
 		MaxConcurrentStreams: uint32(s.config.MaxConcurrentStreams),
 	}
@@ -314,6 +327,9 @@ func (s *Server) serveH2(tlsConn net.Conn) {
 	// Serve directly using the http2.Server
 	log.Printf("[samizdat] serveH2: starting ServeConn")
 	h2Server.ServeConn(tlsConn, &http2.ServeConnOpts{
+		// Background is what ServeConn uses when Context is nil, so streams
+		// keep their lifetime; the value is the only addition.
+		Context: context.WithValue(context.Background(), sessionConnKey{}, rawConn),
 		Handler: handler,
 	})
 	log.Printf("[samizdat] serveH2: ServeConn returned")

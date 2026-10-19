@@ -966,3 +966,77 @@ func TestIntegrationTLSConfig(t *testing.T) {
 		t.Error("TLS handshake should be complete")
 	}
 }
+
+// TestIntegrationSessionConnInContext verifies that a Handler can reach the
+// session's accepted TCP conn through its ctx, and that every stream of the
+// session sees the same one.
+func TestIntegrationSessionConnInContext(t *testing.T) {
+	serverPriv, serverPub, _ := GenerateKeyPair()
+	shortID, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+
+	type seen struct {
+		session net.Conn
+		ok      bool
+		stream  net.Conn
+	}
+	seenCh := make(chan seen, 2)
+
+	_, ln := startTestServer(t, ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{shortID},
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		Handler: func(ctx context.Context, conn net.Conn, destination string) {
+			defer conn.Close()
+			session, ok := SessionConnFromContext(ctx)
+			seenCh <- seen{session: session, ok: ok, stream: conn}
+			conn.Write([]byte("ok"))
+		},
+	})
+
+	client, err := NewClient(ClientConfig{
+		ServerAddr: ln.Addr().String(),
+		ServerName: "test.example.com",
+		PublicKey:  serverPub,
+		ShortID:    shortID,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		conn, err := client.DialContext(ctx, "tcp", "example.com:443")
+		if err != nil {
+			cancel()
+			t.Fatalf("stream %d dial: %v", i, err)
+		}
+		buf := make([]byte, 2)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, err = io.ReadFull(conn, buf)
+		conn.Close()
+		cancel()
+		if err != nil {
+			t.Fatalf("stream %d read: %v", i, err)
+		}
+	}
+
+	first, second := <-seenCh, <-seenCh
+	for i, s := range []seen{first, second} {
+		if !s.ok {
+			t.Fatalf("stream %d: no session conn in handler ctx", i)
+		}
+		if _, isTCP := s.session.(*net.TCPConn); !isTCP {
+			t.Errorf("stream %d: session conn is %T, want *net.TCPConn", i, s.session)
+		}
+		if got, want := s.session.RemoteAddr().String(), s.stream.RemoteAddr().String(); got != want {
+			t.Errorf("stream %d: session conn remote %s, stream remote %s", i, got, want)
+		}
+	}
+	if first.session != second.session {
+		t.Errorf("streams of one session saw different session conns")
+	}
+}
