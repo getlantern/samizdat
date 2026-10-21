@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,12 +27,19 @@ var ErrServerClosed = errors.New("server closed")
 type Server struct {
 	config       ServerConfig
 	serverPubKey []byte // derived from config.PrivateKey
-	listenerMu   sync.Mutex
-	listener     net.Listener
-	masquerade   *Masquerade
-	ctx          context.Context
-	cancel       context.CancelCauseFunc
-	wg           sync.WaitGroup
+	// shortIDs is the set a client may authenticate with. It starts as
+	// config.ShortIDs; SetShortIDs replaces it while the server runs.
+	shortIDs   atomic.Pointer[[][8]byte]
+	sessionsMu sync.Mutex
+	// sessions maps each authenticated connection to the short ID it
+	// authenticated with, so SetShortIDs can close the ones it revokes.
+	sessions   map[net.Conn][8]byte
+	listenerMu sync.Mutex
+	listener   net.Listener
+	masquerade *Masquerade
+	ctx        context.Context
+	cancel     context.CancelCauseFunc
+	wg         sync.WaitGroup
 }
 
 // NewServer creates a new Samizdat server.
@@ -59,9 +67,12 @@ func NewServer(config ServerConfig) (*Server, error) {
 	s := &Server{
 		config:       config,
 		serverPubKey: serverPubKey,
+		sessions:     make(map[net.Conn][8]byte),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
+	ids := append([][8]byte(nil), config.ShortIDs...)
+	s.shortIDs.Store(&ids)
 
 	// Set up masquerade if configured
 	if config.MasqueradeDomain != "" {
@@ -140,6 +151,55 @@ func (s *Server) Addr() net.Addr {
 	return nil
 }
 
+// SetShortIDs replaces the short IDs clients may authenticate with, while the
+// server runs. A connection that authenticated with an ID the new set leaves
+// out is closed, so removing an ID revokes it at once rather than whenever
+// its sessions end. As in NewServer the set must not be empty. ids is copied.
+func (s *Server) SetShortIDs(ids [][8]byte) error {
+	if len(ids) == 0 {
+		return fmt.Errorf("at least one ShortID is required")
+	}
+	next := append([][8]byte(nil), ids...)
+	s.sessionsMu.Lock()
+	s.shortIDs.Store(&next)
+	var revoked []net.Conn
+	for conn, id := range s.sessions {
+		if !slices.Contains(next, id) {
+			revoked = append(revoked, conn)
+			delete(s.sessions, conn)
+		}
+	}
+	s.sessionsMu.Unlock()
+	for _, conn := range revoked {
+		conn.Close()
+	}
+	return nil
+}
+
+// ShortIDs returns a copy of the short IDs clients may authenticate with.
+func (s *Server) ShortIDs() [][8]byte {
+	return append([][8]byte(nil), *s.shortIDs.Load()...)
+}
+
+// trackSession records conn as authenticated with id, unless id has been
+// revoked since it was verified. The check and the record share
+// SetShortIDs' lock, so no revocation falls between them.
+func (s *Server) trackSession(conn net.Conn, id [8]byte) bool {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	if !slices.Contains(*s.shortIDs.Load(), id) {
+		return false
+	}
+	s.sessions[conn] = id
+	return true
+}
+
+func (s *Server) untrackSession(conn net.Conn) {
+	s.sessionsMu.Lock()
+	delete(s.sessions, conn)
+	s.sessionsMu.Unlock()
+}
+
 // handleConnection processes a new TCP connection:
 // 1. Read the ClientHello (buffer raw bytes)
 // 2. Attempt Samizdat auth verification
@@ -168,7 +228,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 
 	// Verify Samizdat auth using PSK derived from server public key
-	_, authenticated, err := VerifySessionID(sessionID, s.serverPubKey, s.config.ShortIDs)
+	shortID, authenticated, err := VerifySessionID(sessionID, s.serverPubKey, *s.shortIDs.Load())
 	if err != nil || !authenticated {
 		// Auth failed — enter masquerade mode
 		s.doMasquerade(conn, clientHelloRecord)
@@ -176,7 +236,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 
 	// Auth passed — complete TLS handshake and enter H2 proxy mode
-	s.handleAuthenticated(conn, clientHelloRecord)
+	s.handleAuthenticated(conn, clientHelloRecord, shortID)
 }
 
 // doMasquerade forwards the connection to the real masquerade domain.
@@ -190,7 +250,14 @@ func (s *Server) doMasquerade(conn net.Conn, clientHelloRecord []byte) {
 
 // handleAuthenticated completes the TLS handshake with the authenticated
 // client and serves HTTP/2 CONNECT requests.
-func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte) {
+func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, shortID [8]byte) {
+	// Registered before the handshake: a SetShortIDs that revokes shortID
+	// from here on closes conn, and one that already did refuses it.
+	if !s.trackSession(conn, shortID) {
+		return
+	}
+	defer s.untrackSession(conn)
+
 	// Create a connection that replays the ClientHello record first,
 	// then reads from the real connection
 	replayConn := newReplayConn(conn, clientHelloRecord)
