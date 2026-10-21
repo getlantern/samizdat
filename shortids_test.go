@@ -43,8 +43,9 @@ func relayHandler(_ context.Context, conn net.Conn, destination string) {
 	defer target.Close()
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); io.Copy(target, conn) }()
-	go func() { defer wg.Done(); io.Copy(conn, target) }()
+	// Closing both ends when either direction finishes unblocks the other copy.
+	go func() { defer wg.Done(); io.Copy(target, conn); target.Close(); conn.Close() }()
+	go func() { defer wg.Done(); io.Copy(conn, target); target.Close(); conn.Close() }()
 	wg.Wait()
 }
 
@@ -171,4 +172,42 @@ func TestSetShortIDsRejectsEmptySetAndCopies(t *testing.T) {
 	if s.ShortIDs()[0] != b {
 		t.Fatal("ShortIDs must return a copy")
 	}
+}
+
+func TestTrackSessionRefusesIDRevokedAfterVerify(t *testing.T) {
+	priv, pub, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	base, _ := GenerateShortID()
+	paired, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+	s, err := NewServer(ServerConfig{PrivateKey: priv, ShortIDs: [][8]byte{base, paired}, CertPEM: certPEM, KeyPEM: keyPEM, Handler: relayHandler})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	sessionID, err := BuildSessionID(pub, paired)
+	if err != nil {
+		t.Fatalf("BuildSessionID: %v", err)
+	}
+	id, ok, err := VerifySessionID(sessionID[:], s.serverPubKey, s.ShortIDs())
+	if err != nil || !ok || id != paired {
+		t.Fatalf("verify against the old set: id=%v ok=%v err=%v", id, ok, err)
+	}
+
+	if err := s.SetShortIDs([][8]byte{base}); err != nil {
+		t.Fatalf("SetShortIDs: %v", err)
+	}
+
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	if s.trackSession(c1, id) {
+		t.Fatal("a session verified before its ID was revoked was tracked")
+	}
+	if !s.trackSession(c1, base) {
+		t.Fatal("a session using a remaining ID was refused")
+	}
+	s.untrackSession(c1)
 }

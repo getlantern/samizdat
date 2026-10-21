@@ -153,8 +153,12 @@ func (s *Server) Addr() net.Addr {
 
 // SetShortIDs replaces the short IDs clients may authenticate with, while the
 // server runs. A connection that authenticated with an ID the new set leaves
-// out is closed, so removing an ID revokes it at once rather than whenever
-// its sessions end. As in NewServer the set must not be empty. ids is copied.
+// out is closed, so removing an ID ends its sessions now rather than whenever
+// they would end on their own. Stream handlers see this as an ordinary
+// disconnect: stream errors and context cancellation.
+//
+// An empty set is rejected with an error and the previous set stays in force,
+// so callers must check the error. ids is copied.
 func (s *Server) SetShortIDs(ids [][8]byte) error {
 	if len(ids) == 0 {
 		return fmt.Errorf("at least one ShortID is required")
