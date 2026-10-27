@@ -1,6 +1,7 @@
 package samizdat
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -45,6 +46,12 @@ func NewMasquerade(domain, addr string, idleTimeout, maxDuration time.Duration) 
 // clientHello contains the buffered raw ClientHello bytes that triggered the
 // auth check failure. conn is the raw TCP connection from the probe (pre-TLS).
 func (m *Masquerade) ProxyConnection(conn net.Conn, clientHello []byte) error {
+	return m.proxyConnection(context.Background(), conn, clientHello)
+}
+
+// proxyConnection is ProxyConnection, ended early when ctx is done: the dial
+// is abandoned and both connections are closed.
+func (m *Masquerade) proxyConnection(ctx context.Context, conn net.Conn, clientHello []byte) error {
 	// Resolve origin address if needed
 	addr := m.OriginAddr
 	if addr == "" {
@@ -52,10 +59,17 @@ func (m *Masquerade) ProxyConnection(conn net.Conn, clientHello []byte) error {
 	}
 
 	// Connect to the real domain
-	originConn, err := net.DialTimeout("tcp", addr, m.DialTimeout)
+	dialer := net.Dialer{Timeout: m.DialTimeout}
+	originConn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("connecting to masquerade origin %s: %w", addr, err)
 	}
+
+	stop := context.AfterFunc(ctx, func() {
+		originConn.Close()
+		conn.Close()
+	})
+	defer stop()
 
 	// Forward the buffered ClientHello that we already read
 	if len(clientHello) > 0 {
