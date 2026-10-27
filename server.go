@@ -33,7 +33,12 @@ type Server struct {
 	sessionsMu sync.Mutex
 	// sessions maps each authenticated connection to the short ID it
 	// authenticated with, so SetShortIDs can close the ones it revokes.
-	sessions   map[net.Conn][8]byte
+	sessions map[net.Conn][8]byte
+	connsMu  sync.Mutex
+	// conns holds every accepted connection still being handled, so Close
+	// can end them. closed is set by Close; no connection is added after.
+	conns      map[net.Conn]struct{}
+	closed     bool
 	listenerMu sync.Mutex
 	listener   net.Listener
 	masquerade *Masquerade
@@ -68,6 +73,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		config:       config,
 		serverPubKey: serverPubKey,
 		sessions:     make(map[net.Conn][8]byte),
+		conns:        make(map[net.Conn]struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
 	}
@@ -106,6 +112,11 @@ func (s *Server) Serve(ln net.Listener) error {
 	s.listenerMu.Lock()
 	s.listener = ln
 	s.listenerMu.Unlock()
+	// A Close that ran before the listener was recorded could not close it.
+	if s.ctx.Err() != nil {
+		ln.Close()
+		return nil
+	}
 
 	for {
 		conn, err := ln.Accept()
@@ -118,23 +129,60 @@ func (s *Server) Serve(ln net.Listener) error {
 			}
 		}
 
-		s.wg.Add(1)
+		if !s.trackConn(conn) {
+			conn.Close()
+			continue
+		}
 		go func() {
 			defer s.wg.Done()
+			defer s.untrackConn(conn)
 			s.handleConnection(conn)
 		}()
 	}
 }
 
-// Close shuts down the server.
+// trackConn records conn and adds it to s.wg, unless Close has run. Both
+// happen under the lock Close takes, so Close either sees conn or refuses it.
+func (s *Server) trackConn(conn net.Conn) bool {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	if s.closed {
+		return false
+	}
+	s.conns[conn] = struct{}{}
+	s.wg.Add(1)
+	return true
+}
+
+func (s *Server) untrackConn(conn net.Conn) {
+	s.connsMu.Lock()
+	delete(s.conns, conn)
+	s.connsMu.Unlock()
+}
+
+// Close shuts down the server: it stops accepting, closes every connection
+// it accepted, which ends live sessions (their streams see an ordinary
+// disconnect) as well as handshakes and masqueraded connections, and waits
+// for their goroutines. It is safe to call more than once.
 func (s *Server) Close() error {
 	s.cancel(ErrServerClosed)
-	s.listenerMu.Lock()
-	ln := s.listener
-	s.listenerMu.Unlock()
+	s.connsMu.Lock()
+	first := !s.closed
+	s.closed = true
+	conns := s.conns
+	s.conns = nil
+	s.connsMu.Unlock()
 	var err error
-	if ln != nil {
-		err = ln.Close()
+	if first {
+		s.listenerMu.Lock()
+		ln := s.listener
+		s.listenerMu.Unlock()
+		if ln != nil {
+			err = ln.Close()
+		}
+	}
+	for conn := range conns {
+		conn.Close()
 	}
 	s.wg.Wait()
 	return err
@@ -249,7 +297,7 @@ func (s *Server) doMasquerade(conn net.Conn, clientHelloRecord []byte) {
 		// No masquerade configured — just close
 		return
 	}
-	s.masquerade.ProxyConnection(conn, clientHelloRecord)
+	s.masquerade.proxyConnection(s.ctx, conn, clientHelloRecord)
 }
 
 // handleAuthenticated completes the TLS handshake with the authenticated
