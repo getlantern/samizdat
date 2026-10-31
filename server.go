@@ -340,7 +340,7 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 	}
 
 	// Serve HTTP/2 with CONNECT handler
-	s.serveH2(tlsConn, conn)
+	s.serveH2(tlsConn, conn, shortID)
 }
 
 type sessionConnKey struct{}
@@ -355,10 +355,20 @@ func SessionConnFromContext(ctx context.Context) (net.Conn, bool) {
 	return conn, ok
 }
 
+type shortIDKey struct{}
+
+// ShortIDFromContext returns the short ID the session authenticated with,
+// from the ctx a Handler receives. Every stream of a session shares it.
+func ShortIDFromContext(ctx context.Context) ([8]byte, bool) {
+	id, ok := ctx.Value(shortIDKey{}).([8]byte)
+	return id, ok
+}
+
 // serveH2 serves HTTP/2 over the authenticated TLS connection, handling
 // CONNECT requests to establish proxy tunnels. rawConn is the accepted
-// connection beneath TLS, exposed to handlers via SessionConnFromContext.
-func (s *Server) serveH2(tlsConn, rawConn net.Conn) {
+// connection beneath TLS and shortID the one the session authenticated
+// with, exposed to handlers via SessionConnFromContext and ShortIDFromContext.
+func (s *Server) serveH2(tlsConn, rawConn net.Conn, shortID [8]byte) {
 	h2Server := &http2.Server{
 		MaxConcurrentStreams: uint32(s.config.MaxConcurrentStreams),
 	}
@@ -447,8 +457,11 @@ func (s *Server) serveH2(tlsConn, rawConn net.Conn) {
 	log.Printf("[samizdat] serveH2: starting ServeConn")
 	h2Server.ServeConn(tlsConn, &http2.ServeConnOpts{
 		// Background is what ServeConn uses when Context is nil, so streams
-		// keep their lifetime; the value is the only addition.
-		Context: context.WithValue(context.Background(), sessionConnKey{}, rawConn),
+		// keep their lifetime; the values are the only addition.
+		Context: context.WithValue(
+			context.WithValue(context.Background(), sessionConnKey{}, rawConn),
+			shortIDKey{}, shortID,
+		),
 		Handler: handler,
 	})
 	log.Printf("[samizdat] serveH2: ServeConn returned")

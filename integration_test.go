@@ -1040,3 +1040,81 @@ func TestIntegrationSessionConnInContext(t *testing.T) {
 		t.Errorf("streams of one session saw different session conns")
 	}
 }
+
+// TestIntegrationShortIDInContext verifies that a Handler can read the short
+// ID its session authenticated with, and that two sessions on one server,
+// each with its own short ID, each see their own on every stream.
+func TestIntegrationShortIDInContext(t *testing.T) {
+	serverPriv, serverPub, _ := GenerateKeyPair()
+	idA, _ := GenerateShortID()
+	idB, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+
+	type seen struct {
+		id [8]byte
+		ok bool
+	}
+	seenCh := make(chan seen, 4)
+
+	_, ln := startTestServer(t, ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{idA, idB},
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		Handler: func(ctx context.Context, conn net.Conn, destination string) {
+			defer func() { _ = conn.Close() }()
+			id, ok := ShortIDFromContext(ctx)
+			seenCh <- seen{id: id, ok: ok}
+			_, _ = conn.Write([]byte("ok"))
+		},
+	})
+
+	for _, want := range [][8]byte{idA, idB} {
+		client, err := NewClient(ClientConfig{
+			ServerAddr: ln.Addr().String(),
+			ServerName: "test.example.com",
+			PublicKey:  serverPub,
+			ShortID:    want,
+		})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		for i := 0; i < 2; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			conn, err := client.DialContext(ctx, "tcp", "example.com:443")
+			if err != nil {
+				cancel()
+				_ = client.Close()
+				t.Fatalf("stream %d dial: %v", i, err)
+			}
+			buf := make([]byte, 2)
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_, err = io.ReadFull(conn, buf)
+			_ = conn.Close()
+			cancel()
+			if err != nil {
+				_ = client.Close()
+				t.Fatalf("stream %d read: %v", i, err)
+			}
+			got := <-seenCh
+			if !got.ok {
+				t.Fatalf("stream %d: no short ID in handler ctx", i)
+			}
+			if got.id != want {
+				t.Errorf("stream %d: handler saw a different short ID than its session authenticated with", i)
+			}
+		}
+		_ = client.Close()
+	}
+}
+
+func TestShortIDFromContextMissing(t *testing.T) {
+	if id, ok := ShortIDFromContext(context.Background()); ok || id != ([8]byte{}) {
+		t.Errorf("ShortIDFromContext(Background) = %x, %v, want zero, false", id, ok)
+	}
+	ctx := context.WithValue(context.Background(), sessionConnKey{}, nil)
+	if _, ok := ShortIDFromContext(ctx); ok {
+		t.Errorf("ShortIDFromContext without a short ID returned ok")
+	}
+}
