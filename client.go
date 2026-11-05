@@ -131,7 +131,13 @@ func (c *Client) DialSession(ctx context.Context) (net.Conn, error) {
 		ctx, cancel = context.WithTimeout(ctx, c.config.ConnectTimeout)
 		defer cancel()
 	}
-	return c.dialConn(ctx)
+	// Return an untyped nil on failure: a nil *utls.UConn in a net.Conn
+	// would compare non-nil.
+	uConn, err := c.dialConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return uConn, nil
 }
 
 func (c *Client) isClosed() bool {

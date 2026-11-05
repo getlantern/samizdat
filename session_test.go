@@ -143,10 +143,14 @@ func TestDialSessionPinsCertificate(t *testing.T) {
 		}
 		defer c.Close()
 		conn, err := c.DialSession(ctx(t))
-		if err == nil {
-			conn.Close()
+		if err != nil {
+			if conn != nil {
+				t.Errorf("DialSession returned a non-nil conn (%T) with error %v", conn, err)
+			}
+			return err
 		}
-		return err
+		conn.Close()
+		return nil
 	}
 	if err := dial(good[:]); err != nil {
 		t.Fatalf("good pin: %v", err)
@@ -172,8 +176,8 @@ func TestDialSessionAfterClose(t *testing.T) {
 	_, pub, _ := GenerateKeyPair()
 	c, _ := NewClient(ClientConfig{ServerAddr: "127.0.0.1:1", ServerName: "x", PublicKey: pub})
 	c.Close()
-	if _, err := c.DialSession(ctx(t)); err == nil {
-		t.Fatal("expected error after Close")
+	if conn, err := c.DialSession(ctx(t)); err == nil || conn != nil {
+		t.Fatalf("after Close: conn = %v, err = %v, want nil and an error", conn, err)
 	}
 }
 
@@ -302,8 +306,12 @@ func TestDialSessionCancelledCtx(t *testing.T) {
 	defer c.Close()
 	cctx, cancel := context.WithCancel(ctx(t))
 	cancel()
-	if _, err := c.DialSession(cctx); !errors.Is(err, context.Canceled) {
+	conn, err := c.DialSession(cctx)
+	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if conn != nil {
+		t.Fatalf("conn = %T, want nil", conn)
 	}
 }
 
@@ -330,8 +338,8 @@ func TestDialSessionConnectTimeout(t *testing.T) {
 	}
 	defer c.Close()
 	start := time.Now()
-	if _, err := c.DialSession(ctx(t)); err == nil {
-		t.Fatal("expected a timeout")
+	if conn, err := c.DialSession(ctx(t)); err == nil || conn != nil {
+		t.Fatalf("conn = %v, err = %v, want nil and a timeout", conn, err)
 	}
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("DialSession took %v, want about ConnectTimeout", d)
