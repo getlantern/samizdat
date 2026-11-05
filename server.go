@@ -57,8 +57,8 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if len(config.ShortIDs) == 0 {
 		return nil, fmt.Errorf("at least one ShortID is required")
 	}
-	if config.Handler == nil {
-		return nil, fmt.Errorf("Handler is required")
+	if config.Handler == nil && config.SessionHandler == nil {
+		return nil, fmt.Errorf("Handler or SessionHandler is required")
 	}
 
 	// Derive server public key from private key
@@ -301,7 +301,8 @@ func (s *Server) doMasquerade(conn net.Conn, clientHelloRecord []byte) {
 }
 
 // handleAuthenticated completes the TLS handshake with the authenticated
-// client and serves HTTP/2 CONNECT requests.
+// client and serves HTTP/2 CONNECT requests, or hands the connection to
+// config.SessionHandler when one is set.
 func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, shortID [8]byte) {
 	// Registered before the handshake: a SetShortIDs that revokes shortID
 	// from here on closes conn, and one that already did refuses it.
@@ -339,6 +340,14 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 		return
 	}
 
+	if h := s.config.SessionHandler; h != nil {
+		ctx := context.WithValue(s.ctx, sessionConnKey{}, conn)
+		ctx = context.WithValue(ctx, shortIDKey{}, shortID)
+		defer tlsConn.Close()
+		h(ctx, tlsConn, shortID)
+		return
+	}
+
 	// Serve HTTP/2 with CONNECT handler
 	s.serveH2(tlsConn, conn, shortID)
 }
@@ -346,10 +355,11 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 type sessionConnKey struct{}
 
 // SessionConnFromContext returns the client's underlying connection, as
-// accepted from the listener, from the ctx a Handler receives. Every stream
-// of a session shares it, so it must not be closed, written to, or given
-// deadlines on behalf of one stream. It is exposed so a handler can read
-// socket state (e.g. TCP_INFO) that the stream itself cannot reach.
+// accepted from the listener, from the ctx a Handler or SessionHandler
+// receives. Every stream of a session shares it, so it must not be closed,
+// written to, or given deadlines on behalf of one stream. It is exposed so a
+// handler can read socket state (e.g. TCP_INFO) that the stream itself cannot
+// reach.
 func SessionConnFromContext(ctx context.Context) (net.Conn, bool) {
 	conn, ok := ctx.Value(sessionConnKey{}).(net.Conn)
 	return conn, ok
@@ -358,7 +368,8 @@ func SessionConnFromContext(ctx context.Context) (net.Conn, bool) {
 type shortIDKey struct{}
 
 // ShortIDFromContext returns the short ID the session authenticated with,
-// from the ctx a Handler receives. Every stream of a session shares it.
+// from the ctx a Handler or SessionHandler receives. Every stream of a
+// session shares it.
 func ShortIDFromContext(ctx context.Context) ([8]byte, bool) {
 	id, ok := ctx.Value(shortIDKey{}).([8]byte)
 	return id, ok
