@@ -364,14 +364,29 @@ func ShortIDFromContext(ctx context.Context) ([8]byte, bool) {
 	return id, ok
 }
 
+// newH2Server returns the HTTP/2 server for one tunnel connection.
+//
+// It uses x/net's random write scheduler rather than its default round-robin
+// one. Round-robin keeps every open stream (up to maxStreams) in a ring and
+// Pop walks it past idle streams to find one with a queued frame, so each frame
+// written costs a scan over all open streams; serverStreamConn flushes every
+// write, so that is one scan per tunnel write. On busy proxies this was 2.3-2.9%
+// of CPU in writeQueue.empty alone. The random scheduler tracks only streams
+// with queued frames, and still sends control and RST_STREAM frames first.
+// Stream priorities are ignored either way, which a CONNECT tunnel doesn't use.
+func newH2Server(maxStreams int) *http2.Server {
+	return &http2.Server{
+		MaxConcurrentStreams: uint32(maxStreams),
+		NewWriteScheduler:    http2.NewRandomWriteScheduler,
+	}
+}
+
 // serveH2 serves HTTP/2 over the authenticated TLS connection, handling
 // CONNECT requests to establish proxy tunnels. rawConn is the accepted
 // connection beneath TLS and shortID the one the session authenticated
 // with, exposed to handlers via SessionConnFromContext and ShortIDFromContext.
 func (s *Server) serveH2(tlsConn, rawConn net.Conn, shortID [8]byte) {
-	h2Server := &http2.Server{
-		MaxConcurrentStreams: uint32(s.config.MaxConcurrentStreams),
-	}
+	h2Server := newH2Server(s.config.MaxConcurrentStreams)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
