@@ -2,7 +2,11 @@ package samizdat
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -32,6 +36,9 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 	if config.ServerName == "" {
 		return nil, fmt.Errorf("ServerName is required")
+	}
+	if n := len(config.ServerCertSPKISHA256); n != 0 && n != sha256.Size {
+		return nil, fmt.Errorf("ServerCertSPKISHA256 must be empty or %d bytes, got %d", sha256.Size, n)
 	}
 
 	c := &Client{
@@ -97,6 +104,39 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 	return nil, fmt.Errorf("opening tunnel to %s: %w", address, err)
 }
 
+// ErrCertPinMismatch is returned, wrapped, when ClientConfig.ServerCertSPKISHA256
+// is set and the server's certificate does not match it.
+var ErrCertPinMismatch = errors.New("samizdat: server certificate does not match pin")
+
+// SPKISHA256 is the SHA-256 of a DER certificate's SubjectPublicKeyInfo,
+// the value ClientConfig.ServerCertSPKISHA256 pins.
+func SPKISHA256(certDER []byte) ([32]byte, error) {
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	return sha256.Sum256(cert.RawSubjectPublicKeyInfo), nil
+}
+
+// DialSession dials and authenticates a new connection that is not pooled
+// and runs no HTTP/2, for callers that layer their own protocol on it. ALPN
+// "h2" has been negotiated on it. The caller owns the connection. When ctx
+// has no deadline, ConnectTimeout bounds the dial and handshake.
+func (c *Client) DialSession(ctx context.Context) (net.Conn, error) {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return nil, fmt.Errorf("client is closed")
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.config.ConnectTimeout)
+		defer cancel()
+	}
+	return c.dialConn(ctx)
+}
+
 // Close shuts down all connections.
 func (c *Client) Close() error {
 	c.mu.Lock()
@@ -111,6 +151,27 @@ func (c *Client) Close() error {
 // createTransport creates a new TLS+H2 connection to the server with
 // Reality-style auth embedded in the ClientHello.
 func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
+	uConn, err := c.dialConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create H2 transport over the TLS connection
+	// We need to wrap uConn as a standard net.Conn for the http2 transport.
+	// The utls.UConn already implements net.Conn.
+	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper)
+	if err != nil {
+		uConn.Close()
+		return nil, fmt.Errorf("creating H2 transport: %w", err)
+	}
+
+	return transport, nil
+}
+
+// dialConn dials the server and completes a TLS handshake with Reality-style
+// auth embedded in the ClientHello, returning the connection once ALPN "h2"
+// has been negotiated.
+func (c *Client) dialConn(ctx context.Context) (*utls.UConn, error) {
 	// Dial TCP connection
 	var tcpConn net.Conn
 	var err error
@@ -136,6 +197,19 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 		ServerName:         c.config.ServerName,
 		InsecureSkipVerify: true, // We verify via Reality auth, not PKI
 		NextProtos:         []string{"h2"},
+	}
+	if pin := c.config.ServerCertSPKISHA256; len(pin) > 0 {
+		// InsecureSkipVerify skips only chain verification; this still runs.
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return ErrCertPinMismatch
+			}
+			got, err := SPKISHA256(rawCerts[0])
+			if err != nil || subtle.ConstantTimeCompare(got[:], pin) != 1 {
+				return ErrCertPinMismatch
+			}
+			return nil
+		}
 	}
 
 	var helloID utls.ClientHelloID
@@ -176,16 +250,7 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 		return nil, fmt.Errorf("expected h2, got %q", state.NegotiatedProtocol)
 	}
 
-	// Create H2 transport over the TLS connection
-	// We need to wrap uConn as a standard net.Conn for the http2 transport.
-	// The utls.UConn already implements net.Conn.
-	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper)
-	if err != nil {
-		uConn.Close()
-		return nil, fmt.Errorf("creating H2 transport: %w", err)
-	}
-
-	return transport, nil
+	return uConn, nil
 }
 
 // applyAuthToClientHello modifies the uTLS ClientHello to embed the auth

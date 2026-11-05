@@ -36,6 +36,12 @@ type ClientConfig struct {
 	PublicKey []byte  // server X25519 public key (32 bytes)
 	ShortID   [8]byte // pre-shared 8-byte identifier
 
+	// ServerCertSPKISHA256, when set, pins the server's certificate: the
+	// handshake fails with ErrCertPinMismatch unless the SHA-256 of the leaf
+	// certificate's SubjectPublicKeyInfo (see SPKISHA256) equals it. It must
+	// be empty or 32 bytes.
+	ServerCertSPKISHA256 []byte
+
 	// TLS fingerprint
 	Fingerprint string // "chrome" (default), "firefox", "safari"
 
