@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // --- Auth tests ---
@@ -1073,6 +1076,21 @@ func TestServerStreamConn_ShutdownWaitsForInflightWrite(t *testing.T) {
 func ctx(t *testing.T) context.Context {
 	t.Helper()
 	return context.Background()
+}
+
+// The tunnel's HTTP/2 server must not use the round-robin write scheduler,
+// whose Pop scans every open stream for each frame written.
+func TestH2ServerUsesRandomWriteScheduler(t *testing.T) {
+	s := newH2Server(250)
+	if s.MaxConcurrentStreams != 250 {
+		t.Fatalf("MaxConcurrentStreams = %d, want 250", s.MaxConcurrentStreams)
+	}
+	if s.NewWriteScheduler == nil {
+		t.Fatal("NewWriteScheduler is nil, so x/net falls back to round-robin")
+	}
+	if got, want := fmt.Sprintf("%T", s.NewWriteScheduler()), fmt.Sprintf("%T", http2.NewRandomWriteScheduler()); got != want {
+		t.Fatalf("write scheduler = %s, want %s", got, want)
+	}
 }
 
 // Suppress unused import
