@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,10 @@ import (
 
 // ErrServerClosed is the cause set on the server's context when Close is called.
 var ErrServerClosed = errors.New("server closed")
+
+// ErrSessionRevoked is the cause set on a SessionHandler's context when
+// SetShortIDs revokes the short ID its session authenticated with.
+var ErrSessionRevoked = errors.New("session short ID revoked")
 
 // Server accepts Samizdat connections, authenticates them via Reality-style
 // auth in the TLS ClientHello, and proxies authenticated HTTP/2 CONNECT
@@ -33,7 +38,7 @@ type Server struct {
 	sessionsMu sync.Mutex
 	// sessions maps each authenticated connection to the short ID it
 	// authenticated with, so SetShortIDs can close the ones it revokes.
-	sessions map[net.Conn][8]byte
+	sessions map[net.Conn]session
 	connsMu  sync.Mutex
 	// conns holds every accepted connection still being handled, so Close
 	// can end them. closed is set by Close; no connection is added after.
@@ -57,8 +62,8 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if len(config.ShortIDs) == 0 {
 		return nil, fmt.Errorf("at least one ShortID is required")
 	}
-	if config.Handler == nil {
-		return nil, fmt.Errorf("Handler is required")
+	if config.Handler == nil && config.SessionHandler == nil {
+		return nil, fmt.Errorf("Handler or SessionHandler is required")
 	}
 
 	// Derive server public key from private key
@@ -72,7 +77,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	s := &Server{
 		config:       config,
 		serverPubKey: serverPubKey,
-		sessions:     make(map[net.Conn][8]byte),
+		sessions:     make(map[net.Conn]session),
 		conns:        make(map[net.Conn]struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -214,15 +219,18 @@ func (s *Server) SetShortIDs(ids [][8]byte) error {
 	next := append([][8]byte(nil), ids...)
 	s.sessionsMu.Lock()
 	s.shortIDs.Store(&next)
-	var revoked []net.Conn
-	for conn, id := range s.sessions {
-		if !slices.Contains(next, id) {
-			revoked = append(revoked, conn)
+	revoked := make(map[net.Conn]session)
+	for conn, sess := range s.sessions {
+		if !slices.Contains(next, sess.id) {
+			revoked[conn] = sess
 			delete(s.sessions, conn)
 		}
 	}
 	s.sessionsMu.Unlock()
-	for _, conn := range revoked {
+	for conn, sess := range revoked {
+		if sess.cancel != nil {
+			sess.cancel(ErrSessionRevoked)
+		}
 		conn.Close()
 	}
 	return nil
@@ -233,16 +241,24 @@ func (s *Server) ShortIDs() [][8]byte {
 	return append([][8]byte(nil), *s.shortIDs.Load()...)
 }
 
+// session is what the server tracks about an authenticated connection.
+type session struct {
+	id [8]byte
+	// cancel ends the session's context. It may be nil.
+	cancel context.CancelCauseFunc
+}
+
 // trackSession records conn as authenticated with id, unless id has been
 // revoked since it was verified. The check and the record share
-// SetShortIDs' lock, so no revocation falls between them.
-func (s *Server) trackSession(conn net.Conn, id [8]byte) bool {
+// SetShortIDs' lock, so no revocation falls between them. A SetShortIDs that
+// revokes id calls cancel, when it is not nil, and closes conn.
+func (s *Server) trackSession(conn net.Conn, id [8]byte, cancel context.CancelCauseFunc) bool {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
 	if !slices.Contains(*s.shortIDs.Load(), id) {
 		return false
 	}
-	s.sessions[conn] = id
+	s.sessions[conn] = session{id: id, cancel: cancel}
 	return true
 }
 
@@ -301,11 +317,17 @@ func (s *Server) doMasquerade(conn net.Conn, clientHelloRecord []byte) {
 }
 
 // handleAuthenticated completes the TLS handshake with the authenticated
-// client and serves HTTP/2 CONNECT requests.
+// client and serves HTTP/2 CONNECT requests, or hands the connection to
+// config.SessionHandler when one is set.
 func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, shortID [8]byte) {
+	// The session's context ends with the server, a revocation, the
+	// connection failing, or this function returning.
+	sessCtx, cancel := context.WithCancelCause(s.ctx)
+	defer cancel(nil)
+
 	// Registered before the handshake: a SetShortIDs that revokes shortID
 	// from here on closes conn, and one that already did refuses it.
-	if !s.trackSession(conn, shortID) {
+	if !s.trackSession(conn, shortID, cancel) {
 		return
 	}
 	defer s.untrackSession(conn)
@@ -339,17 +361,59 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 		return
 	}
 
+	if h := s.config.SessionHandler; h != nil {
+		ctx := context.WithValue(sessCtx, sessionConnKey{}, conn)
+		ctx = context.WithValue(ctx, shortIDKey{}, shortID)
+		defer tlsConn.Close()
+		h(ctx, &sessionConn{Conn: tlsConn, cancel: cancel}, shortID)
+		return
+	}
+
 	// Serve HTTP/2 with CONNECT handler
 	s.serveH2(tlsConn, conn, shortID)
+}
+
+// sessionConn is the connection a SessionHandler receives. Its first failed
+// Read other than a deadline expiring, any failed Write, or its Close ends
+// the session's context, so a handler that waits on ctx.Done() returns when
+// the peer goes away. A Write that times out ends it too: crypto/tls fails
+// every later Write on the conn after one does. Embedding *tls.Conn keeps
+// ConnectionState reachable.
+type sessionConn struct {
+	*tls.Conn
+	cancel context.CancelCauseFunc
+}
+
+func (c *sessionConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		c.cancel(err)
+	}
+	return n, err
+}
+
+func (c *sessionConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if err != nil {
+		c.cancel(err)
+	}
+	return n, err
+}
+
+func (c *sessionConn) Close() error {
+	err := c.Conn.Close()
+	c.cancel(net.ErrClosed)
+	return err
 }
 
 type sessionConnKey struct{}
 
 // SessionConnFromContext returns the client's underlying connection, as
-// accepted from the listener, from the ctx a Handler receives. Every stream
-// of a session shares it, so it must not be closed, written to, or given
-// deadlines on behalf of one stream. It is exposed so a handler can read
-// socket state (e.g. TCP_INFO) that the stream itself cannot reach.
+// accepted from the listener, from the ctx a Handler or SessionHandler
+// receives. Every stream of a session shares it, so it must not be closed,
+// written to, or given deadlines on behalf of one stream. It is exposed so a
+// handler can read socket state (e.g. TCP_INFO) that the stream itself cannot
+// reach.
 func SessionConnFromContext(ctx context.Context) (net.Conn, bool) {
 	conn, ok := ctx.Value(sessionConnKey{}).(net.Conn)
 	return conn, ok
@@ -358,7 +422,8 @@ func SessionConnFromContext(ctx context.Context) (net.Conn, bool) {
 type shortIDKey struct{}
 
 // ShortIDFromContext returns the short ID the session authenticated with,
-// from the ctx a Handler receives. Every stream of a session shares it.
+// from the ctx a Handler or SessionHandler receives. Every stream of a
+// session shares it.
 func ShortIDFromContext(ctx context.Context) ([8]byte, bool) {
 	id, ok := ctx.Value(shortIDKey{}).([8]byte)
 	return id, ok

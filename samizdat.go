@@ -20,6 +20,19 @@ type DialFunc func(ctx context.Context, network, address string) (net.Conn, erro
 // ConnHandler is called for each proxied connection with destination info.
 type ConnHandler func(ctx context.Context, conn net.Conn, destination string)
 
+// SessionHandler is called once per authenticated connection, in place of
+// the built-in HTTP/2 CONNECT server, with the TLS connection (ALPN "h2"
+// already negotiated) and the short ID the client authenticated with. The
+// connection is closed when it returns.
+//
+// ctx ends when the session does: when a Read on conn fails other than by
+// its deadline expiring (the peer went away), when any Write fails,
+// including by its deadline expiring, when conn is closed, when SetShortIDs revokes shortID
+// (cause ErrSessionRevoked), or when the server is closed (cause
+// ErrServerClosed). A handler should return once ctx is done. Server.Close
+// waits for handlers to return, so one that ignores ctx blocks it.
+type SessionHandler func(ctx context.Context, conn net.Conn, shortID [8]byte)
+
 // ClientConfig configures the Samizdat client.
 type ClientConfig struct {
 	// Server connection
@@ -29,6 +42,12 @@ type ClientConfig struct {
 	// Authentication
 	PublicKey []byte  // server X25519 public key (32 bytes)
 	ShortID   [8]byte // pre-shared 8-byte identifier
+
+	// ServerCertSPKISHA256, when set, pins the server's certificate: the
+	// handshake fails with ErrCertPinMismatch unless the SHA-256 of the leaf
+	// certificate's SubjectPublicKeyInfo (see SPKISHA256) equals it. It must
+	// be empty or 32 bytes.
+	ServerCertSPKISHA256 []byte
 
 	// TLS fingerprint
 	Fingerprint string // "chrome" (default), "firefox", "safari"
@@ -93,6 +112,10 @@ type ServerConfig struct {
 
 	// Handler: called for each authenticated proxied connection
 	Handler ConnHandler
+
+	// SessionHandler, when set, takes each authenticated connection instead
+	// of the built-in HTTP/2 CONNECT server, and Handler is not used.
+	SessionHandler SessionHandler
 }
 
 // applyDefaults fills in zero-value fields with sensible defaults.
