@@ -374,9 +374,11 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 }
 
 // sessionConn is the connection a SessionHandler receives. Its first failed
-// Read or Write, other than a deadline expiring, or its Close ends the
-// session's context, so a handler that waits on ctx.Done() returns when the
-// peer goes away. Embedding *tls.Conn keeps ConnectionState reachable.
+// Read other than a deadline expiring, any failed Write, or its Close ends
+// the session's context, so a handler that waits on ctx.Done() returns when
+// the peer goes away. A Write that times out ends it too: crypto/tls fails
+// every later Write on the conn after one does. Embedding *tls.Conn keeps
+// ConnectionState reachable.
 type sessionConn struct {
 	*tls.Conn
 	cancel context.CancelCauseFunc
@@ -384,13 +386,17 @@ type sessionConn struct {
 
 func (c *sessionConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	c.fail(err)
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		c.cancel(err)
+	}
 	return n, err
 }
 
 func (c *sessionConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
-	c.fail(err)
+	if err != nil {
+		c.cancel(err)
+	}
 	return n, err
 }
 
@@ -398,13 +404,6 @@ func (c *sessionConn) Close() error {
 	err := c.Conn.Close()
 	c.cancel(net.ErrClosed)
 	return err
-}
-
-func (c *sessionConn) fail(err error) {
-	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-		return
-	}
-	c.cancel(err)
 }
 
 type sessionConnKey struct{}

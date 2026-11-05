@@ -25,8 +25,9 @@ type ConnHandler func(ctx context.Context, conn net.Conn, destination string)
 // already negotiated) and the short ID the client authenticated with. The
 // connection is closed when it returns.
 //
-// ctx ends when the session does: when a Read or Write on conn fails (the
-// peer went away), when conn is closed, when SetShortIDs revokes shortID
+// ctx ends when the session does: when a Read on conn fails other than by
+// its deadline expiring (the peer went away), when any Write fails,
+// including by its deadline expiring, when conn is closed, when SetShortIDs revokes shortID
 // (cause ErrSessionRevoked), or when the server is closed (cause
 // ErrServerClosed). A handler should return once ctx is done. Server.Close
 // waits for handlers to return, so one that ignores ctx blocks it.

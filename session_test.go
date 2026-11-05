@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"testing"
 	"time"
 )
@@ -343,5 +344,56 @@ func TestDialSessionConnectTimeout(t *testing.T) {
 	}
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("DialSession took %v, want about ConnectTimeout", d)
+	}
+}
+
+func TestSessionHandlerCtxEndsOnWriteTimeout(t *testing.T) {
+	priv, pub, _ := GenerateKeyPair()
+	sid, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+	type result struct {
+		readCause, writeCause error
+		writeErr              error
+	}
+	res := make(chan result, 1)
+	_, ln := startTestServer(t, ServerConfig{
+		PrivateKey: priv, ShortIDs: [][8]byte{sid}, CertPEM: certPEM, KeyPEM: keyPEM,
+		SessionHandler: func(ctx context.Context, conn net.Conn, _ [8]byte) {
+			var r result
+			// A read timeout leaves the session usable, so ctx stays live.
+			conn.SetReadDeadline(time.Now().Add(-time.Second))
+			conn.Read(make([]byte, 1))
+			r.readCause = context.Cause(ctx)
+			conn.SetReadDeadline(time.Time{})
+			// A write timeout poisons the TLS conn, so it ends the session.
+			conn.SetWriteDeadline(time.Now().Add(-time.Second))
+			_, r.writeErr = conn.Write([]byte("x"))
+			select {
+			case <-ctx.Done():
+				r.writeCause = context.Cause(ctx)
+			case <-time.After(2 * time.Second):
+			}
+			res <- r
+		},
+	})
+	c, err := NewClient(ClientConfig{ServerAddr: ln.Addr().String(), ServerName: "localhost", PublicKey: pub, ShortID: sid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	conn, err := c.DialSession(ctx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	r := waitFor(t, res, "handler")
+	if r.readCause != nil {
+		t.Fatalf("a read timeout ended the session: %v", r.readCause)
+	}
+	if !errors.Is(r.writeErr, os.ErrDeadlineExceeded) {
+		t.Fatalf("write err = %v, want a deadline error", r.writeErr)
+	}
+	if !errors.Is(r.writeCause, os.ErrDeadlineExceeded) {
+		t.Fatalf("cause after write timeout = %v, want a deadline error", r.writeCause)
 	}
 }
