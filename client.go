@@ -69,12 +69,9 @@ const maxDialAttempts = 3
 // but not yet marked closed; DialContext retries such conn-fatal failures on a
 // fresh transport, up to maxDialAttempts, rather than surfacing them.
 func (c *Client) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
+	if c.isClosed() {
 		return nil, fmt.Errorf("client is closed")
 	}
-	c.mu.Unlock()
 
 	var err error
 	for attempt := 0; attempt < maxDialAttempts; attempt++ {
@@ -121,12 +118,12 @@ func SPKISHA256(certDER []byte) ([32]byte, error) {
 // DialSession dials and authenticates a new connection that is not pooled
 // and runs no HTTP/2, for callers that layer their own protocol on it. ALPN
 // "h2" has been negotiated on it. The caller owns the connection. When ctx
-// has no deadline, ConnectTimeout bounds the dial and handshake.
+// has no deadline, ConnectTimeout bounds the dial and handshake. Of the
+// ClientConfig options that shape traffic, only TCPFragmentation applies;
+// RecordFragmentation, Jitter, MaxJitterMs and MaxStreamsPerConn belong to the
+// pooled HTTP/2 layer DialSession does not use.
 func (c *Client) DialSession(ctx context.Context) (net.Conn, error) {
-	c.mu.Lock()
-	closed := c.closed
-	c.mu.Unlock()
-	if closed {
+	if c.isClosed() {
 		return nil, fmt.Errorf("client is closed")
 	}
 	if _, ok := ctx.Deadline(); !ok {
@@ -135,6 +132,12 @@ func (c *Client) DialSession(ctx context.Context) (net.Conn, error) {
 		defer cancel()
 	}
 	return c.dialConn(ctx)
+}
+
+func (c *Client) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
 }
 
 // Close shuts down all connections.

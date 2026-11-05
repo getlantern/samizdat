@@ -203,10 +203,10 @@ func TestTrackSessionRefusesIDRevokedAfterVerify(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
-	if s.trackSession(c1, id) {
+	if s.trackSession(c1, id, nil) {
 		t.Fatal("a session verified before its ID was revoked was tracked")
 	}
-	if !s.trackSession(c1, base) {
+	if !s.trackSession(c1, base, nil) {
 		t.Fatal("a session using a remaining ID was refused")
 	}
 	s.untrackSession(c1)

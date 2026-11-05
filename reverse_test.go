@@ -20,9 +20,11 @@ func TestReversedHTTP2Roles(t *testing.T) {
 	certPEM, keyPEM := generateSelfSignedCert(t)
 	echo := startEcho(t)
 	ccs := make(chan *http2.ClientConn, 1)
+	returned := make(chan struct{})
 	_, ln := startTestServer(t, ServerConfig{
 		PrivateKey: priv, ShortIDs: [][8]byte{sid}, CertPEM: certPEM, KeyPEM: keyPEM,
 		SessionHandler: func(ctx context.Context, conn net.Conn, _ [8]byte) {
+			defer close(returned)
 			cc, err := (&http2.Transport{}).NewClientConn(conn)
 			if err != nil {
 				t.Error(err)
@@ -31,6 +33,8 @@ func TestReversedHTTP2Roles(t *testing.T) {
 			}
 			defer cc.Close()
 			ccs <- cc
+			// The session's ctx ends when the peer goes away: cc's read loop
+			// keeps a Read pending on conn, and its failure cancels ctx.
 			<-ctx.Done()
 		},
 	})
@@ -63,8 +67,8 @@ func TestReversedHTTP2Roles(t *testing.T) {
 		io.Copy(flushEachWrite{w}, up)
 	})})
 
-	cc, ok := <-ccs
-	if !ok {
+	cc := waitFor(t, ccs, "server side HTTP/2 client")
+	if cc == nil {
 		t.Fatal("server side could not start an HTTP/2 client")
 	}
 	tctx, cancel := context.WithTimeout(ctx(t), 10*time.Second)
@@ -91,6 +95,10 @@ func TestReversedHTTP2Roles(t *testing.T) {
 	if _, err := io.ReadFull(resp.Body, buf); err != nil || string(buf) != "hello" {
 		t.Fatalf("echo = %q, %v", buf, err)
 	}
+
+	// The inviter going away ends the portal's handler without Server.Close.
+	conn.Close()
+	waitFor(t, returned, "handler to return after the client disconnected")
 }
 
 // flushEachWrite flushes after every write, so tunneled bytes are not held in

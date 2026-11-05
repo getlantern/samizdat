@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,10 @@ import (
 
 // ErrServerClosed is the cause set on the server's context when Close is called.
 var ErrServerClosed = errors.New("server closed")
+
+// ErrSessionRevoked is the cause set on a SessionHandler's context when
+// SetShortIDs revokes the short ID its session authenticated with.
+var ErrSessionRevoked = errors.New("session short ID revoked")
 
 // Server accepts Samizdat connections, authenticates them via Reality-style
 // auth in the TLS ClientHello, and proxies authenticated HTTP/2 CONNECT
@@ -33,7 +38,7 @@ type Server struct {
 	sessionsMu sync.Mutex
 	// sessions maps each authenticated connection to the short ID it
 	// authenticated with, so SetShortIDs can close the ones it revokes.
-	sessions map[net.Conn][8]byte
+	sessions map[net.Conn]session
 	connsMu  sync.Mutex
 	// conns holds every accepted connection still being handled, so Close
 	// can end them. closed is set by Close; no connection is added after.
@@ -72,7 +77,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 	s := &Server{
 		config:       config,
 		serverPubKey: serverPubKey,
-		sessions:     make(map[net.Conn][8]byte),
+		sessions:     make(map[net.Conn]session),
 		conns:        make(map[net.Conn]struct{}),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -214,15 +219,18 @@ func (s *Server) SetShortIDs(ids [][8]byte) error {
 	next := append([][8]byte(nil), ids...)
 	s.sessionsMu.Lock()
 	s.shortIDs.Store(&next)
-	var revoked []net.Conn
-	for conn, id := range s.sessions {
-		if !slices.Contains(next, id) {
-			revoked = append(revoked, conn)
+	revoked := make(map[net.Conn]session)
+	for conn, sess := range s.sessions {
+		if !slices.Contains(next, sess.id) {
+			revoked[conn] = sess
 			delete(s.sessions, conn)
 		}
 	}
 	s.sessionsMu.Unlock()
-	for _, conn := range revoked {
+	for conn, sess := range revoked {
+		if sess.cancel != nil {
+			sess.cancel(ErrSessionRevoked)
+		}
 		conn.Close()
 	}
 	return nil
@@ -233,16 +241,24 @@ func (s *Server) ShortIDs() [][8]byte {
 	return append([][8]byte(nil), *s.shortIDs.Load()...)
 }
 
+// session is what the server tracks about an authenticated connection.
+type session struct {
+	id [8]byte
+	// cancel ends the session's context. It may be nil.
+	cancel context.CancelCauseFunc
+}
+
 // trackSession records conn as authenticated with id, unless id has been
 // revoked since it was verified. The check and the record share
-// SetShortIDs' lock, so no revocation falls between them.
-func (s *Server) trackSession(conn net.Conn, id [8]byte) bool {
+// SetShortIDs' lock, so no revocation falls between them. A SetShortIDs that
+// revokes id calls cancel, when it is not nil, and closes conn.
+func (s *Server) trackSession(conn net.Conn, id [8]byte, cancel context.CancelCauseFunc) bool {
 	s.sessionsMu.Lock()
 	defer s.sessionsMu.Unlock()
 	if !slices.Contains(*s.shortIDs.Load(), id) {
 		return false
 	}
-	s.sessions[conn] = id
+	s.sessions[conn] = session{id: id, cancel: cancel}
 	return true
 }
 
@@ -304,9 +320,14 @@ func (s *Server) doMasquerade(conn net.Conn, clientHelloRecord []byte) {
 // client and serves HTTP/2 CONNECT requests, or hands the connection to
 // config.SessionHandler when one is set.
 func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, shortID [8]byte) {
+	// The session's context ends with the server, a revocation, the
+	// connection failing, or this function returning.
+	sessCtx, cancel := context.WithCancelCause(s.ctx)
+	defer cancel(nil)
+
 	// Registered before the handshake: a SetShortIDs that revokes shortID
 	// from here on closes conn, and one that already did refuses it.
-	if !s.trackSession(conn, shortID) {
+	if !s.trackSession(conn, shortID, cancel) {
 		return
 	}
 	defer s.untrackSession(conn)
@@ -341,15 +362,49 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 	}
 
 	if h := s.config.SessionHandler; h != nil {
-		ctx := context.WithValue(s.ctx, sessionConnKey{}, conn)
+		ctx := context.WithValue(sessCtx, sessionConnKey{}, conn)
 		ctx = context.WithValue(ctx, shortIDKey{}, shortID)
 		defer tlsConn.Close()
-		h(ctx, tlsConn, shortID)
+		h(ctx, &sessionConn{Conn: tlsConn, cancel: cancel}, shortID)
 		return
 	}
 
 	// Serve HTTP/2 with CONNECT handler
 	s.serveH2(tlsConn, conn, shortID)
+}
+
+// sessionConn is the connection a SessionHandler receives. Its first failed
+// Read or Write, other than a deadline expiring, or its Close ends the
+// session's context, so a handler that waits on ctx.Done() returns when the
+// peer goes away. Embedding *tls.Conn keeps ConnectionState reachable.
+type sessionConn struct {
+	*tls.Conn
+	cancel context.CancelCauseFunc
+}
+
+func (c *sessionConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.fail(err)
+	return n, err
+}
+
+func (c *sessionConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.fail(err)
+	return n, err
+}
+
+func (c *sessionConn) Close() error {
+	err := c.Conn.Close()
+	c.cancel(net.ErrClosed)
+	return err
+}
+
+func (c *sessionConn) fail(err error) {
+	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		return
+	}
+	c.cancel(err)
 }
 
 type sessionConnKey struct{}

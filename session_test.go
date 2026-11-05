@@ -2,6 +2,7 @@ package samizdat
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -74,7 +75,7 @@ func TestSessionHandlerCtxCancelledByClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	<-started
+	waitFor(t, started, "handler start")
 	srv.Close()
 	select {
 	case cause := <-done:
@@ -173,5 +174,166 @@ func TestDialSessionAfterClose(t *testing.T) {
 	c.Close()
 	if _, err := c.DialSession(ctx(t)); err == nil {
 		t.Fatal("expected error after Close")
+	}
+}
+
+// waitFor fails the test if ch is not ready within 5s.
+func waitFor[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		var zero T
+		return zero
+	}
+}
+
+func TestSessionHandlerCtxEndsWhenClientDisconnects(t *testing.T) {
+	priv, pub, _ := GenerateKeyPair()
+	sid, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	_, ln := startTestServer(t, ServerConfig{
+		PrivateKey: priv, ShortIDs: [][8]byte{sid}, CertPEM: certPEM, KeyPEM: keyPEM,
+		SessionHandler: func(ctx context.Context, conn net.Conn, _ [8]byte) {
+			// Like an http2.ClientConn's read loop: a Read is always pending.
+			go io.Copy(io.Discard, conn)
+			close(started)
+			<-ctx.Done()
+			done <- context.Cause(ctx)
+		},
+	})
+	c, err := NewClient(ClientConfig{ServerAddr: ln.Addr().String(), ServerName: "localhost", PublicKey: pub, ShortID: sid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	conn, err := c.DialSession(ctx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, started, "handler start")
+	conn.Close()
+	if cause := waitFor(t, done, "handler ctx to end after disconnect"); cause == nil || errors.Is(cause, ErrServerClosed) {
+		t.Fatalf("cause = %v, want a connection error", cause)
+	}
+}
+
+func TestSessionHandlerCtxEndsWhenShortIDRevoked(t *testing.T) {
+	priv, pub, _ := GenerateKeyPair()
+	sid, _ := GenerateShortID()
+	other, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	srv, ln := startTestServer(t, ServerConfig{
+		PrivateKey: priv, ShortIDs: [][8]byte{sid, other}, CertPEM: certPEM, KeyPEM: keyPEM,
+		// No Read pending: revocation must end ctx on its own.
+		SessionHandler: func(ctx context.Context, _ net.Conn, _ [8]byte) {
+			close(started)
+			<-ctx.Done()
+			done <- context.Cause(ctx)
+		},
+	})
+	c, err := NewClient(ClientConfig{ServerAddr: ln.Addr().String(), ServerName: "localhost", PublicKey: pub, ShortID: sid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	conn, err := c.DialSession(ctx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	waitFor(t, started, "handler start")
+	if err := srv.SetShortIDs([][8]byte{other}); err != nil {
+		t.Fatal(err)
+	}
+	if cause := waitFor(t, done, "handler ctx to end after revocation"); !errors.Is(cause, ErrSessionRevoked) {
+		t.Fatalf("cause = %v, want ErrSessionRevoked", cause)
+	}
+}
+
+func TestSessionHandlerConnKeepsConnectionState(t *testing.T) {
+	priv, pub, _ := GenerateKeyPair()
+	sid, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+	proto := make(chan string, 1)
+	_, ln := startTestServer(t, ServerConfig{
+		PrivateKey: priv, ShortIDs: [][8]byte{sid}, CertPEM: certPEM, KeyPEM: keyPEM,
+		SessionHandler: func(_ context.Context, conn net.Conn, _ [8]byte) {
+			cs, ok := conn.(interface{ ConnectionState() tls.ConnectionState })
+			if !ok {
+				proto <- ""
+				return
+			}
+			proto <- cs.ConnectionState().NegotiatedProtocol
+		},
+	})
+	c, err := NewClient(ClientConfig{ServerAddr: ln.Addr().String(), ServerName: "localhost", PublicKey: pub, ShortID: sid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	conn, err := c.DialSession(ctx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if p := waitFor(t, proto, "handler"); p != "h2" {
+		t.Fatalf("NegotiatedProtocol = %q, want h2", p)
+	}
+}
+
+func TestDialSessionCancelledCtx(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	_, pub, _ := GenerateKeyPair()
+	c, err := NewClient(ClientConfig{ServerAddr: ln.Addr().String(), ServerName: "x", PublicKey: pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	cctx, cancel := context.WithCancel(ctx(t))
+	cancel()
+	if _, err := c.DialSession(cctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+func TestDialSessionConnectTimeout(t *testing.T) {
+	// The listener accepts but never answers the ClientHello.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	_, pub, _ := GenerateKeyPair()
+	c, err := NewClient(ClientConfig{ServerAddr: ln.Addr().String(), ServerName: "x", PublicKey: pub, ConnectTimeout: 200 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	start := time.Now()
+	if _, err := c.DialSession(ctx(t)); err == nil {
+		t.Fatal("expected a timeout")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("DialSession took %v, want about ConnectTimeout", d)
 	}
 }

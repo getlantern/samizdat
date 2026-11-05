@@ -24,6 +24,12 @@ type ConnHandler func(ctx context.Context, conn net.Conn, destination string)
 // the built-in HTTP/2 CONNECT server, with the TLS connection (ALPN "h2"
 // already negotiated) and the short ID the client authenticated with. The
 // connection is closed when it returns.
+//
+// ctx ends when the session does: when a Read or Write on conn fails (the
+// peer went away), when conn is closed, when SetShortIDs revokes shortID
+// (cause ErrSessionRevoked), or when the server is closed (cause
+// ErrServerClosed). A handler should return once ctx is done. Server.Close
+// waits for handlers to return, so one that ignores ctx blocks it.
 type SessionHandler func(ctx context.Context, conn net.Conn, shortID [8]byte)
 
 // ClientConfig configures the Samizdat client.
