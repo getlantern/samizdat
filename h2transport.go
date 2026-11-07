@@ -28,7 +28,7 @@ type h2Transport struct {
 
 	mu            sync.Mutex
 	activeStreams atomic.Int32
-	// idleSince is when the last stream closed, in Unix nanoseconds, or when
+	// idleSince is when a stream last closed, in Unix nanoseconds, or when
 	// the transport was created if no stream has.
 	idleSince  atomic.Int64
 	maxStreams int
@@ -247,9 +247,10 @@ func (s *h2StreamRWC) Close() error {
 		if s.tunnelCancel != nil {
 			s.tunnelCancel()
 		}
-		if s.transport.activeStreams.Add(-1) == 0 {
-			s.transport.idleSince.Store(time.Now().UnixNano())
-		}
+		// The timestamp is stored before the count can reach zero, so cleanup
+		// never sees an idle transport with a stale one.
+		s.transport.idleSince.Store(time.Now().UnixNano())
+		s.transport.activeStreams.Add(-1)
 	})
 	return closeErr
 }

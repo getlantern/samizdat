@@ -1139,3 +1139,25 @@ func TestConnPoolNeverClosesBusyTransport(t *testing.T) {
 		t.Error("a transport with an open stream was closed under a negative idleTimeout")
 	}
 }
+
+func TestClosingLastStreamRestartsIdleClock(t *testing.T) {
+	c, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	tr := &h2Transport{tlsConn: c, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
+	tr.idleSince.Store(time.Now().Add(-time.Hour).UnixNano())
+	tr.activeStreams.Add(1)
+	pr, pw := io.Pipe()
+	pw.Close()
+	_, w := io.Pipe()
+	s := &h2StreamRWC{reader: pr, writer: w, transport: tr}
+	s.Close()
+
+	if got := tr.idleFor(time.Now()); got > time.Minute {
+		t.Fatalf("idle for %v right after its long-lived stream closed", got)
+	}
+	p := &connPool{idleTimeout: time.Minute, transports: []*h2Transport{tr}}
+	p.cleanup()
+	if tr.isClosed() {
+		t.Error("a transport whose last stream just closed was retired at once")
+	}
+}
