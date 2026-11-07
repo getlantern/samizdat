@@ -1095,3 +1095,33 @@ func TestH2ServerUsesRandomWriteScheduler(t *testing.T) {
 
 // Suppress unused import
 var _ = io.Discard
+
+func TestConnPoolKeepsTransportUntilIdleTimeout(t *testing.T) {
+	newTransport := func() *h2Transport {
+		c, peer := net.Pipe()
+		t.Cleanup(func() { peer.Close() })
+		tr := &h2Transport{tlsConn: c, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
+		tr.idleSince.Store(time.Now().UnixNano())
+		return tr
+	}
+	recent, stale, busy := newTransport(), newTransport(), newTransport()
+	stale.idleSince.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	busy.idleSince.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	busy.activeStreams.Add(1)
+
+	p := &connPool{idleTimeout: time.Minute, transports: []*h2Transport{recent, stale, busy}}
+	p.cleanup()
+
+	if recent.isClosed() {
+		t.Error("a transport idle for less than idleTimeout was closed")
+	}
+	if !stale.isClosed() {
+		t.Error("a transport idle past idleTimeout was kept")
+	}
+	if busy.isClosed() {
+		t.Error("a transport with an open stream was closed")
+	}
+	if len(p.transports) != 2 {
+		t.Errorf("pool kept %d transports, want 2", len(p.transports))
+	}
+}
