@@ -98,7 +98,7 @@ func (p *connPool) cleanup() {
 		if t.isClosed() {
 			continue
 		}
-		if t.idleFor(now) >= p.idleTimeout {
+		if t.streamCount() == 0 && t.idleFor(now) >= p.idleTimeout {
 			t.close()
 			continue
 		}

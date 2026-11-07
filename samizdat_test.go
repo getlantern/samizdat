@@ -1125,3 +1125,17 @@ func TestConnPoolKeepsTransportUntilIdleTimeout(t *testing.T) {
 		t.Errorf("pool kept %d transports, want 2", len(p.transports))
 	}
 }
+
+func TestConnPoolNeverClosesBusyTransport(t *testing.T) {
+	c, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	busy := &h2Transport{tlsConn: c, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
+	busy.activeStreams.Add(1)
+
+	p := &connPool{idleTimeout: -time.Second, transports: []*h2Transport{busy}}
+	p.cleanup()
+
+	if busy.isClosed() {
+		t.Error("a transport with an open stream was closed under a negative idleTimeout")
+	}
+}
