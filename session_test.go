@@ -397,3 +397,25 @@ func TestSessionHandlerCtxEndsOnWriteTimeout(t *testing.T) {
 		t.Fatalf("cause after write timeout = %v, want a deadline error", r.writeCause)
 	}
 }
+
+func TestServerSharesOneTLSConfig(t *testing.T) {
+	priv, _, _ := GenerateKeyPair()
+	sid, _ := GenerateShortID()
+	certPEM, keyPEM := generateSelfSignedCert(t)
+	h := func(context.Context, net.Conn, [8]byte) {}
+	s, err := NewServer(ServerConfig{PrivateKey: priv, ShortIDs: [][8]byte{sid}, CertPEM: certPEM, KeyPEM: keyPEM, SessionHandler: h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := s.tlsConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := s.tlsConfig()
+	if a != b {
+		t.Fatal("each session got its own TLS config, so session tickets can never be resumed")
+	}
+	if len(a.Certificates) != 1 || a.MinVersion != tls.VersionTLS13 || len(a.NextProtos) != 1 || a.NextProtos[0] != "h2" {
+		t.Fatalf("unexpected TLS config: %d certs, min version %x, ALPN %v", len(a.Certificates), a.MinVersion, a.NextProtos)
+	}
+}
