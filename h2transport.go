@@ -28,8 +28,11 @@ type h2Transport struct {
 
 	mu            sync.Mutex
 	activeStreams atomic.Int32
-	maxStreams    int
-	closed        bool
+	// idleSince is when a stream last closed, in Unix nanoseconds, or when
+	// the transport was created if no stream has.
+	idleSince  atomic.Int64
+	maxStreams int
+	closed     bool
 }
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
@@ -53,6 +56,7 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 		maxStreams:  maxStreams,
 		shaper:      shaper,
 	}
+	t.idleSince.Store(time.Now().UnixNano())
 
 	return t, nil
 }
@@ -167,6 +171,15 @@ func (t *h2Transport) streamCount() int {
 	return int(t.activeStreams.Load())
 }
 
+// idleFor returns how long the transport has had no open stream as of now,
+// or zero while it has one.
+func (t *h2Transport) idleFor(now time.Time) time.Duration {
+	if t.streamCount() > 0 {
+		return 0
+	}
+	return now.Sub(time.Unix(0, t.idleSince.Load()))
+}
+
 // close shuts down the H2 transport and underlying TLS connection.
 func (t *h2Transport) close() error {
 	t.mu.Lock()
@@ -234,6 +247,9 @@ func (s *h2StreamRWC) Close() error {
 		if s.tunnelCancel != nil {
 			s.tunnelCancel()
 		}
+		// The timestamp is stored before the count can reach zero, so cleanup
+		// never sees an idle transport with a stale one.
+		s.transport.idleSince.Store(time.Now().UnixNano())
 		s.transport.activeStreams.Add(-1)
 	})
 	return closeErr

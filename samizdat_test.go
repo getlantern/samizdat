@@ -1095,3 +1095,69 @@ func TestH2ServerUsesRandomWriteScheduler(t *testing.T) {
 
 // Suppress unused import
 var _ = io.Discard
+
+func TestConnPoolKeepsTransportUntilIdleTimeout(t *testing.T) {
+	newTransport := func() *h2Transport {
+		c, peer := net.Pipe()
+		t.Cleanup(func() { peer.Close() })
+		tr := &h2Transport{tlsConn: c, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
+		tr.idleSince.Store(time.Now().UnixNano())
+		return tr
+	}
+	recent, stale, busy := newTransport(), newTransport(), newTransport()
+	stale.idleSince.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	busy.idleSince.Store(time.Now().Add(-2 * time.Minute).UnixNano())
+	busy.activeStreams.Add(1)
+
+	p := &connPool{idleTimeout: time.Minute, transports: []*h2Transport{recent, stale, busy}}
+	p.cleanup()
+
+	if recent.isClosed() {
+		t.Error("a transport idle for less than idleTimeout was closed")
+	}
+	if !stale.isClosed() {
+		t.Error("a transport idle past idleTimeout was kept")
+	}
+	if busy.isClosed() {
+		t.Error("a transport with an open stream was closed")
+	}
+	if len(p.transports) != 2 {
+		t.Errorf("pool kept %d transports, want 2", len(p.transports))
+	}
+}
+
+func TestConnPoolNeverClosesBusyTransport(t *testing.T) {
+	c, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	busy := &h2Transport{tlsConn: c, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
+	busy.activeStreams.Add(1)
+
+	p := &connPool{idleTimeout: -time.Second, transports: []*h2Transport{busy}}
+	p.cleanup()
+
+	if busy.isClosed() {
+		t.Error("a transport with an open stream was closed under a negative idleTimeout")
+	}
+}
+
+func TestClosingLastStreamRestartsIdleClock(t *testing.T) {
+	c, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	tr := &h2Transport{tlsConn: c, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
+	tr.idleSince.Store(time.Now().Add(-time.Hour).UnixNano())
+	tr.activeStreams.Add(1)
+	pr, pw := io.Pipe()
+	pw.Close()
+	_, w := io.Pipe()
+	s := &h2StreamRWC{reader: pr, writer: w, transport: tr}
+	s.Close()
+
+	if got := tr.idleFor(time.Now()); got > time.Minute {
+		t.Fatalf("idle for %v right after its long-lived stream closed", got)
+	}
+	p := &connPool{idleTimeout: time.Minute, transports: []*h2Transport{tr}}
+	p.cleanup()
+	if tr.isClosed() {
+		t.Error("a transport whose last stream just closed was retired at once")
+	}
+}

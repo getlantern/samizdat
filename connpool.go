@@ -68,7 +68,11 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 
 // cleanupLoop periodically removes closed and idle transports.
 func (p *connPool) cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+	interval := 30 * time.Second
+	if p.idleTimeout > 0 && p.idleTimeout < interval {
+		interval = p.idleTimeout
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -81,18 +85,20 @@ func (p *connPool) cleanupLoop() {
 	}
 }
 
-// cleanup removes closed transports and closes idle ones.
+// cleanup removes closed transports and closes those idle for idleTimeout.
+// Closing one the moment it has no stream would make every pause in a
+// user's browsing cost a new TCP connection and TLS handshake.
 func (p *connPool) cleanup() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	now := time.Now()
 	alive := make([]*h2Transport, 0, len(p.transports))
 	for _, t := range p.transports {
 		if t.isClosed() {
 			continue
 		}
-		if t.streamCount() == 0 {
-			// Close idle transports (we'll create new ones on demand)
+		if t.streamCount() == 0 && t.idleFor(now) >= p.idleTimeout {
 			t.close()
 			continue
 		}
