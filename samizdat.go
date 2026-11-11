@@ -110,6 +110,11 @@ type ServerConfig struct {
 	// Limits
 	MaxConcurrentStreams int // per connection (default: 250)
 
+	// LeanH2 serves tunnels with samizdat's own HTTP/2 server instead of
+	// x/net's. Clients see the same frames; the server uses much less CPU
+	// per byte (see leanh2.go).
+	LeanH2 bool
+
 	// Handler: called for each authenticated proxied connection
 	Handler ConnHandler
 

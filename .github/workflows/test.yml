@@ -21,3 +21,8 @@ jobs:
 
       - name: Test
         run: go test -race -count=1 -timeout 5m ./...
+
+      - name: Test with the lean HTTP/2 server
+        run: go test -race -count=1 -timeout 5m ./...
+        env:
+          SAMIZDAT_TEST_LEAN_H2: "1"

@@ -1,0 +1,407 @@
+package samizdat
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+)
+
+// h2Peer is a hand-driven HTTP/2 client on a plain TCP connection to one of
+// the two servers, serveH2 (x/net) or serveLeanH2, run without TLS.
+type h2Peer struct {
+	conn net.Conn
+	fr   *http2.Framer
+	enc  *hpack.Encoder
+	hbuf bytes.Buffer
+}
+
+// startH2Pair serves one connection with the chosen implementation and
+// returns a client connected to it.
+func startH2Pair(t *testing.T, lean bool, handler ConnHandler) *h2Peer {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	s := &Server{config: ServerConfig{MaxConcurrentStreams: 4, Handler: handler}}
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if lean {
+			bc := &batchConn{Conn: conn}
+			s.serveLeanH2(bc, bc, conn, [8]byte{})
+		} else {
+			s.serveH2(conn, conn, [8]byte{})
+		}
+	}()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	p := &h2Peer{conn: conn, fr: http2.NewFramer(conn, conn)}
+	p.fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	p.enc = hpack.NewEncoder(&p.hbuf)
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	return p
+}
+
+// handshake sends what x/net's Transport sends first.
+func (p *h2Peer) handshake(t *testing.T) {
+	t.Helper()
+	if _, err := p.conn.Write([]byte(http2.ClientPreface)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.fr.WriteSettings(
+		http2.Setting{ID: http2.SettingEnablePush, Val: 0},
+		http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20},
+		http2.Setting{ID: http2.SettingMaxHeaderListSize, Val: 10 << 20},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.fr.WriteWindowUpdate(0, 1<<30); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (p *h2Peer) request(t *testing.T, id uint32, method, authority string, endStream bool, extra ...hpack.HeaderField) {
+	t.Helper()
+	p.hbuf.Reset()
+	p.enc.WriteField(hpack.HeaderField{Name: ":method", Value: method})
+	p.enc.WriteField(hpack.HeaderField{Name: ":authority", Value: authority})
+	for _, f := range extra {
+		p.enc.WriteField(f)
+	}
+	if err := p.fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID: id, BlockFragment: p.hbuf.Bytes(), EndHeaders: true, EndStream: endStream,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// describe renders a frame for comparison, leaving out what varies between
+// runs (the date header's value).
+func describe(f http2.Frame) string {
+	h := f.Header()
+	s := fmt.Sprintf("%v flags=%v stream=%d", h.Type, h.Flags, h.StreamID)
+	switch f := f.(type) {
+	case *http2.SettingsFrame:
+		f.ForeachSetting(func(st http2.Setting) error {
+			s += fmt.Sprintf(" %v=%d", st.ID, st.Val)
+			return nil
+		})
+	case *http2.WindowUpdateFrame:
+		s += fmt.Sprintf(" incr=%d", f.Increment)
+	case *http2.MetaHeadersFrame:
+		for _, hf := range f.Fields {
+			if hf.Name == "date" {
+				s += " date"
+			} else {
+				s += fmt.Sprintf(" %s=%s", hf.Name, hf.Value)
+			}
+		}
+	case *http2.DataFrame:
+		s += fmt.Sprintf(" len=%d", len(f.Data()))
+	case *http2.RSTStreamFrame:
+		s += fmt.Sprintf(" code=%v", f.ErrCode)
+	}
+	return s
+}
+
+// transcript drives one exchange and returns the frames the server sent.
+func transcript(t *testing.T, lean bool, method, authority string, extra ...hpack.HeaderField) []string {
+	p := startH2Pair(t, lean, func(ctx context.Context, conn net.Conn, dest string) {
+		conn.Write([]byte("hello"))
+	})
+	p.handshake(t)
+	p.request(t, 1, method, authority, true, extra...)
+	var out []string
+	for {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("lean=%v: %v (so far %q)", lean, err, out)
+		}
+		out = append(out, describe(f))
+		h := f.Header()
+		if h.StreamID == 1 && (h.Flags.Has(http2.FlagDataEndStream) || h.Type == http2.FrameRSTStream) {
+			return out
+		}
+	}
+}
+
+// canonical renders a transcript for comparison. x/net's writer sends its
+// connection WINDOW_UPDATE and its SETTINGS ACK in either order from run to
+// run, so the connection-level frames after the first SETTINGS are compared
+// as a set; stream frames keep their order.
+func canonical(frames []string) string {
+	var conn, stream []string
+	for i, f := range frames {
+		if i > 0 && strings.Contains(f, " stream=0") {
+			conn = append(conn, f)
+		} else {
+			stream = append(stream, f)
+		}
+	}
+	slices.Sort(conn)
+	return fmt.Sprintf("%q then %q", conn, stream)
+}
+
+// TestLeanH2MatchesXNet checks that a client sees the same frames from the
+// lean server as from x/net's: settings, window, response headers, data and
+// stream end.
+func TestLeanH2MatchesXNet(t *testing.T) {
+	path := []hpack.HeaderField{{Name: ":scheme", Value: "https"}, {Name: ":path", Value: "/"}}
+	for _, c := range []struct {
+		name, method, authority string
+		extra                   []hpack.HeaderField
+	}{
+		{"connect", "CONNECT", "example.com:443", nil},
+		{"connect without authority", "CONNECT", "", nil},
+		{"connect with path", "CONNECT", "example.com:443", path},
+		{"get", "GET", "example.com", path},
+		{"get without path", "GET", "example.com", nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			want := canonical(transcript(t, false, c.method, c.authority, c.extra...))
+			got := canonical(transcript(t, true, c.method, c.authority, c.extra...))
+			if got != want {
+				t.Errorf("lean server frames differ\nx/net: %s\nlean:  %s", want, got)
+			}
+		})
+	}
+}
+
+// startLeanPair runs a real samizdat client against a lean server whose
+// handler is handler.
+func startLeanPair(t *testing.T, handler ConnHandler) *Client {
+	t.Helper()
+	priv, pub, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := GenerateShortID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := generateSelfSignedCert(t)
+	_, ln := startTestServer(t, ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		PrivateKey: priv,
+		ShortIDs:   [][8]byte{sid},
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		Handler:    handler,
+		LeanH2:     true,
+	})
+	client, err := NewClient(ClientConfig{
+		ServerAddr: ln.Addr().String(), ServerName: "test.example.com",
+		PublicKey: pub, ShortID: sid,
+		Jitter: false, TCPFragmentation: false, RecordFragmentation: false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+	return client
+}
+
+// TestLeanH2LargeTransfers moves several times the 1 MiB flow-control
+// windows both ways on concurrent streams and checks every byte.
+func TestLeanH2LargeTransfers(t *testing.T) {
+	const streams, size = 8, 6 << 20
+	client := startLeanPair(t, func(ctx context.Context, conn net.Conn, dest string) {
+		defer conn.Close()
+		// Echo, hashing nothing: the client checks the bytes.
+		io.Copy(conn, conn)
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < streams; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			conn, err := client.DialContext(ctx, "tcp", "echo:1")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer conn.Close()
+			payload := make([]byte, size)
+			rand.Read(payload)
+			want := sha256.Sum256(payload)
+			go func() {
+				conn.Write(payload)
+				conn.(interface{ CloseWrite() error }).CloseWrite()
+			}()
+			h := sha256.New()
+			n, err := io.Copy(h, conn)
+			if err != nil || n != size {
+				t.Errorf("echoed %d of %d bytes: %v", n, size, err)
+				return
+			}
+			if !bytes.Equal(h.Sum(nil), want[:]) {
+				t.Error("echoed bytes differ")
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestLeanH2ResetEndsOnlyThatStream cancels one download mid-stream: its
+// handler's writes must fail and its context end, while a second stream on
+// the same connection carries on.
+func TestLeanH2ResetEndsOnlyThatStream(t *testing.T) {
+	handlerErr := make(chan error, 1)
+	ctxDone := make(chan struct{})
+	client := startLeanPair(t, func(ctx context.Context, conn net.Conn, dest string) {
+		defer conn.Close()
+		buf := make([]byte, 32<<10)
+		if dest == "endless:1" {
+			for {
+				if _, err := conn.Write(buf); err != nil {
+					handlerErr <- err
+					<-ctx.Done()
+					close(ctxDone)
+					return
+				}
+			}
+		}
+		conn.Write([]byte("still here"))
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	victim, err := client.DialContext(ctx, "tcp", "endless:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.CopyN(io.Discard, victim, 4<<20)
+
+	// Abort the stream the way the client does when a read stalls: it
+	// closes the response body, which sends RST_STREAM.
+	sc := victim.(*streamConn)
+	sc.rwc.(*h2StreamRWC).abort()
+	select {
+	case err := <-handlerErr:
+		if !errors.Is(err, errLeanStreamReset) {
+			t.Errorf("handler write error = %v, want a stream reset", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler kept writing after the client reset the stream")
+	}
+	select {
+	case <-ctxDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler context didn't end on reset")
+	}
+
+	other, err := client.DialContext(ctx, "tcp", "plain:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	other.(interface{ CloseWrite() error }).CloseWrite()
+	got, err := io.ReadAll(other)
+	if err != nil || string(got) != "still here" {
+		t.Errorf("second stream got %q, %v", got, err)
+	}
+}
+
+// TestLeanH2RefusesStreamsOverTheLimit opens more streams than
+// MaxConcurrentStreams allows: the extra one is refused, and the connection
+// keeps serving.
+func TestLeanH2RefusesStreamsOverTheLimit(t *testing.T) {
+	release := make(chan struct{})
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {
+		<-release
+	})
+	defer close(release)
+	p.handshake(t)
+	for id := uint32(1); id <= 9; id += 2 { // five streams; the limit is four
+		p.request(t, id, "CONNECT", "example.com:443", false)
+	}
+	refused := false
+	for !refused {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rst, ok := f.(*http2.RSTStreamFrame); ok {
+			if rst.StreamID != 9 || rst.ErrCode != http2.ErrCodeRefusedStream {
+				t.Fatalf("got %s, want stream 9 refused", describe(f))
+			}
+			refused = true
+		}
+	}
+	// A PING still gets its answer.
+	if err := p.fr.WritePing(false, [8]byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ping, ok := f.(*http2.PingFrame); ok && ping.IsAck() && ping.Data == [8]byte{1, 2, 3} {
+			return
+		}
+	}
+}
+
+// TestLeanH2ManyStreams runs many short echo streams at once, the shape of a
+// browser's traffic through a proxy, to shake out races.
+func TestLeanH2ManyStreams(t *testing.T) {
+	var served atomic.Int32
+	client := startLeanPair(t, func(ctx context.Context, conn net.Conn, dest string) {
+		defer conn.Close()
+		served.Add(1)
+		io.Copy(conn, conn)
+	})
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			conn, err := client.DialContext(ctx, "tcp", "echo:1")
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer conn.Close()
+			msg := bytes.Repeat([]byte{byte(i)}, 1+i*97)
+			go func() {
+				conn.Write(msg)
+				conn.(interface{ CloseWrite() error }).CloseWrite()
+			}()
+			got, err := io.ReadAll(conn)
+			if err != nil || !bytes.Equal(got, msg) {
+				t.Errorf("stream %d: got %d bytes, %v", i, len(got), err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if served.Load() != 200 {
+		t.Errorf("handler ran %d times, want 200", served.Load())
+	}
+}
