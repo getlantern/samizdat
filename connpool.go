@@ -60,8 +60,14 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 		return nil, err
 	}
 
-	t.activeStreams.Add(1)
 	p.mu.Lock()
+	if p.closed {
+		// Closed while this one was dialing: close would never reach it.
+		p.mu.Unlock()
+		t.close()
+		return nil, context.Canceled
+	}
+	t.activeStreams.Add(1)
 	p.transports = append(p.transports, t)
 	p.mu.Unlock()
 

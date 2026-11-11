@@ -216,10 +216,13 @@ func (c *leanConn) serve() {
 	fr.MaxHeaderListSize = leanMaxHeaderListSize
 	fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
 	if f, err := fr.ReadFrame(); err != nil {
+		c.goAway(err)
 		return
 	} else if sf, ok := f.(*http2.SettingsFrame); !ok || sf.IsAck() {
-		return // the preface must be followed by SETTINGS
-	} else if c.handleSettings(sf) != nil {
+		c.goAway(errLeanProtocol) // the preface must be followed by SETTINGS
+		return
+	} else if err := c.handleSettings(sf); err != nil {
+		c.goAway(err)
 		return
 	}
 	c.conn.SetReadDeadline(time.Time{})
@@ -366,13 +369,19 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	c.mu.Lock()
 	if id%2 == 1 && id <= c.lastStreamID {
 		// HEADERS on a stream already opened: trailers, which must end the
-		// stream, as x/net's server accepts them, or HEADERS on a stream
-		// that's gone.
+		// stream and which x/net's server accepts, or HEADERS on a stream
+		// that's closed or gone, which it rejects.
 		defer c.mu.Unlock()
 		st := c.streams[id]
 		switch {
-		case st == nil || st.remoteDone || st.reset:
-			c.wbuf = appendRSTStream(c.wbuf, id, http2.ErrCodeStreamClosed)
+		case st == nil:
+			// x/net's server treats HEADERS for a stream it has forgotten
+			// as a connection error.
+			return errLeanProtocol
+		case st.reset:
+			return nil // already answered with RST_STREAM, as x/net
+		case st.remoteDone:
+			c.resetStreamLocked(st, http2.ErrCodeStreamClosed)
 			return c.queuedControlFrame()
 		case !f.StreamEnded():
 			c.resetStreamLocked(st, http2.ErrCodeProtocol)
@@ -579,6 +588,8 @@ func (c *leanConn) goAway(err error) {
 		code = http2.ErrCode(ce)
 	case errors.Is(err, errLeanFlow):
 		code = http2.ErrCodeFlowControl
+	case errors.Is(err, http2.ErrFrameTooLarge):
+		code = http2.ErrCodeFrameSize
 	case errors.Is(err, errLeanCalm):
 		code = http2.ErrCodeEnhanceYourCalm
 	case !errors.Is(err, errLeanProtocol):
@@ -772,7 +783,8 @@ func (st *leanStream) run(method, authority, scheme, path string, truncated bool
 		connect && (authority == "" || scheme != "" || path != "") ||
 		!connect && (path == "" || scheme != "http" && scheme != "https")
 	if malformed {
-		if c.resetStream(st.id, http2.ErrCodeProtocol) != nil {
+		if err := c.resetStream(st.id, http2.ErrCodeProtocol); err != nil {
+			c.goAway(err)
 			c.close()
 		}
 		return
@@ -791,7 +803,16 @@ func (st *leanStream) run(method, authority, scheme, path string, truncated bool
 	// closes normally rather than with RST_STREAM, as serveH2 does, and for
 	// writes from goroutines the handler left behind to finish, up to the
 	// drain timeout. Data still arriving is dropped meanwhile.
+	st.drainAndEnd()
+}
+
+// drainAndEnd is run's drain. It holds c.mu through a deferred unlock, as
+// every path under run does, so that run's recover can take c.mu after a
+// panic.
+func (st *leanStream) drainAndEnd() {
+	c := st.c
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	st.draining = true
 	st.dropUnreadLocked()
 	st.cond.Broadcast() // a read the handler left behind now fails
@@ -809,7 +830,6 @@ func (st *leanStream) run(method, authority, scheme, path string, truncated bool
 	st.closed = true
 	st.wakeLocked()
 	st.endLocked(nil)
-	c.mu.Unlock()
 }
 
 // runHandler runs the Handler on the stream. A handler that panics resets
@@ -852,9 +872,10 @@ func (st *leanStream) endLocked(body []byte) {
 			st.cond.Wait()
 		}
 		// An empty body needs no credit; a window can be negative (the
-		// client may shrink INITIAL_WINDOW_SIZE after data went out), so a
-		// frame's length is taken from the windows only when both are
-		// open, and never below zero.
+		// client may shrink INITIAL_WINDOW_SIZE after data went out). The
+		// loop above only lets a non-empty body through with both windows
+		// open, so the clamp never fires; it stays as a guard, since a
+		// negative length here panics.
 		n := 0
 		if len(body) > 0 {
 			n = max(0, min(len(body), c.peerMaxFrame, int(st.sendWin), int(c.connSendWin)))
@@ -920,8 +941,8 @@ func (st *leanStream) reply(status int, contentType string, nosniff bool, body s
 		return
 	}
 	st.c.mu.Lock()
+	defer st.c.mu.Unlock() // deferred, so run's recover can take c.mu
 	st.endLocked([]byte(body))
-	st.c.mu.Unlock()
 }
 
 // writeHeaders sends response HEADERS with :status, extra and date, the
@@ -986,17 +1007,23 @@ func (sc *leanStreamConn) Read(b []byte) (int, error) {
 func (sc *leanStreamConn) Write(b []byte) (int, error) {
 	st := sc.st
 	c := st.c
-	st.wmu.Lock()
-	defer st.wmu.Unlock()
+	// The Write counts as in progress while it waits for wmu too, so the
+	// drain doesn't end the stream under a Write queued behind another.
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	st.writing++
+	c.mu.Unlock()
 	defer func() {
+		c.mu.Lock()
 		st.writing--
 		if st.writing == 0 {
 			st.cond.Broadcast()
 		}
+		c.mu.Unlock()
 	}()
+	st.wmu.Lock()
+	defer st.wmu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	written := 0
 	for written < len(b) {
 		for {
