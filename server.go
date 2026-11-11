@@ -358,8 +358,16 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 		return
 	}
 
+	// The lean HTTP/2 server batches TLS records beneath the TLS conn.
+	var under net.Conn = replayConn
+	var bc *batchConn
+	if s.config.LeanH2 && s.config.SessionHandler == nil {
+		bc = &batchConn{Conn: replayConn}
+		under = bc
+	}
+
 	// Complete TLS handshake
-	tlsConn := tls.Server(replayConn, tlsConfig)
+	tlsConn := tls.Server(under, tlsConfig)
 	if err := tlsConn.HandshakeContext(s.ctx); err != nil {
 		tlsConn.Close()
 		return
@@ -380,6 +388,10 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 	}
 
 	// Serve HTTP/2 with CONNECT handler
+	if bc != nil {
+		s.serveLeanH2(tlsConn, bc, conn, shortID)
+		return
+	}
 	s.serveH2(tlsConn, conn, shortID)
 }
 
@@ -700,8 +712,8 @@ func (sc *serverStreamConn) RemoteAddr() net.Addr {
 	return &streamAddr{"tcp", "client"}
 }
 func (sc *serverStreamConn) SetDeadline(t time.Time) error      { return nil }
-func (sc *serverStreamConn) SetReadDeadline(t time.Time) error   { return nil }
-func (sc *serverStreamConn) SetWriteDeadline(t time.Time) error  { return nil }
+func (sc *serverStreamConn) SetReadDeadline(t time.Time) error  { return nil }
+func (sc *serverStreamConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // syncReader serializes concurrent reads with a mutex. This prevents a data
 // race when both a handler's copy goroutine and the drain goroutine read from
@@ -777,4 +789,3 @@ var (
 	_ net.Conn = (*serverStreamConn)(nil)
 	_ net.Conn = (*replayConn)(nil)
 )
-

@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -65,6 +66,11 @@ func startTestServer(t *testing.T, config ServerConfig) (*Server, net.Listener) 
 		t.Fatalf("listen: %v", err)
 	}
 	config.ListenAddr = ""
+	// SAMIZDAT_TEST_LEAN_H2 runs every test that starts a server here
+	// against the lean HTTP/2 server.
+	if os.Getenv("SAMIZDAT_TEST_LEAN_H2") != "" {
+		config.LeanH2 = true
+	}
 	server, err := NewServer(config)
 	if err != nil {
 		ln.Close()
@@ -285,9 +291,9 @@ func buildFakeTLSRecord() []byte {
 
 	// Minimal ClientHello handshake message
 	hello := []byte{
-		0x01,       // HandshakeType: ClientHello
-		0, 0, 0,    // length placeholder
-		3, 3,       // client_version: TLS 1.2
+		0x01,    // HandshakeType: ClientHello
+		0, 0, 0, // length placeholder
+		3, 3, // client_version: TLS 1.2
 	}
 
 	// Random (32 bytes)
@@ -301,7 +307,7 @@ func buildFakeTLSRecord() []byte {
 	hello = append(hello, sessionID...)
 
 	// Cipher suites
-	hello = append(hello, 0, 2)    // length: 2 bytes
+	hello = append(hello, 0, 2)       // length: 2 bytes
 	hello = append(hello, 0x13, 0x01) // TLS_AES_128_GCM_SHA256
 
 	// Compression methods
