@@ -55,7 +55,14 @@ const (
 	// keeps sending frames that need an answer without reading ours would
 	// otherwise grow the write buffer without bound.
 	leanMaxQueuedControl = 10000
-	leanDrainTimeout     = 5 * time.Second
+	// leanMaxHandlersFactor caps the streams whose handlers are still running,
+	// counting ones already reset, at this many times MaxConcurrentStreams,
+	// as x/net's server caps its handlers at 4x. Reset streams stop counting
+	// against MaxConcurrentStreams, so without this cap a client could open
+	// and reset streams in a loop ("rapid reset") and leave a handler running
+	// for each.
+	leanMaxHandlersFactor = 4
+	leanDrainTimeout      = 5 * time.Second
 	// A WINDOW_UPDATE goes out once a quarter of a window has been consumed.
 	leanWindowUpdateDivisor = 4
 )
@@ -119,7 +126,10 @@ type leanConn struct {
 	// writer last took the buffer; see leanMaxQueuedControl.
 	queuedControl int
 
-	streams      map[uint32]*leanStream
+	streams map[uint32]*leanStream
+	// active counts the streams in streams that neither side has reset,
+	// which are the ones MaxConcurrentStreams limits.
+	active       int
 	maxStreams   int
 	lastStreamID uint32
 	goingAway    bool
@@ -224,7 +234,7 @@ func (c *leanConn) handleFrame(f http2.Frame) error {
 	case *http2.RSTStreamFrame:
 		c.mu.Lock()
 		if st := c.streams[f.StreamID]; st != nil && !st.reset {
-			st.reset = true
+			st.markResetLocked()
 			st.cond.Broadcast()
 			c.roomCond.Broadcast()
 			st.cancel()
@@ -296,7 +306,12 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		return errLeanProtocol
 	}
 	c.lastStreamID = id
-	if c.goingAway || c.activeStreamsLocked() >= c.maxStreams {
+	if len(c.streams) >= leanMaxHandlersFactor*c.maxStreams {
+		// Too many handlers still running for streams the client reset.
+		c.mu.Unlock()
+		return errLeanProtocol
+	}
+	if c.goingAway || c.active >= c.maxStreams {
 		c.wbuf = appendRSTStream(c.wbuf, id, http2.ErrCodeRefusedStream)
 		err := c.queuedControlFrame()
 		c.mu.Unlock()
@@ -314,24 +329,22 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		remoteDone: f.StreamEnded(),
 	}
 	c.streams[id] = st
+	c.active++
 	c.mu.Unlock()
 
 	go st.run(f.PseudoValue("method"), f.PseudoValue("authority"), f.PseudoValue("scheme"), f.PseudoValue("path"))
 	return nil
 }
 
-// activeStreamsLocked counts the streams that count against
-// MaxConcurrentStreams. A stream reset by either side no longer does, as with
-// x/net's server, even while its handler is still returning. c.mu must be
-// held.
-func (c *leanConn) activeStreamsLocked() int {
-	n := 0
-	for _, st := range c.streams {
-		if !st.reset {
-			n++
+// markResetLocked records that st has been reset by either side, which
+// frees its MaxConcurrentStreams slot. c.mu must be held.
+func (st *leanStream) markResetLocked() {
+	if !st.reset {
+		st.reset = true
+		if !st.removed {
+			st.c.active--
 		}
 	}
-	return n
 }
 
 func (c *leanConn) handleData(f *http2.DataFrame) error {
@@ -410,7 +423,7 @@ func (c *leanConn) resetStreamLocked(st *leanStream, code http2.ErrCode) {
 	if st.reset {
 		return
 	}
-	st.reset = true
+	st.markResetLocked()
 	c.wbuf = appendRSTStream(c.wbuf, st.id, code)
 	c.queued()
 	st.cond.Broadcast()
@@ -502,6 +515,7 @@ type leanStream struct {
 	// until closed is set.
 	draining bool
 	closed   bool // the handler closed the stream, or the drain ended
+	removed  bool // finish took the stream out of c.streams
 }
 
 // dropUnreadLocked discards data the handler will never read and returns it
@@ -610,7 +624,7 @@ func (st *leanStream) endLocked(body []byte) {
 	c.wbuf = append(c.wbuf, body...)
 	if !st.remoteDone {
 		c.wbuf = appendRSTStream(c.wbuf, st.id, http2.ErrCodeNo)
-		st.reset = true
+		st.markResetLocked()
 	}
 	c.queued()
 }
@@ -621,6 +635,10 @@ func (st *leanStream) finish() {
 	c := st.c
 	c.mu.Lock()
 	delete(c.streams, st.id)
+	if !st.reset {
+		c.active--
+	}
+	st.removed = true
 	st.closed = true
 	st.dropUnreadLocked()
 	st.cond.Broadcast()
