@@ -551,3 +551,38 @@ func TestConnFatalSecondDial(t *testing.T) {
 		t.Error("connFatal(errSecondDial) = false")
 	}
 }
+
+// TestLeanH2ClosesOnRapidReset opens streams and resets each once its
+// handler is running, with handlers that never return. Reset streams free
+// their MaxConcurrentStreams slots, so only the cap on running handlers stops
+// the client from piling them up; past it the server must close the
+// connection.
+func TestLeanH2ClosesOnRapidReset(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {
+		<-release
+	})
+	p.handshake(t)
+	limit := leanMaxHandlersFactor * 4 // startH2Pair's MaxConcurrentStreams is 4
+	for id := uint32(1); id < uint32(4*limit); id += 2 {
+		p.request(t, id, "CONNECT", "stuck:1", false)
+		// Wait for the 200: the handler is running.
+		for {
+			f, err := p.fr.ReadFrame()
+			if err != nil {
+				if id/2 < uint32(limit) {
+					t.Fatalf("connection closed after only %d streams: %v", id/2, err)
+				}
+				return // closed past the cap
+			}
+			if h, ok := f.(*http2.MetaHeadersFrame); ok && h.StreamID == id {
+				break
+			}
+		}
+		if err := p.fr.WriteRSTStream(id, http2.ErrCodeCancel); err != nil {
+			return
+		}
+	}
+	t.Fatal("server kept the connection open under rapid reset")
+}
