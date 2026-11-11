@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -176,6 +177,8 @@ func TestLeanH2MatchesXNet(t *testing.T) {
 		{"connect", "CONNECT", "example.com:443", nil},
 		{"connect without authority", "CONNECT", "", nil},
 		{"connect with path", "CONNECT", "example.com:443", path},
+		{"connect with only scheme", "CONNECT", "example.com:443", path[:1]},
+		{"get with ftp scheme", "GET", "example.com", []hpack.HeaderField{{Name: ":scheme", Value: "ftp"}, {Name: ":path", Value: "/"}}},
 		{"get", "GET", "example.com", path},
 		{"get without path", "GET", "example.com", nil},
 	} {
@@ -427,4 +430,124 @@ func TestLeanH2ClosesOnControlFrameFlood(t *testing.T) {
 		}
 	}
 	t.Fatal("server kept the connection open under a PING flood")
+}
+
+// TestLeanH2HandlerPanicResetsOnlyItsStream: a panicking handler must not
+// take the server down; its stream is reset and the next one is served.
+func TestLeanH2HandlerPanicResetsOnlyItsStream(t *testing.T) {
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {
+		if dest == "boom:1" {
+			panic("handler bug")
+		}
+		conn.Write([]byte("ok"))
+	})
+	p.handshake(t)
+	p.request(t, 1, "CONNECT", "boom:1", true)
+	p.request(t, 3, "CONNECT", "fine:1", true)
+	reset, served := false, false
+	for !reset || !served {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("reset=%v served=%v: %v", reset, served, err)
+		}
+		switch f := f.(type) {
+		case *http2.RSTStreamFrame:
+			if f.StreamID == 1 && f.ErrCode == http2.ErrCodeInternal {
+				reset = true
+			}
+		case *http2.DataFrame:
+			if f.StreamID == 3 && string(f.Data()) == "ok" {
+				served = true
+			}
+		}
+	}
+}
+
+// TestLeanH2ResetFreesItsSlot: a stream the client reset stops counting
+// against MaxConcurrentStreams even while its handler hasn't returned, as
+// with x/net's server, so a new stream is accepted rather than refused.
+func TestLeanH2ResetFreesItsSlot(t *testing.T) {
+	release := make(chan struct{})
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {
+		if dest == "new:1" {
+			conn.Write([]byte("ok"))
+			return
+		}
+		<-release // ignores its context, like a handler stuck dialing
+	})
+	defer close(release)
+	p.handshake(t)
+	for id := uint32(1); id <= 7; id += 2 { // the limit is four
+		p.request(t, id, "CONNECT", "stuck:1", false)
+	}
+	if err := p.fr.WriteRSTStream(1, http2.ErrCodeCancel); err != nil {
+		t.Fatal(err)
+	}
+	p.request(t, 9, "CONNECT", "new:1", true)
+	for {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rst, ok := f.(*http2.RSTStreamFrame); ok && rst.StreamID == 9 {
+			t.Fatalf("stream 9 refused: %v", rst.ErrCode)
+		}
+		if d, ok := f.(*http2.DataFrame); ok && d.StreamID == 9 && string(d.Data()) == "ok" {
+			return
+		}
+	}
+}
+
+// TestLeanH2UnreadUploadDoesNotStallTheConnection: a handler that returns
+// without reading its upload must not leave the shared connection window
+// spent, or every other upload on the connection stalls until the drain
+// times out.
+func TestLeanH2UnreadUploadDoesNotStallTheConnection(t *testing.T) {
+	client := startLeanPair(t, func(ctx context.Context, conn net.Conn, dest string) {
+		if dest == "ignore:1" {
+			// Read nothing while the upload fills the stream's and the
+			// connection's windows, then return without closing the conn.
+			time.Sleep(500 * time.Millisecond)
+			return
+		}
+		defer conn.Close()
+		n, _ := io.Copy(io.Discard, conn)
+		conn.Write([]byte(strconv.FormatInt(n, 10)))
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ignored, err := client.DialContext(ctx, "tcp", "ignore:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ignored.Close()
+	go ignored.Write(make([]byte, 4<<20))
+
+	time.Sleep(time.Second)
+	start := time.Now()
+	counted, err := client.DialContext(ctx, "tcp", "count:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer counted.Close()
+	const size = 3 << 20
+	go func() {
+		counted.Write(make([]byte, size))
+		counted.(interface{ CloseWrite() error }).CloseWrite()
+	}()
+	got, err := io.ReadAll(counted)
+	if err != nil || string(got) != strconv.Itoa(size) {
+		t.Fatalf("second upload: got %q, %v", got, err)
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Errorf("second upload took %v; the ignored stream held up the connection", d)
+	}
+}
+
+// TestConnFatalSecondDial: a refused second dial means x/net's pool has given
+// up on the connection, so the transport must be retired.
+func TestConnFatalSecondDial(t *testing.T) {
+	if !connFatal(fmt.Errorf("CONNECT: %w", errSecondDial)) {
+		t.Error("connFatal(errSecondDial) = false")
+	}
 }

@@ -169,6 +169,7 @@ func connFatal(err error) bool {
 		return false
 	}
 	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, errSecondDial) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, syscall.ECONNRESET) ||

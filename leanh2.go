@@ -7,8 +7,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -42,7 +44,11 @@ const (
 	leanInitialPeerWindow = 65535 // until the client's SETTINGS says otherwise
 	leanDefaultMaxFrame   = 16384 // the client sends no SETTINGS_MAX_FRAME_SIZE
 	leanMaxWriteBuffer    = 512 << 10
-	leanReadBuffer        = 64 << 10
+	leanReadBuffer        = 32 << 10
+	// An idle connection keeps a write buffer up to this size and returns a
+	// larger one to leanBufPool, so thousands of idle connections don't each
+	// hold a burst's worth while busy ones don't reallocate on every pause.
+	leanIdleBufKeep = 64 << 10
 	// leanMaxQueuedControl caps the control frames (PING and SETTINGS
 	// acknowledgements, RST_STREAM) the read loop may queue while the writer
 	// hasn't sent them, as x/net's maxQueuedControlFrames does. A peer that
@@ -108,7 +114,6 @@ type leanConn struct {
 	roomCond *sync.Cond
 
 	wbuf   []byte // frames queued for the writer
-	spare  []byte // the writer's previous buffer, for reuse
 	closed bool
 	// queuedControl counts the control frames the read loop queued since the
 	// writer last took the buffer; see leanMaxQueuedControl.
@@ -221,6 +226,7 @@ func (c *leanConn) handleFrame(f http2.Frame) error {
 		if st := c.streams[f.StreamID]; st != nil && !st.reset {
 			st.reset = true
 			st.cond.Broadcast()
+			c.roomCond.Broadcast()
 			st.cancel()
 		}
 		c.mu.Unlock()
@@ -290,7 +296,7 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		return errLeanProtocol
 	}
 	c.lastStreamID = id
-	if c.goingAway || len(c.streams) >= c.maxStreams {
+	if c.goingAway || c.activeStreamsLocked() >= c.maxStreams {
 		c.wbuf = appendRSTStream(c.wbuf, id, http2.ErrCodeRefusedStream)
 		err := c.queuedControlFrame()
 		c.mu.Unlock()
@@ -310,9 +316,22 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	c.streams[id] = st
 	c.mu.Unlock()
 
-	go st.run(f.PseudoValue("method"), f.PseudoValue("authority"),
-		f.PseudoValue("scheme") != "" && f.PseudoValue("path") != "")
+	go st.run(f.PseudoValue("method"), f.PseudoValue("authority"), f.PseudoValue("scheme"), f.PseudoValue("path"))
 	return nil
+}
+
+// activeStreamsLocked counts the streams that count against
+// MaxConcurrentStreams. A stream reset by either side no longer does, as with
+// x/net's server, even while its handler is still returning. c.mu must be
+// held.
+func (c *leanConn) activeStreamsLocked() int {
+	n := 0
+	for _, st := range c.streams {
+		if !st.reset {
+			n++
+		}
+	}
+	return n
 }
 
 func (c *leanConn) handleData(f *http2.DataFrame) error {
@@ -345,7 +364,7 @@ func (c *leanConn) handleData(f *http2.DataFrame) error {
 	// Padding is never read, and data the handler no longer reads is
 	// dropped; both are returned at once so the client can finish sending.
 	unread := n - int64(len(data))
-	if st.closed {
+	if st.closed || st.draining {
 		unread = n
 	} else {
 		st.rbuf = append(st.rbuf, data...)
@@ -395,6 +414,7 @@ func (c *leanConn) resetStreamLocked(st *leanStream, code http2.ErrCode) {
 	c.wbuf = appendRSTStream(c.wbuf, st.id, code)
 	c.queued()
 	st.cond.Broadcast()
+	c.roomCond.Broadcast()
 	st.cancel()
 }
 
@@ -404,6 +424,10 @@ func (c *leanConn) writeLoop() {
 	for {
 		c.mu.Lock()
 		for len(c.wbuf) == 0 && !c.closed {
+			if cap(c.wbuf) > leanIdleBufKeep {
+				putLeanBuf(c.wbuf)
+				c.wbuf = nil
+			}
 			c.wcond.Wait()
 		}
 		if len(c.wbuf) == 0 {
@@ -411,7 +435,7 @@ func (c *leanConn) writeLoop() {
 			return
 		}
 		buf := c.wbuf
-		c.wbuf, c.spare = c.spare[:0], nil
+		c.wbuf = getLeanBuf()
 		c.queuedControl = 0
 		c.roomCond.Broadcast()
 		c.mu.Unlock()
@@ -420,12 +444,7 @@ func (c *leanConn) writeLoop() {
 			_, err := c.conn.Write(buf)
 			return err
 		})
-
-		c.mu.Lock()
-		if cap(buf) <= 2*leanMaxWriteBuffer {
-			c.spare = buf[:0]
-		}
-		c.mu.Unlock()
+		putLeanBuf(buf)
 		if err != nil {
 			c.close()
 			return
@@ -478,7 +497,23 @@ type leanStream struct {
 	rbuf        []byte
 	remoteDone  bool // the client sent END_STREAM
 	reset       bool
-	closed      bool // the handler closed the stream or returned
+	// draining is set when the handler returns: what the client still sends
+	// is dropped, as serveH2's drain does, but lingering writes go through
+	// until closed is set.
+	draining bool
+	closed   bool // the handler closed the stream, or the drain ended
+}
+
+// dropUnreadLocked discards data the handler will never read and returns it
+// to the client's windows, so it doesn't hold up the stream or, through the
+// shared connection window, the connection's other streams. c.mu must be
+// held.
+func (st *leanStream) dropUnreadLocked() {
+	if n := int64(len(st.rbuf)); n > 0 {
+		st.rbuf = nil
+		st.c.creditConn(n)
+		st.creditStream(n)
+	}
 }
 
 // creditStream returns n consumed bytes to the stream's window. c.mu must
@@ -497,16 +532,18 @@ func (st *leanStream) creditStream(n int64) {
 }
 
 // run answers the request and, for a CONNECT, runs the handler on the tunnel,
-// as serveH2's handler does with x/net's server. hasPath reports whether the
-// request carried both :scheme and :path.
-func (st *leanStream) run(method, authority string, hasPath bool) {
+// as serveH2's handler does with x/net's server.
+func (st *leanStream) run(method, authority, scheme, path string) {
 	c := st.c
 	defer st.finish()
 	// x/net's server rejects a malformed request with RST_STREAM before any
-	// handler sees it: a CONNECT must have :authority and no :scheme or
-	// :path, and any other request must have both.
+	// handler sees it: a CONNECT must have :authority and neither :scheme nor
+	// :path, and any other request needs a :path and an http or https
+	// :scheme.
 	connect := method == http.MethodConnect
-	if connect && (authority == "" || hasPath) || !connect && !hasPath {
+	malformed := connect && (authority == "" || scheme != "" || path != "") ||
+		!connect && (path == "" || scheme != "http" && scheme != "https")
+	if malformed {
 		if c.resetStream(st.id, http2.ErrCodeProtocol) != nil {
 			c.close()
 		}
@@ -520,13 +557,15 @@ func (st *leanStream) run(method, authority string, hasPath bool) {
 		return
 	}
 
-	conn := &leanStreamConn{st: st}
-	c.s.config.Handler(st.ctx, conn, authority)
-	conn.Close()
+	st.runHandler(&leanStreamConn{st: st}, authority)
 
 	// Wait for the client's END_STREAM before ending the stream, so it
-	// closes normally rather than with RST_STREAM, as serveH2 does.
+	// closes normally rather than with RST_STREAM, as serveH2 does. Data
+	// still arriving is dropped meanwhile, and writes from goroutines the
+	// handler left behind still go through.
 	c.mu.Lock()
+	st.draining = true
+	st.dropUnreadLocked()
 	timedOut := false
 	timer := time.AfterFunc(leanDrainTimeout, func() {
 		c.mu.Lock()
@@ -538,8 +577,26 @@ func (st *leanStream) run(method, authority string, hasPath bool) {
 		st.cond.Wait()
 	}
 	timer.Stop()
+	st.closed = true
+	st.cond.Broadcast()
+	c.roomCond.Broadcast()
 	st.endLocked(nil)
 	c.mu.Unlock()
+}
+
+// runHandler runs the Handler on the stream. A handler that panics resets
+// only its own stream, as x/net's server does, rather than ending the
+// process and every tunnel in it.
+func (st *leanStream) runHandler(conn net.Conn, destination string) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[samizdat] panic in handler for stream %d: %v\n%s", st.id, r, debug.Stack())
+			st.c.mu.Lock()
+			st.c.resetStreamLocked(st, http2.ErrCodeInternal)
+			st.c.mu.Unlock()
+		}
+	}()
+	st.c.s.config.Handler(st.ctx, conn, destination)
 }
 
 // endLocked sends body, if any, with END_STREAM, and RST_STREAM(NO_ERROR) if
@@ -565,11 +622,9 @@ func (st *leanStream) finish() {
 	c.mu.Lock()
 	delete(c.streams, st.id)
 	st.closed = true
-	if unread := int64(len(st.rbuf)); unread > 0 {
-		st.rbuf = nil
-		c.creditConn(unread)
-	}
+	st.dropUnreadLocked()
 	st.cond.Broadcast()
+	c.roomCond.Broadcast()
 	c.mu.Unlock()
 	st.cancel()
 }
@@ -627,7 +682,7 @@ func (sc *leanStreamConn) Read(b []byte) (int, error) {
 	defer c.mu.Unlock()
 	for len(st.rbuf) == 0 {
 		switch {
-		case st.closed:
+		case st.closed, st.draining:
 			return 0, net.ErrClosed
 		case st.reset:
 			return 0, errLeanStreamReset
@@ -692,7 +747,9 @@ func (sc *leanStreamConn) Close() error {
 	st := sc.st
 	st.c.mu.Lock()
 	st.closed = true
+	st.dropUnreadLocked()
 	st.cond.Broadcast()
+	st.c.roomCond.Broadcast()
 	st.c.mu.Unlock()
 	return nil
 }
@@ -710,17 +767,24 @@ func (sc *leanStreamConn) SetWriteDeadline(t time.Time) error { return nil }
 // batchConn sits beneath the TLS connection. Inside batch, the records TLS
 // writes are collected and sent to the socket in one Write when it returns.
 // Outside it, writes go straight through, so the handshake and any record TLS
-// sends on its own, such as an alert, are not held back.
+// sends on its own, such as an alert or a KeyUpdate, are not held back.
+//
+// Records must reach the socket in the order TLS wrote them. A record TLS
+// writes while a batch is being sent, which it can because it no longer holds
+// its own lock by then, is queued behind the batch rather than sent ahead
+// of it.
 type batchConn struct {
 	net.Conn
-	mu       sync.Mutex
-	batching bool
-	buf      []byte
+	mu sync.Mutex
+	// pending is set from the start of a batch until everything it and any
+	// record written meanwhile collected has been sent.
+	pending bool
+	buf     []byte
 }
 
 func (bc *batchConn) Write(b []byte) (int, error) {
 	bc.mu.Lock()
-	if bc.batching {
+	if bc.pending {
 		bc.buf = append(bc.buf, b...)
 		bc.mu.Unlock()
 		return len(b), nil
@@ -733,24 +797,51 @@ func (bc *batchConn) Write(b []byte) (int, error) {
 // in one socket Write. Only the connection's writer goroutine calls it.
 func (bc *batchConn) batch(write func() error) error {
 	bc.mu.Lock()
-	bc.batching = true
+	bc.pending = true
+	bc.buf = getLeanBuf()
 	bc.mu.Unlock()
 	err := write()
-	bc.mu.Lock()
-	bc.batching = false
-	buf := bc.buf
-	bc.buf = nil
-	bc.mu.Unlock()
-	if len(buf) == 0 {
-		return err
+	for {
+		bc.mu.Lock()
+		buf := bc.buf
+		if len(buf) == 0 {
+			bc.pending = false
+			bc.buf = nil
+			bc.mu.Unlock()
+			putLeanBuf(buf)
+			return err
+		}
+		bc.buf = nil
+		bc.mu.Unlock()
+		_, werr := bc.Conn.Write(buf)
+		putLeanBuf(buf)
+		if werr != nil {
+			bc.mu.Lock()
+			bc.pending = false
+			bc.buf = nil
+			bc.mu.Unlock()
+			return errors.Join(err, werr)
+		}
 	}
-	_, werr := bc.Conn.Write(buf)
-	bc.mu.Lock()
-	if bc.buf == nil && cap(buf) <= 2*leanMaxWriteBuffer {
-		bc.buf = buf[:0]
+}
+
+// leanBufPool holds write buffers between bursts, so an idle connection
+// holds none and a busy one doesn't allocate a new one per write.
+var leanBufPool sync.Pool
+
+func getLeanBuf() []byte {
+	if b, ok := leanBufPool.Get().(*[]byte); ok {
+		return (*b)[:0]
 	}
-	bc.mu.Unlock()
-	return errors.Join(err, werr)
+	return nil
+}
+
+func putLeanBuf(b []byte) {
+	if b == nil || cap(b) > 4*leanMaxWriteBuffer {
+		return
+	}
+	b = b[:0]
+	leanBufPool.Put(&b)
 }
 
 func appendFrameHeader(b []byte, length int, t http2.FrameType, flags http2.Flags, streamID uint32) []byte {
