@@ -891,3 +891,47 @@ func TestLeanH2SerializesWritesOnAStream(t *testing.T) {
 		t.Fatal("the two writes were interleaved")
 	}
 }
+
+// TestLeanH2EndsStreamWithNegativeWindow: a client that shrinks
+// INITIAL_WINDOW_SIZE after data went out leaves the stream's send window
+// negative. Ending the stream needs no credit and must still work, rather
+// than computing a negative frame length.
+func TestLeanH2EndsStreamWithNegativeWindow(t *testing.T) {
+	shrunk := make(chan struct{})
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {
+		conn.Write(make([]byte, 100))
+		<-shrunk
+	})
+	p.handshake(t)
+	p.request(t, 1, "CONNECT", "example.com:443", false)
+	for got := false; !got; {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d, ok := f.(*http2.DataFrame); ok && d.StreamID == 1 && len(d.Data()) > 0 {
+			got = true
+		}
+	}
+	// 100 bytes sent; a 0 window leaves the stream at -100.
+	if err := p.fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.fr.WriteData(1, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // the SETTINGS is applied
+	close(shrunk)
+	for {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d, ok := f.(*http2.DataFrame); ok && d.StreamID == 1 && d.StreamEnded() {
+			return
+		}
+		if r, ok := f.(*http2.RSTStreamFrame); ok && r.StreamID == 1 {
+			t.Fatalf("stream reset with %v instead of ending", r.ErrCode)
+		}
+	}
+}

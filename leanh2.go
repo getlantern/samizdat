@@ -746,6 +746,16 @@ func (st *leanStream) creditStream(n int64) {
 func (st *leanStream) run(method, authority, scheme, path string, truncated bool) {
 	c := st.c
 	defer st.finish()
+	// A bug in serving one stream must not end the process and every tunnel
+	// in it; the handler's own panics are handled in runHandler.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[samizdat] panic serving stream %d: %v\n%s", st.id, r, debug.Stack())
+			c.mu.Lock()
+			c.resetStreamLocked(st, http2.ErrCodeInternal)
+			c.mu.Unlock()
+		}
+	}()
 	if truncated {
 		// The header list passed MaxHeaderListSize; x/net's server answers
 		// 431 without calling the handler (handleHeaderListTooLong).
@@ -841,7 +851,14 @@ func (st *leanStream) endLocked(body []byte) {
 			}
 			st.cond.Wait()
 		}
-		n := min(len(body), c.peerMaxFrame, int(st.sendWin), int(c.connSendWin))
+		// An empty body needs no credit; a window can be negative (the
+		// client may shrink INITIAL_WINDOW_SIZE after data went out), so a
+		// frame's length is taken from the windows only when both are
+		// open, and never below zero.
+		n := 0
+		if len(body) > 0 {
+			n = max(0, min(len(body), c.peerMaxFrame, int(st.sendWin), int(c.connSendWin)))
+		}
 		last := n == len(body)
 		flags := http2.Flags(0)
 		if last {
