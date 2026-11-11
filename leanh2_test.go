@@ -935,3 +935,68 @@ func TestLeanH2EndsStreamWithNegativeWindow(t *testing.T) {
 		}
 	}
 }
+
+// TestLeanH2MatchesXNetOnBadPeers runs misbehaving clients against both
+// servers and compares the frames each sends back before ending the
+// connection.
+func TestLeanH2MatchesXNetOnBadPeers(t *testing.T) {
+	cases := []struct {
+		name   string
+		script func(t *testing.T, p *h2Peer)
+	}{
+		{"no settings after the preface", func(t *testing.T, p *h2Peer) {
+			p.conn.Write([]byte(http2.ClientPreface))
+			p.fr.WritePing(false, [8]byte{})
+		}},
+		{"frame too large", func(t *testing.T, p *h2Peer) {
+			p.handshake(t)
+			p.fr.WriteRawFrame(http2.FrameData, 0, 1, make([]byte, leanMaxReadFrameSize+1))
+		}},
+		{"headers for a gone stream", func(t *testing.T, p *h2Peer) {
+			p.handshake(t)
+			p.request(t, 1, "CONNECT", "example.com:443", true)
+			time.Sleep(300 * time.Millisecond) // the stream finishes
+			p.request(t, 1, "CONNECT", "example.com:443", true)
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			run := func(lean bool) string {
+				p := startH2Pair(t, lean, func(ctx context.Context, conn net.Conn, dest string) {})
+				go c.script(t, p)
+				var out []string
+				for {
+					f, err := p.fr.ReadFrame()
+					if err != nil {
+						return canonical(out)
+					}
+					out = append(out, describe(f))
+				}
+			}
+			if want, got := run(false), run(true); got != want {
+				t.Errorf("lean server frames differ\nx/net: %s\nlean:  %s", want, got)
+			}
+		})
+	}
+}
+
+// TestPoolClosedWhileDialing: a transport whose dial finishes after the pool
+// closed must be closed, not added to the closed pool and leaked.
+func TestPoolClosedWhileDialing(t *testing.T) {
+	var pool *connPool
+	var created *h2Transport
+	pool = newConnPool(10, time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		pool.close()
+		c1, c2 := net.Pipe()
+		t.Cleanup(func() { c2.Close() })
+		tr, err := newH2Transport(c1, "example.com:443", 10, nil)
+		created = tr
+		return tr, err
+	})
+	if _, err := pool.getTransport(context.Background()); err == nil {
+		t.Fatal("getTransport succeeded on a pool closed during the dial")
+	}
+	if !created.isClosed() {
+		t.Fatal("the transport dialed for a closed pool was left open")
+	}
+}
