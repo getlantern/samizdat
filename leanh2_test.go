@@ -181,6 +181,7 @@ func TestLeanH2MatchesXNet(t *testing.T) {
 		{"get with ftp scheme", "GET", "example.com", []hpack.HeaderField{{Name: ":scheme", Value: "ftp"}, {Name: ":path", Value: "/"}}},
 		{"get", "GET", "example.com", path},
 		{"get without path", "GET", "example.com", nil},
+		{"no method", "", "example.com", path},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			want := canonical(transcript(t, false, c.method, c.authority, c.extra...))
@@ -585,4 +586,31 @@ func TestLeanH2ClosesOnRapidReset(t *testing.T) {
 		}
 	}
 	t.Fatal("server kept the connection open under rapid reset")
+}
+
+// TestRetiredTransportKeepsItsStreams: when x/net's Transport stops using the
+// connection for new streams (errSecondDial), the transport must stop taking
+// new tunnels but keep the ones it carries, and close once the last ends.
+func TestRetiredTransportKeepsItsStreams(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	tr, err := newH2Transport(c1, "example.com:443", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.activeStreams.Store(1)
+	tr.retire()
+	if tr.isClosed() {
+		t.Fatal("retiring closed a transport that still carries a stream")
+	}
+	if tr.hasCapacity() {
+		t.Fatal("a retired transport still takes new streams")
+	}
+	pr, pw := io.Pipe()
+	defer pr.Close()
+	rwc := &h2StreamRWC{reader: io.NopCloser(strings.NewReader("")), writer: pw, transport: tr}
+	rwc.Close()
+	if !tr.isClosed() {
+		t.Fatal("retired transport stayed open after its last stream ended")
+	}
 }
