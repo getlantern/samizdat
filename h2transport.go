@@ -16,6 +16,10 @@ import (
 	"golang.org/x/net/http2"
 )
 
+// errSecondDial is what h2Transport's x/net Transport gets if it tries to dial
+// a second connection; see newH2Transport.
+var errSecondDial = errors.New("samizdat: HTTP/2 transport has only one connection")
+
 // h2Transport manages a single TLS+HTTP/2 connection to the server and
 // multiplexes CONNECT tunnels over it as separate H2 streams.
 type h2Transport struct {
@@ -37,14 +41,24 @@ type h2Transport struct {
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
 func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper) (*h2Transport, error) {
-	// Create HTTP/2 client transport over the existing TLS connection
+	// Create HTTP/2 client transport over the existing TLS connection.
+	// The transport must never dial a second connection: it would get this
+	// same one back and write a new preface into the middle of the first
+	// connection's frames, corrupting every stream on it. x/net dials again
+	// when it thinks the connection is full (it assumes 100 streams until the
+	// server's SETTINGS arrive), so StrictMaxConcurrentStreams makes it wait
+	// for a stream slot instead, and any later dial is refused.
+	var dialed atomic.Bool
 	h2t := &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			// Return the existing TLS connection — this is called only once
+			if dialed.Swap(true) {
+				return nil, errSecondDial
+			}
 			return tlsConn, nil
 		},
-		AllowHTTP:          false,
-		DisableCompression: true,
+		AllowHTTP:                  false,
+		DisableCompression:         true,
+		StrictMaxConcurrentStreams: true,
 	}
 
 	t := &h2Transport{
