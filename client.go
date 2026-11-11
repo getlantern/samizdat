@@ -88,7 +88,7 @@ func (c *Client) DialContext(ctx context.Context, network, address string) (net.
 		}
 
 		var conn net.Conn
-		conn, err = transport.openTunnel(ctx, address)
+		conn, err = transport.openReserved(ctx, address)
 		if err == nil {
 			return conn, nil
 		}

@@ -11,7 +11,7 @@ import (
 type connPool struct {
 	mu          sync.Mutex
 	transports  []*h2Transport
-	maxStreams   int
+	maxStreams  int
 	idleTimeout time.Duration
 	createFunc  func(ctx context.Context) (*h2Transport, error)
 	closed      bool
@@ -21,7 +21,7 @@ type connPool struct {
 // newConnPool creates a connection pool that creates new transports via createFunc.
 func newConnPool(maxStreams int, idleTimeout time.Duration, createFunc func(ctx context.Context) (*h2Transport, error)) *connPool {
 	p := &connPool{
-		maxStreams:   maxStreams,
+		maxStreams:  maxStreams,
 		idleTimeout: idleTimeout,
 		createFunc:  createFunc,
 		closeCh:     make(chan struct{}),
@@ -34,7 +34,8 @@ func newConnPool(maxStreams int, idleTimeout time.Duration, createFunc func(ctx 
 }
 
 // getTransport returns an existing transport with available capacity, or
-// creates a new one.
+// creates a new one, with a stream slot reserved on it for the caller, who
+// must open a tunnel on it with openReserved.
 func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 	p.mu.Lock()
 
@@ -45,7 +46,7 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 
 	// Find an existing transport with capacity
 	for _, t := range p.transports {
-		if !t.isClosed() && t.hasCapacity() {
+		if !t.isClosed() && t.tryReserve() {
 			p.mu.Unlock()
 			return t, nil
 		}
@@ -59,6 +60,7 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 		return nil, err
 	}
 
+	t.activeStreams.Add(1)
 	p.mu.Lock()
 	p.transports = append(p.transports, t)
 	p.mu.Unlock()

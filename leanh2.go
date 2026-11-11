@@ -46,6 +46,7 @@ const (
 	leanDefaultMaxFrame   = 16384 // the client sends no SETTINGS_MAX_FRAME_SIZE
 	leanMaxWriteBuffer    = 512 << 10
 	leanReadBuffer        = 32 << 10
+	leanFrameHeaderLen    = 9
 	// An idle connection keeps write buffers up to this size and drops larger
 	// ones, so thousands of idle connections don't each hold a burst's worth
 	// while a busy one reuses its buffers write after write.
@@ -67,15 +68,32 @@ const (
 	// and reset streams in a loop ("rapid reset") and leave a handler running
 	// for each.
 	leanMaxHandlersFactor = 4
-	leanDrainTimeout      = 5 * time.Second
+	// leanMaxBatch caps the records batchConn collects while a batch is being
+	// sent. TLS can write records of its own then, such as KeyUpdate
+	// replies, which no other limit bounds; past it the connection fails.
+	leanMaxBatch = 4 * leanMaxWriteBuffer
+
+	// leanCloseFlush bounds how long closing waits for the writer to send
+	// what's queued, such as a GOAWAY, before closing the connection.
+	leanCloseFlush   = time.Second
+	leanDrainTimeout = 5 * time.Second
 	// A WINDOW_UPDATE goes out once a quarter of a window has been consumed.
 	leanWindowUpdateDivisor = 4
 )
 
+// leanPrefaceTimeout bounds how long a client may take to send its preface
+// and first SETTINGS, as x/net's server does. A variable for tests.
+var leanPrefaceTimeout = 10 * time.Second
+
 var (
+	errLeanBatchFull   = errors.New("samizdat: too many TLS records pending")
 	errLeanConnClosed  = errors.New("samizdat: connection closed")
 	errLeanStreamReset = errors.New("samizdat: stream reset by peer")
 	errLeanProtocol    = errors.New("samizdat: HTTP/2 protocol error")
+	errLeanFlow        = errors.New("samizdat: HTTP/2 flow control error")
+	// errLeanCalm ends a connection whose peer exceeded a cap (queued
+	// control frames, running handlers) with ENHANCE_YOUR_CALM, as x/net does.
+	errLeanCalm = errors.New("samizdat: peer exceeded a limit")
 )
 
 // serveLeanH2 serves HTTP/2 CONNECT tunnels on tlsConn until the peer goes
@@ -101,6 +119,7 @@ func (s *Server) serveLeanH2(tlsConn net.Conn, bc *batchConn, rawConn net.Conn, 
 		peerMaxFrame:  leanDefaultMaxFrame,
 		connRecvAvail: leanConnRecvWindow,
 		hpackBuf:      new(bytes.Buffer),
+		writerDone:    make(chan struct{}),
 	}
 	c.wcond = sync.NewCond(&c.mu)
 	c.hpackEnc = hpack.NewEncoder(c.hpackBuf)
@@ -137,6 +156,9 @@ type leanConn struct {
 	queuedControl int
 
 	streams map[uint32]*leanStream
+	// peekedStreamID is the highest stream ID of a HEADERS frame read so
+	// far, including one that failed to decode; see goAway.
+	peekedStreamID uint32
 	// active counts the streams in streams that neither side has reset,
 	// which are the ones MaxConcurrentStreams limits.
 	active       int
@@ -155,6 +177,8 @@ type leanConn struct {
 
 	hpackEnc *hpack.Encoder
 	hpackBuf *bytes.Buffer
+
+	writerDone chan struct{} // closed when writeLoop returns
 }
 
 func (c *leanConn) serve() {
@@ -179,6 +203,8 @@ func (c *leanConn) serve() {
 	// Frames are read through a buffer: without one, each frame costs two
 	// TLS reads, one for its header and one for its payload.
 	br := bufio.NewReaderSize(c.conn, leanReadBuffer)
+	// The deadline is cleared once the client's first SETTINGS arrives.
+	c.conn.SetReadDeadline(time.Now().Add(leanPrefaceTimeout))
 	preface := make([]byte, len(http2.ClientPreface))
 	if _, err := io.ReadFull(br, preface); err != nil || string(preface) != http2.ClientPreface {
 		return
@@ -189,19 +215,39 @@ func (c *leanConn) serve() {
 	fr.SetMaxReadFrameSize(leanMaxReadFrameSize)
 	fr.MaxHeaderListSize = leanMaxHeaderListSize
 	fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	if f, err := fr.ReadFrame(); err != nil {
+		return
+	} else if sf, ok := f.(*http2.SettingsFrame); !ok || sf.IsAck() {
+		return // the preface must be followed by SETTINGS
+	} else if c.handleSettings(sf) != nil {
+		return
+	}
+	c.conn.SetReadDeadline(time.Time{})
 	for {
+		// The next frame's header, peeked so that a HEADERS frame the framer
+		// fails to decode still counts toward the GOAWAY's last stream ID,
+		// as x/net's server counts it.
+		if h, err := br.Peek(9); err == nil && http2.FrameType(h[3]) == http2.FrameHeaders {
+			id := binary.BigEndian.Uint32(h[5:]) & 0x7fffffff
+			c.mu.Lock()
+			c.peekedStreamID = max(c.peekedStreamID, id)
+			c.mu.Unlock()
+		}
 		f, err := fr.ReadFrame()
 		if err != nil {
 			var se http2.StreamError
 			if errors.As(err, &se) {
-				if c.resetStream(se.StreamID, se.Code) != nil {
+				if err := c.resetStream(se.StreamID, se.Code); err != nil {
+					c.goAway(err)
 					return
 				}
 				continue
 			}
+			c.goAway(err)
 			return
 		}
 		if err := c.handleFrame(f); err != nil {
+			c.goAway(err)
 			return
 		}
 	}
@@ -217,7 +263,7 @@ func (c *leanConn) queuedControlFrame() error {
 	c.queuedControl++
 	c.queued()
 	if c.queuedControl > leanMaxQueuedControl {
-		return errLeanProtocol
+		return errLeanCalm
 	}
 	return nil
 }
@@ -266,18 +312,16 @@ func (c *leanConn) handleSettings(f *http2.SettingsFrame) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// A frame can repeat INITIAL_WINDOW_SIZE many times; the streams are
+	// adjusted once, for its last value.
+	oldInitWin := c.peerInitWin
 	err := f.ForeachSetting(func(s http2.Setting) error {
 		switch s.ID {
 		case http2.SettingInitialWindowSize:
 			if s.Val > 1<<31-1 {
 				return errLeanProtocol
 			}
-			delta := int64(s.Val) - c.peerInitWin
 			c.peerInitWin = int64(s.Val)
-			for _, st := range c.streams {
-				st.sendWin += delta
-				st.cond.Broadcast()
-			}
 		case http2.SettingMaxFrameSize:
 			if s.Val < 16384 || s.Val > 1<<24-1 {
 				return errLeanProtocol
@@ -292,6 +336,12 @@ func (c *leanConn) handleSettings(f *http2.SettingsFrame) error {
 	})
 	if err != nil {
 		return err
+	}
+	if delta := c.peerInitWin - oldInitWin; delta != 0 {
+		for _, st := range c.streams {
+			st.sendWin += delta
+			st.cond.Broadcast()
+		}
 	}
 	c.wbuf = appendFrameHeader(c.wbuf, 0, http2.FrameSettings, http2.FlagSettingsAck, 0)
 	return c.queuedControlFrame()
@@ -314,7 +364,25 @@ func (c *leanConn) handleWindowUpdate(f *http2.WindowUpdateFrame) {
 func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	id := f.StreamID
 	c.mu.Lock()
-	if id%2 == 0 || id <= c.lastStreamID {
+	if id%2 == 1 && id <= c.lastStreamID {
+		// HEADERS on a stream already opened: trailers, which must end the
+		// stream, as x/net's server accepts them, or HEADERS on a stream
+		// that's gone.
+		defer c.mu.Unlock()
+		st := c.streams[id]
+		switch {
+		case st == nil || st.remoteDone || st.reset:
+			c.wbuf = appendRSTStream(c.wbuf, id, http2.ErrCodeStreamClosed)
+			return c.queuedControlFrame()
+		case !f.StreamEnded():
+			c.resetStreamLocked(st, http2.ErrCodeProtocol)
+			return c.queuedControlFrame()
+		}
+		st.remoteDone = true
+		st.cond.Broadcast()
+		return nil
+	}
+	if id%2 == 0 {
 		c.mu.Unlock()
 		return errLeanProtocol
 	}
@@ -322,7 +390,7 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	if len(c.streams) >= leanMaxHandlersFactor*c.maxStreams {
 		// Too many handlers still running for streams the client reset.
 		c.mu.Unlock()
-		return errLeanProtocol
+		return errLeanCalm
 	}
 	if c.goingAway || c.active >= c.maxStreams {
 		c.wbuf = appendRSTStream(c.wbuf, id, http2.ErrCodeRefusedStream)
@@ -346,7 +414,7 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	c.active++
 	c.mu.Unlock()
 
-	go st.run(f.PseudoValue("method"), f.PseudoValue("authority"), f.PseudoValue("scheme"), f.PseudoValue("path"))
+	go st.run(f.PseudoValue("method"), f.PseudoValue("authority"), f.PseudoValue("scheme"), f.PseudoValue("path"), f.Truncated)
 	return nil
 }
 
@@ -378,7 +446,7 @@ func (c *leanConn) handleData(f *http2.DataFrame) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if n > c.connRecvAvail {
-		return errLeanProtocol
+		return errLeanFlow
 	}
 	c.connRecvAvail -= n
 	st := c.streams[f.StreamID]
@@ -469,6 +537,7 @@ func (c *leanConn) writeLoop() {
 		}
 		if len(c.wbuf) == 0 {
 			c.mu.Unlock()
+			close(c.writerDone)
 			return
 		}
 		buf := c.wbuf
@@ -493,14 +562,42 @@ func (c *leanConn) writeLoop() {
 		}
 		c.mu.Unlock()
 		if err != nil {
+			close(c.writerDone)
 			c.close()
 			return
 		}
 	}
 }
 
+// goAway queues a GOAWAY carrying the HTTP/2 error code for err, as x/net's
+// server sends before closing a connection on an error. close sends it.
+func (c *leanConn) goAway(err error) {
+	code := http2.ErrCodeProtocol
+	var ce http2.ConnectionError
+	switch {
+	case errors.As(err, &ce):
+		code = http2.ErrCode(ce)
+	case errors.Is(err, errLeanFlow):
+		code = http2.ErrCodeFlowControl
+	case errors.Is(err, errLeanCalm):
+		code = http2.ErrCodeEnhanceYourCalm
+	case !errors.Is(err, errLeanProtocol):
+		return // the connection itself failed; there's no one to tell
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.wbuf = appendFrameHeader(c.wbuf, 8, http2.FrameGoAway, 0, 0)
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, max(c.lastStreamID, c.peekedStreamID)&0x7fffffff)
+	c.wbuf = binary.BigEndian.AppendUint32(c.wbuf, uint32(code))
+	c.queued()
+}
+
 // close ends the connection: every stream's reads and writes fail and every
-// handler's context ends.
+// handler's context ends. The writer first gets up to leanCloseFlush to send
+// what's queued, such as a GOAWAY.
 func (c *leanConn) close() {
 	c.mu.Lock()
 	if c.closed {
@@ -517,6 +614,10 @@ func (c *leanConn) close() {
 	}
 	c.mu.Unlock()
 	c.cancel()
+	select {
+	case <-c.writerDone:
+	case <-time.After(leanCloseFlush):
+	}
 	c.conn.Close()
 }
 
@@ -607,6 +708,10 @@ type leanStream struct {
 	// writing counts Writes in progress, so the drain doesn't end the
 	// stream under one, as serverStreamConn.shutdown waits for them.
 	writing int
+	// wmu serializes whole Writes on the stream, as serverStreamConn's
+	// mutex does: a Write releases c.mu while it waits for credit or room,
+	// and another Write must not slip its bytes into the middle of it.
+	wmu sync.Mutex
 }
 
 // dropUnreadLocked discards data the handler will never read and returns it
@@ -638,9 +743,16 @@ func (st *leanStream) creditStream(n int64) {
 
 // run answers the request and, for a CONNECT, runs the handler on the tunnel,
 // as serveH2's handler does with x/net's server.
-func (st *leanStream) run(method, authority, scheme, path string) {
+func (st *leanStream) run(method, authority, scheme, path string, truncated bool) {
 	c := st.c
 	defer st.finish()
+	if truncated {
+		// The header list passed MaxHeaderListSize; x/net's server answers
+		// 431 without calling the handler (handleHeaderListTooLong).
+		st.reply(http.StatusRequestHeaderFieldsTooLarge, "text/html; charset=utf-8", false,
+			"<h1>HTTP Error 431</h1><p>Request Header Field(s) Too Large</p>")
+		return
+	}
 	// x/net's server rejects a malformed request with RST_STREAM before any
 	// handler sees it: every request needs a :method, a CONNECT must have
 	// :authority and neither :scheme nor :path, and any other request needs a
@@ -713,24 +825,43 @@ func (st *leanStream) runHandler(conn net.Conn, destination string) {
 // the client hasn't ended its side. c.mu must be held.
 func (st *leanStream) endLocked(body []byte) {
 	c := st.c
-	// The body, sent with END_STREAM in one frame as x/net does, needs room
-	// in both send windows.
-	n := int64(len(body))
-	for n > 0 && (st.sendWin < n || c.connSendWin < n) && !st.reset && !c.closed {
-		st.cond.Wait()
+	// The body goes out in as few DATA frames as the send windows allow,
+	// one for a short body as x/net sends it, with END_STREAM on the last.
+	// Credit is rechecked after every wait, since c.mu is released.
+	for {
+		for {
+			if st.reset {
+				return
+			}
+			if err := st.waitForRoom(); err != nil {
+				return
+			}
+			if len(body) == 0 || st.sendWin > 0 && c.connSendWin > 0 {
+				break
+			}
+			st.cond.Wait()
+		}
+		n := min(len(body), c.peerMaxFrame, int(st.sendWin), int(c.connSendWin))
+		last := n == len(body)
+		flags := http2.Flags(0)
+		if last {
+			flags = http2.FlagDataEndStream
+		}
+		c.wbuf = appendFrameHeader(c.wbuf, n, http2.FrameData, flags, st.id)
+		c.wbuf = append(c.wbuf, body[:n]...)
+		st.sendWin -= int64(n)
+		c.connSendWin -= int64(n)
+		body = body[n:]
+		c.queued()
+		if last {
+			break
+		}
 	}
-	if st.reset || st.waitForRoom() != nil {
-		return
-	}
-	c.wbuf = appendFrameHeader(c.wbuf, len(body), http2.FrameData, http2.FlagDataEndStream, st.id)
-	c.wbuf = append(c.wbuf, body...)
-	st.sendWin -= n
-	c.connSendWin -= n
 	if !st.remoteDone {
 		c.wbuf = appendRSTStream(c.wbuf, st.id, http2.ErrCodeNo)
 		st.markResetLocked()
+		c.queued()
 	}
-	c.queued()
 }
 
 // finish forgets the stream, returning anything the handler left unread to
@@ -756,13 +887,19 @@ func (st *leanStream) finish() {
 	st.cancel()
 }
 
+// replyError answers with msg as http.Error writes it.
 func (st *leanStream) replyError(status int, msg string) {
-	body := msg + "\n"
-	if err := st.writeHeaders(status, []hpack.HeaderField{
-		{Name: "content-type", Value: "text/plain; charset=utf-8"},
-		{Name: "x-content-type-options", Value: "nosniff"},
-		{Name: "content-length", Value: strconv.Itoa(len(body))},
-	}); err != nil {
+	st.reply(status, "text/plain; charset=utf-8", true, msg+"\n")
+}
+
+// reply answers with body and the headers net/http adds for it.
+func (st *leanStream) reply(status int, contentType string, nosniff bool, body string) {
+	hdrs := []hpack.HeaderField{{Name: "content-type", Value: contentType}}
+	if nosniff {
+		hdrs = append(hdrs, hpack.HeaderField{Name: "x-content-type-options", Value: "nosniff"})
+	}
+	hdrs = append(hdrs, hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(body))})
+	if err := st.writeHeaders(status, hdrs); err != nil {
 		return
 	}
 	st.c.mu.Lock()
@@ -832,6 +969,8 @@ func (sc *leanStreamConn) Read(b []byte) (int, error) {
 func (sc *leanStreamConn) Write(b []byte) (int, error) {
 	st := sc.st
 	c := st.c
+	st.wmu.Lock()
+	defer st.wmu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	st.writing++
@@ -853,7 +992,7 @@ func (sc *leanStreamConn) Write(b []byte) (int, error) {
 			if c.closed {
 				return written, errLeanConnClosed
 			}
-			if len(c.wbuf) >= leanMaxWriteBuffer {
+			if len(c.wbuf)+leanFrameHeaderLen >= leanMaxWriteBuffer {
 				st.awaitRoomLocked()
 				continue
 			}
@@ -863,7 +1002,10 @@ func (sc *leanStreamConn) Write(b []byte) (int, error) {
 			}
 			break
 		}
-		n := min(len(b)-written, c.peerMaxFrame, int(st.sendWin), int(c.connSendWin))
+		// Bounded by the buffer's room too, so one large frame can't carry
+		// the buffer far past leanMaxWriteBuffer.
+		room := leanMaxWriteBuffer - len(c.wbuf) - leanFrameHeaderLen
+		n := min(len(b)-written, c.peerMaxFrame, int(st.sendWin), int(c.connSendWin), room)
 		c.wbuf = appendFrameHeader(c.wbuf, n, http2.FrameData, 0, st.id)
 		c.wbuf = append(c.wbuf, b[written:written+n]...)
 		st.sendWin -= int64(n)
@@ -916,6 +1058,10 @@ type batchConn struct {
 func (bc *batchConn) Write(b []byte) (int, error) {
 	bc.mu.Lock()
 	if bc.pending {
+		if len(bc.buf)+len(b) > leanMaxBatch {
+			bc.mu.Unlock()
+			return 0, errLeanBatchFull
+		}
 		bc.buf = append(bc.buf, b...)
 		bc.mu.Unlock()
 		return len(b), nil
