@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -282,6 +283,10 @@ func (c *leanConn) handleSettings(f *http2.SettingsFrame) error {
 				return errLeanProtocol
 			}
 			c.peerMaxFrame = int(s.Val)
+		case http2.SettingHeaderTableSize:
+			// The client's HPACK decoder keeps at most this much; our
+			// response encoder must not refer past it.
+			c.hpackEnc.SetMaxDynamicTableSize(s.Val)
 		}
 		return nil
 	})
@@ -360,6 +365,9 @@ func (st *leanStream) markResetLocked() {
 		if !st.removed {
 			st.c.active--
 		}
+		// Nothing will read what's buffered; return it to the shared
+		// connection window now rather than when the handler returns.
+		st.dropUnreadLocked()
 	}
 }
 
@@ -596,6 +604,9 @@ type leanStream struct {
 	removed  bool // finish took the stream out of c.streams
 	// waitingRoom is set while st is in c.roomWaiters.
 	waitingRoom bool
+	// writing counts Writes in progress, so the drain doesn't end the
+	// stream under one, as serverStreamConn.shutdown waits for them.
+	writing int
 }
 
 // dropUnreadLocked discards data the handler will never read and returns it
@@ -655,9 +666,9 @@ func (st *leanStream) run(method, authority, scheme, path string) {
 	st.runHandler(&leanStreamConn{st: st}, authority)
 
 	// Wait for the client's END_STREAM before ending the stream, so it
-	// closes normally rather than with RST_STREAM, as serveH2 does. Data
-	// still arriving is dropped meanwhile, and writes from goroutines the
-	// handler left behind still go through.
+	// closes normally rather than with RST_STREAM, as serveH2 does, and for
+	// writes from goroutines the handler left behind to finish, up to the
+	// drain timeout. Data still arriving is dropped meanwhile.
 	c.mu.Lock()
 	st.draining = true
 	st.dropUnreadLocked()
@@ -669,7 +680,7 @@ func (st *leanStream) run(method, authority, scheme, path string) {
 		st.cond.Broadcast()
 		c.mu.Unlock()
 	})
-	for !st.remoteDone && !st.reset && !c.closed && !timedOut {
+	for (!st.remoteDone || st.writing > 0) && !st.reset && !c.closed && !timedOut {
 		st.cond.Wait()
 	}
 	timer.Stop()
@@ -702,11 +713,19 @@ func (st *leanStream) runHandler(conn net.Conn, destination string) {
 // the client hasn't ended its side. c.mu must be held.
 func (st *leanStream) endLocked(body []byte) {
 	c := st.c
+	// The body, sent with END_STREAM in one frame as x/net does, needs room
+	// in both send windows.
+	n := int64(len(body))
+	for n > 0 && (st.sendWin < n || c.connSendWin < n) && !st.reset && !c.closed {
+		st.cond.Wait()
+	}
 	if st.reset || st.waitForRoom() != nil {
 		return
 	}
 	c.wbuf = appendFrameHeader(c.wbuf, len(body), http2.FrameData, http2.FlagDataEndStream, st.id)
 	c.wbuf = append(c.wbuf, body...)
+	st.sendWin -= n
+	c.connSendWin -= n
 	if !st.remoteDone {
 		c.wbuf = appendRSTStream(c.wbuf, st.id, http2.ErrCodeNo)
 		st.markResetLocked()
@@ -725,6 +744,12 @@ func (st *leanStream) finish() {
 	}
 	st.removed = true
 	st.closed = true
+	if st.waitingRoom {
+		st.waitingRoom = false
+		if i := slices.Index(c.roomWaiters, st); i >= 0 {
+			c.roomWaiters = slices.Delete(c.roomWaiters, i, i+1)
+		}
+	}
 	st.dropUnreadLocked()
 	st.wakeLocked()
 	c.mu.Unlock()
@@ -809,6 +834,13 @@ func (sc *leanStreamConn) Write(b []byte) (int, error) {
 	c := st.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	st.writing++
+	defer func() {
+		st.writing--
+		if st.writing == 0 {
+			st.cond.Broadcast()
+		}
+	}()
 	written := 0
 	for written < len(b) {
 		for {
