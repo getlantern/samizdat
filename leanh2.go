@@ -43,7 +43,13 @@ const (
 	leanDefaultMaxFrame   = 16384 // the client sends no SETTINGS_MAX_FRAME_SIZE
 	leanMaxWriteBuffer    = 512 << 10
 	leanReadBuffer        = 64 << 10
-	leanDrainTimeout      = 5 * time.Second
+	// leanMaxQueuedControl caps the control frames (PING and SETTINGS
+	// acknowledgements, RST_STREAM) the read loop may queue while the writer
+	// hasn't sent them, as x/net's maxQueuedControlFrames does. A peer that
+	// keeps sending frames that need an answer without reading ours would
+	// otherwise grow the write buffer without bound.
+	leanMaxQueuedControl = 10000
+	leanDrainTimeout     = 5 * time.Second
 	// A WINDOW_UPDATE goes out once a quarter of a window has been consumed.
 	leanWindowUpdateDivisor = 4
 )
@@ -104,6 +110,9 @@ type leanConn struct {
 	wbuf   []byte // frames queued for the writer
 	spare  []byte // the writer's previous buffer, for reuse
 	closed bool
+	// queuedControl counts the control frames the read loop queued since the
+	// writer last took the buffer; see leanMaxQueuedControl.
+	queuedControl int
 
 	streams      map[uint32]*leanStream
 	maxStreams   int
@@ -160,7 +169,9 @@ func (c *leanConn) serve() {
 		if err != nil {
 			var se http2.StreamError
 			if errors.As(err, &se) {
-				c.resetStream(se.StreamID, se.Code)
+				if c.resetStream(se.StreamID, se.Code) != nil {
+					return
+				}
 				continue
 			}
 			return
@@ -173,6 +184,18 @@ func (c *leanConn) serve() {
 
 // queued wakes the writer. c.mu must be held.
 func (c *leanConn) queued() { c.wcond.Signal() }
+
+// queuedControlFrame notes a control frame queued in answer to the peer and wakes
+// the writer. It fails once the peer has made us queue too many it isn't
+// reading, which ends the connection. c.mu must be held.
+func (c *leanConn) queuedControlFrame() error {
+	c.queuedControl++
+	c.queued()
+	if c.queuedControl > leanMaxQueuedControl {
+		return errLeanProtocol
+	}
+	return nil
+}
 
 func (c *leanConn) handleFrame(f http2.Frame) error {
 	switch f := f.(type) {
@@ -189,8 +212,9 @@ func (c *leanConn) handleFrame(f http2.Frame) error {
 			c.mu.Lock()
 			c.wbuf = appendFrameHeader(c.wbuf, 8, http2.FramePing, http2.FlagPingAck, 0)
 			c.wbuf = append(c.wbuf, f.Data[:]...)
-			c.queued()
+			err := c.queuedControlFrame()
 			c.mu.Unlock()
+			return err
 		}
 	case *http2.RSTStreamFrame:
 		c.mu.Lock()
@@ -241,8 +265,7 @@ func (c *leanConn) handleSettings(f *http2.SettingsFrame) error {
 		return err
 	}
 	c.wbuf = appendFrameHeader(c.wbuf, 0, http2.FrameSettings, http2.FlagSettingsAck, 0)
-	c.queued()
-	return nil
+	return c.queuedControlFrame()
 }
 
 func (c *leanConn) handleWindowUpdate(f *http2.WindowUpdateFrame) {
@@ -269,9 +292,9 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	c.lastStreamID = id
 	if c.goingAway || len(c.streams) >= c.maxStreams {
 		c.wbuf = appendRSTStream(c.wbuf, id, http2.ErrCodeRefusedStream)
-		c.queued()
+		err := c.queuedControlFrame()
 		c.mu.Unlock()
-		return nil
+		return err
 	}
 	ctx, cancel := context.WithCancel(c.ctx)
 	st := &leanStream{
@@ -309,7 +332,7 @@ func (c *leanConn) handleData(f *http2.DataFrame) error {
 		c.creditConn(n)
 		if st == nil && f.StreamID <= c.lastStreamID {
 			c.wbuf = appendRSTStream(c.wbuf, f.StreamID, http2.ErrCodeStreamClosed)
-			c.queued()
+			return c.queuedControlFrame()
 		}
 		return nil
 	}
@@ -350,15 +373,17 @@ func (c *leanConn) creditConn(n int64) {
 	}
 }
 
-func (c *leanConn) resetStream(id uint32, code http2.ErrCode) {
+// resetStream ends stream id with RST_STREAM. The read loop calls it for a
+// peer's stream errors, so it counts as an answer to the peer.
+func (c *leanConn) resetStream(id uint32, code http2.ErrCode) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if st := c.streams[id]; st != nil {
 		c.resetStreamLocked(st, code)
-		return
+	} else {
+		c.wbuf = appendRSTStream(c.wbuf, id, code)
 	}
-	c.wbuf = appendRSTStream(c.wbuf, id, code)
-	c.queued()
+	return c.queuedControlFrame()
 }
 
 // resetStreamLocked ends st with RST_STREAM. c.mu must be held.
@@ -387,6 +412,7 @@ func (c *leanConn) writeLoop() {
 		}
 		buf := c.wbuf
 		c.wbuf, c.spare = c.spare[:0], nil
+		c.queuedControl = 0
 		c.roomCond.Broadcast()
 		c.mu.Unlock()
 
@@ -481,7 +507,9 @@ func (st *leanStream) run(method, authority string, hasPath bool) {
 	// :path, and any other request must have both.
 	connect := method == http.MethodConnect
 	if connect && (authority == "" || hasPath) || !connect && !hasPath {
-		c.resetStream(st.id, http2.ErrCodeProtocol)
+		if c.resetStream(st.id, http2.ErrCodeProtocol) != nil {
+			c.close()
+		}
 		return
 	}
 	if !connect {
