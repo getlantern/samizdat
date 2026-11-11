@@ -405,3 +405,26 @@ func TestLeanH2ManyStreams(t *testing.T) {
 		t.Errorf("handler ran %d times, want 200", served.Load())
 	}
 }
+
+// TestLeanH2ClosesOnControlFrameFlood sends PINGs without reading the
+// answers. Once the socket's buffers fill, the answers queue up in the
+// server, which must close the connection past leanMaxQueuedControl rather
+// than queue them without bound.
+func TestLeanH2ClosesOnControlFrameFlood(t *testing.T) {
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {})
+	p.handshake(t)
+	// Small buffers so the flood fills them quickly.
+	if tc, ok := p.conn.(*net.TCPConn); ok {
+		tc.SetReadBuffer(16 << 10)
+	}
+	p.conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	for i := 0; i < 5_000_000; i++ {
+		if err := p.fr.WritePing(false, [8]byte{}); err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				t.Fatal("server stopped reading but didn't close the connection")
+			}
+			return // the server closed the connection
+		}
+	}
+	t.Fatal("server kept the connection open under a PING flood")
+}
