@@ -93,6 +93,16 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 	}
 	t.mu.Unlock()
 
+	// The stream counts from now, not from the CONNECT's response, so a
+	// transport retired meanwhile isn't closed under a CONNECT in flight.
+	t.activeStreams.Add(1)
+	opened := false
+	defer func() {
+		if !opened {
+			t.releaseStream()
+		}
+	}()
+
 	// Issue CONNECT request
 	pr, pw := io.Pipe()
 
@@ -147,7 +157,7 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		return nil, fmt.Errorf("CONNECT to %s returned status %d", destination, resp.StatusCode)
 	}
 
-	t.activeStreams.Add(1)
+	opened = true
 
 	// Create a ReadWriteCloser that reads from the response body and writes to the pipe
 	rwc := &h2StreamRWC{
@@ -190,8 +200,19 @@ func (t *h2Transport) hasCapacity() bool {
 	return !t.retired.Load() && int(t.activeStreams.Load()) < t.maxStreams
 }
 
+// releaseStream ends one of the transport's streams, open or still opening,
+// and closes a retired transport once none is left.
+func (t *h2Transport) releaseStream() {
+	// The timestamp is stored before the count can reach zero, so cleanup
+	// never sees an idle transport with a stale one.
+	t.idleSince.Store(time.Now().UnixNano())
+	if t.activeStreams.Add(-1) == 0 && t.retired.Load() {
+		t.close()
+	}
+}
+
 // retire stops the transport taking new streams and closes it once the ones
-// it carries have ended.
+// it carries, including any still opening, have ended.
 func (t *h2Transport) retire() {
 	t.retired.Store(true)
 	if t.streamCount() == 0 {
@@ -280,12 +301,7 @@ func (s *h2StreamRWC) Close() error {
 		if s.tunnelCancel != nil {
 			s.tunnelCancel()
 		}
-		// The timestamp is stored before the count can reach zero, so cleanup
-		// never sees an idle transport with a stale one.
-		s.transport.idleSince.Store(time.Now().UnixNano())
-		if s.transport.activeStreams.Add(-1) == 0 && s.transport.retired.Load() {
-			s.transport.close()
-		}
+		s.transport.releaseStream()
 	})
 	return closeErr
 }

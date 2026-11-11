@@ -614,3 +614,152 @@ func TestRetiredTransportKeepsItsStreams(t *testing.T) {
 		t.Fatal("retired transport stayed open after its last stream ended")
 	}
 }
+
+// TestLeanH2HonorsClientHeaderTableSize: a client that advertises a 0-byte
+// HPACK table must get responses it can decode with one, so the encoder may
+// not index the date header across responses.
+func TestLeanH2HonorsClientHeaderTableSize(t *testing.T) {
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {})
+	p.fr.ReadMetaHeaders = hpack.NewDecoder(0, nil)
+	if _, err := p.conn.Write([]byte(http2.ClientPreface)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.fr.WriteSettings(
+		http2.Setting{ID: http2.SettingHeaderTableSize, Val: 0},
+		http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20},
+	); err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the server's ack, so the setting applies to the responses.
+	for acked := false; !acked; {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sf, ok := f.(*http2.SettingsFrame); ok && sf.IsAck() {
+			acked = true
+		}
+	}
+	for id := uint32(1); id <= 5; id += 2 {
+		p.request(t, id, "CONNECT", "example.com:443", true)
+	}
+	responses := 0
+	for responses < 3 {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("after %d responses: %v", responses, err)
+		}
+		if _, ok := f.(*http2.MetaHeadersFrame); ok {
+			responses++
+		}
+	}
+}
+
+// TestLeanH2LingeringWriteIsNotTruncated: a handler that returns while a
+// Write it started is still in progress (here, blocked on flow control
+// because the client isn't reading yet) must not have that write cut short
+// when the client's END_STREAM arrives, as serverStreamConn.shutdown waits
+// for an in-flight write.
+func TestLeanH2LingeringWriteIsNotTruncated(t *testing.T) {
+	const size = 16 << 20
+	client := startLeanPair(t, func(ctx context.Context, conn net.Conn, dest string) {
+		started := make(chan struct{})
+		go func() {
+			close(started)
+			conn.Write(make([]byte, size))
+		}()
+		<-started
+		time.Sleep(50 * time.Millisecond) // the Write is blocked on flow control
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp", "dl:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.(interface{ CloseWrite() error }).CloseWrite()
+	time.Sleep(300 * time.Millisecond) // let the handler return first
+	n, err := io.Copy(io.Discard, conn)
+	if n != size {
+		t.Fatalf("got %d of %d bytes: %v", n, size, err)
+	}
+}
+
+// TestLeanH2ResetReleasesUnreadUpload: data buffered for a stream the client
+// resets must go back to the shared connection window at once, even while
+// its handler is stuck, or sibling uploads stall.
+func TestLeanH2ResetReleasesUnreadUpload(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {
+		if dest == "stuck:1" {
+			<-release // reads nothing and ignores its context
+			return
+		}
+		n, _ := io.Copy(io.Discard, conn)
+		conn.Write([]byte(strconv.FormatInt(n, 10)))
+	})
+	p.handshake(t)
+	go func() {
+		for {
+			if _, err := p.fr.ReadFrame(); err != nil {
+				return
+			}
+		}
+	}()
+	// Fill the connection window (1 MiB) on stream 1, then reset it.
+	p.request(t, 1, "CONNECT", "stuck:1", false)
+	chunk := make([]byte, 16384)
+	for sent := 0; sent < 1<<20-16384; sent += len(chunk) {
+		if err := p.fr.WriteData(1, false, chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.fr.WriteRSTStream(1, http2.ErrCodeCancel); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	// The server has credited the connection window back only if it
+	// released stream 1's buffered data: probe by checking the server
+	// accepts 1 MiB more on another stream without a FLOW_CONTROL error.
+	p.request(t, 3, "CONNECT", "count:1", false)
+	for sent := 0; sent < 1<<20-16384; sent += len(chunk) {
+		if err := p.fr.WriteData(3, false, chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.fr.WriteData(3, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A server that kept stream 1's bytes would see stream 3 overrun the
+	// connection window and drop the connection.
+	time.Sleep(300 * time.Millisecond)
+	if err := p.fr.WritePing(false, [8]byte{}); err != nil {
+		t.Fatalf("connection dropped: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if err := p.fr.WritePing(false, [8]byte{}); err != nil {
+		t.Fatalf("connection dropped: %v", err)
+	}
+}
+
+// TestRetiredTransportWaitsForOpeningStream: a transport retired while a
+// CONNECT is still waiting for its response must stay open for it.
+func TestRetiredTransportWaitsForOpeningStream(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	tr, err := newH2Transport(c1, "example.com:443", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.activeStreams.Add(1) // what openTunnel counts before RoundTrip
+	tr.retire()
+	if tr.isClosed() {
+		t.Fatal("retiring closed a transport with a CONNECT in flight")
+	}
+	tr.releaseStream()
+	if !tr.isClosed() {
+		t.Fatal("retired transport stayed open after its last stream ended")
+	}
+}
