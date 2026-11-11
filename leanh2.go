@@ -45,10 +45,14 @@ const (
 	leanDefaultMaxFrame   = 16384 // the client sends no SETTINGS_MAX_FRAME_SIZE
 	leanMaxWriteBuffer    = 512 << 10
 	leanReadBuffer        = 32 << 10
-	// An idle connection keeps a write buffer up to this size and returns a
-	// larger one to leanBufPool, so thousands of idle connections don't each
-	// hold a burst's worth while busy ones don't reallocate on every pause.
+	// An idle connection keeps write buffers up to this size and drops larger
+	// ones, so thousands of idle connections don't each hold a burst's worth
+	// while a busy one reuses its buffers write after write.
 	leanIdleBufKeep = 64 << 10
+	// leanIdleTrimDelay is how long the writer must have been idle before
+	// its buffers are trimmed; trimming at every pause would make a busy
+	// connection reallocate after each burst.
+	leanIdleTrimDelay = time.Second
 	// leanMaxQueuedControl caps the control frames (PING and SETTINGS
 	// acknowledgements, RST_STREAM) the read loop may queue while the writer
 	// hasn't sent them, as x/net's maxQueuedControlFrames does. A peer that
@@ -98,7 +102,6 @@ func (s *Server) serveLeanH2(tlsConn net.Conn, bc *batchConn, rawConn net.Conn, 
 		hpackBuf:      new(bytes.Buffer),
 	}
 	c.wcond = sync.NewCond(&c.mu)
-	c.roomCond = sync.NewCond(&c.mu)
 	c.hpackEnc = hpack.NewEncoder(c.hpackBuf)
 	c.serve()
 }
@@ -113,15 +116,21 @@ type leanConn struct {
 	remoteAddr net.Addr
 
 	// mu guards everything below and every leanStream's fields. wcond wakes
-	// the writer when frames are queued; roomCond wakes Writes waiting for
-	// room in the write buffer. A stream waiting on data or on flow control
-	// waits on its own cond.
-	mu       sync.Mutex
-	wcond    *sync.Cond
-	roomCond *sync.Cond
+	// the writer when frames are queued. A stream waits on its own cond for
+	// data, flow control and room in the write buffer.
+	mu    sync.Mutex
+	wcond *sync.Cond
 
 	wbuf   []byte // frames queued for the writer
+	spare  []byte // the writer's previous buffer, for reuse
 	closed bool
+	// roomWaiters are the streams waiting for room in the write buffer,
+	// woken when the writer takes it.
+	roomWaiters []*leanStream
+	// writerIdle is set while the writer waits for frames; trimTimer trims
+	// the buffers once it has stayed idle for leanIdleTrimDelay.
+	writerIdle bool
+	trimTimer  *time.Timer
 	// queuedControl counts the control frames the read loop queued since the
 	// writer last took the buffer; see leanMaxQueuedControl.
 	queuedControl int
@@ -235,8 +244,7 @@ func (c *leanConn) handleFrame(f http2.Frame) error {
 		c.mu.Lock()
 		if st := c.streams[f.StreamID]; st != nil && !st.reset {
 			st.markResetLocked()
-			st.cond.Broadcast()
-			c.roomCond.Broadcast()
+			st.wakeLocked()
 			st.cancel()
 		}
 		c.mu.Unlock()
@@ -322,6 +330,7 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		c:          c,
 		id:         id,
 		cond:       sync.NewCond(&c.mu),
+		roomCond:   sync.NewCond(&c.mu),
 		ctx:        ctx,
 		cancel:     cancel,
 		sendWin:    c.peerInitWin,
@@ -334,6 +343,13 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 
 	go st.run(f.PseudoValue("method"), f.PseudoValue("authority"), f.PseudoValue("scheme"), f.PseudoValue("path"))
 	return nil
+}
+
+// wakeLocked wakes everything waiting on st: reads, flow-control waits and
+// room waits. c.mu must be held.
+func (st *leanStream) wakeLocked() {
+	st.cond.Broadcast()
+	st.roomCond.Broadcast()
 }
 
 // markResetLocked records that st has been reset by either side, which
@@ -426,8 +442,7 @@ func (c *leanConn) resetStreamLocked(st *leanStream, code http2.ErrCode) {
 	st.markResetLocked()
 	c.wbuf = appendRSTStream(c.wbuf, st.id, code)
 	c.queued()
-	st.cond.Broadcast()
-	c.roomCond.Broadcast()
+	st.wakeLocked()
 	st.cancel()
 }
 
@@ -436,28 +451,39 @@ func (c *leanConn) resetStreamLocked(st *leanStream, code http2.ErrCode) {
 func (c *leanConn) writeLoop() {
 	for {
 		c.mu.Lock()
-		for len(c.wbuf) == 0 && !c.closed {
-			if cap(c.wbuf) > leanIdleBufKeep {
-				putLeanBuf(c.wbuf)
-				c.wbuf = nil
+		if len(c.wbuf) == 0 && !c.closed {
+			c.writerIdle = true
+			c.scheduleTrimLocked()
+			for len(c.wbuf) == 0 && !c.closed {
+				c.wcond.Wait()
 			}
-			c.wcond.Wait()
+			c.writerIdle = false
 		}
 		if len(c.wbuf) == 0 {
 			c.mu.Unlock()
 			return
 		}
 		buf := c.wbuf
-		c.wbuf = getLeanBuf()
+		c.wbuf, c.spare = c.spare[:0], nil
 		c.queuedControl = 0
-		c.roomCond.Broadcast()
+		for _, st := range c.roomWaiters {
+			st.waitingRoom = false
+			st.roomCond.Broadcast()
+		}
+		clear(c.roomWaiters)
+		c.roomWaiters = c.roomWaiters[:0]
 		c.mu.Unlock()
 
 		err := c.bc.batch(func() error {
 			_, err := c.conn.Write(buf)
 			return err
 		})
-		putLeanBuf(buf)
+
+		c.mu.Lock()
+		if c.spare == nil {
+			c.spare = buf[:0]
+		}
+		c.mu.Unlock()
 		if err != nil {
 			c.close()
 			return
@@ -475,34 +501,86 @@ func (c *leanConn) close() {
 	}
 	c.closed = true
 	for _, st := range c.streams {
-		st.cond.Broadcast()
+		st.wakeLocked()
 	}
 	c.wcond.Broadcast()
-	c.roomCond.Broadcast()
+	if c.trimTimer != nil {
+		c.trimTimer.Stop()
+	}
 	c.mu.Unlock()
 	c.cancel()
 	c.conn.Close()
 }
 
-// waitForRoom blocks until the write buffer can take more frames. c.mu must
-// be held.
-func (c *leanConn) waitForRoom() error {
-	for len(c.wbuf) >= leanMaxWriteBuffer && !c.closed {
-		c.roomCond.Wait()
+// scheduleTrimLocked arranges for the write buffers to be trimmed if the
+// writer stays idle for leanIdleTrimDelay, when there's anything to trim.
+// c.mu must be held.
+func (c *leanConn) scheduleTrimLocked() {
+	if cap(c.wbuf) <= leanIdleBufKeep && cap(c.spare) <= leanIdleBufKeep && !c.bc.overKeep(leanIdleBufKeep) {
+		return
+	}
+	if c.trimTimer == nil {
+		c.trimTimer = time.AfterFunc(leanIdleTrimDelay, c.trimIfIdle)
+	} else {
+		c.trimTimer.Reset(leanIdleTrimDelay)
+	}
+}
+
+// trimIfIdle drops write buffers over leanIdleBufKeep if the writer is still
+// idle, so an idle connection holds little memory.
+func (c *leanConn) trimIfIdle() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.writerIdle || len(c.wbuf) > 0 {
+		return
+	}
+	if cap(c.wbuf) > leanIdleBufKeep {
+		c.wbuf = nil
+	}
+	if cap(c.spare) > leanIdleBufKeep {
+		c.spare = nil
+	}
+	c.bc.trim(leanIdleBufKeep)
+}
+
+// waitForRoom blocks st until the write buffer can take more frames, or st
+// or the connection ends. c.mu must be held.
+func (st *leanStream) waitForRoom() error {
+	c := st.c
+	for len(c.wbuf) >= leanMaxWriteBuffer && !c.closed && !st.reset {
+		st.awaitRoomLocked()
 	}
 	if c.closed {
 		return errLeanConnClosed
 	}
+	if st.reset {
+		return errLeanStreamReset
+	}
 	return nil
+}
+
+// awaitRoomLocked waits until the writer takes the write buffer, or st is
+// reset or closed. c.mu must be held.
+func (st *leanStream) awaitRoomLocked() {
+	if !st.waitingRoom {
+		st.waitingRoom = true
+		st.c.roomWaiters = append(st.c.roomWaiters, st)
+	}
+	st.roomCond.Wait()
 }
 
 // leanStream is one CONNECT tunnel. Its fields are guarded by c.mu.
 type leanStream struct {
-	c      *leanConn
-	id     uint32
-	cond   *sync.Cond // signalled on data, END_STREAM, reset, close and window updates
-	ctx    context.Context
-	cancel context.CancelFunc
+	c    *leanConn
+	id   uint32
+	cond *sync.Cond // signalled on data, END_STREAM, reset, close and window updates
+	// roomCond is signalled when the writer takes the write buffer, and on
+	// reset and close. A Write waiting for room waits on it rather than on
+	// cond, so the client's window updates and data don't wake it for
+	// nothing.
+	roomCond *sync.Cond
+	ctx      context.Context
+	cancel   context.CancelFunc
 
 	sendWin     int64
 	recvAvail   int64 // what the client may still send on the stream
@@ -516,6 +594,8 @@ type leanStream struct {
 	draining bool
 	closed   bool // the handler closed the stream, or the drain ended
 	removed  bool // finish took the stream out of c.streams
+	// waitingRoom is set while st is in c.roomWaiters.
+	waitingRoom bool
 }
 
 // dropUnreadLocked discards data the handler will never read and returns it
@@ -551,11 +631,12 @@ func (st *leanStream) run(method, authority, scheme, path string) {
 	c := st.c
 	defer st.finish()
 	// x/net's server rejects a malformed request with RST_STREAM before any
-	// handler sees it: a CONNECT must have :authority and neither :scheme nor
-	// :path, and any other request needs a :path and an http or https
-	// :scheme.
+	// handler sees it: every request needs a :method, a CONNECT must have
+	// :authority and neither :scheme nor :path, and any other request needs a
+	// :path and an http or https :scheme.
 	connect := method == http.MethodConnect
-	malformed := connect && (authority == "" || scheme != "" || path != "") ||
+	malformed := method == "" ||
+		connect && (authority == "" || scheme != "" || path != "") ||
 		!connect && (path == "" || scheme != "http" && scheme != "https")
 	if malformed {
 		if c.resetStream(st.id, http2.ErrCodeProtocol) != nil {
@@ -580,6 +661,7 @@ func (st *leanStream) run(method, authority, scheme, path string) {
 	c.mu.Lock()
 	st.draining = true
 	st.dropUnreadLocked()
+	st.cond.Broadcast() // a read the handler left behind now fails
 	timedOut := false
 	timer := time.AfterFunc(leanDrainTimeout, func() {
 		c.mu.Lock()
@@ -592,8 +674,7 @@ func (st *leanStream) run(method, authority, scheme, path string) {
 	}
 	timer.Stop()
 	st.closed = true
-	st.cond.Broadcast()
-	c.roomCond.Broadcast()
+	st.wakeLocked()
 	st.endLocked(nil)
 	c.mu.Unlock()
 }
@@ -604,7 +685,11 @@ func (st *leanStream) run(method, authority, scheme, path string) {
 func (st *leanStream) runHandler(conn net.Conn, destination string) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[samizdat] panic in handler for stream %d: %v\n%s", st.id, r, debug.Stack())
+			// http.ErrAbortHandler aborts a handler on purpose; x/net's server
+			// doesn't log it either.
+			if r != http.ErrAbortHandler {
+				log.Printf("[samizdat] panic in handler for stream %d: %v\n%s", st.id, r, debug.Stack())
+			}
 			st.c.mu.Lock()
 			st.c.resetStreamLocked(st, http2.ErrCodeInternal)
 			st.c.mu.Unlock()
@@ -617,7 +702,7 @@ func (st *leanStream) runHandler(conn net.Conn, destination string) {
 // the client hasn't ended its side. c.mu must be held.
 func (st *leanStream) endLocked(body []byte) {
 	c := st.c
-	if st.reset || c.waitForRoom() != nil {
+	if st.reset || st.waitForRoom() != nil {
 		return
 	}
 	c.wbuf = appendFrameHeader(c.wbuf, len(body), http2.FrameData, http2.FlagDataEndStream, st.id)
@@ -641,8 +726,7 @@ func (st *leanStream) finish() {
 	st.removed = true
 	st.closed = true
 	st.dropUnreadLocked()
-	st.cond.Broadcast()
-	c.roomCond.Broadcast()
+	st.wakeLocked()
 	c.mu.Unlock()
 	st.cancel()
 }
@@ -667,11 +751,8 @@ func (st *leanStream) writeHeaders(status int, extra []hpack.HeaderField) error 
 	c := st.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.waitForRoom(); err != nil {
+	if err := st.waitForRoom(); err != nil {
 		return err
-	}
-	if st.reset {
-		return errLeanStreamReset
 	}
 	c.hpackBuf.Reset()
 	c.hpackEnc.WriteField(hpack.HeaderField{Name: ":status", Value: strconv.Itoa(status)})
@@ -741,7 +822,7 @@ func (sc *leanStreamConn) Write(b []byte) (int, error) {
 				return written, errLeanConnClosed
 			}
 			if len(c.wbuf) >= leanMaxWriteBuffer {
-				c.roomCond.Wait()
+				st.awaitRoomLocked()
 				continue
 			}
 			if st.sendWin <= 0 || c.connSendWin <= 0 {
@@ -766,8 +847,7 @@ func (sc *leanStreamConn) Close() error {
 	st.c.mu.Lock()
 	st.closed = true
 	st.dropUnreadLocked()
-	st.cond.Broadcast()
-	st.c.roomCond.Broadcast()
+	st.wakeLocked()
 	st.c.mu.Unlock()
 	return nil
 }
@@ -798,6 +878,7 @@ type batchConn struct {
 	// record written meanwhile collected has been sent.
 	pending bool
 	buf     []byte
+	spare   []byte // the previous buffer, for reuse
 }
 
 func (bc *batchConn) Write(b []byte) (int, error) {
@@ -816,7 +897,6 @@ func (bc *batchConn) Write(b []byte) (int, error) {
 func (bc *batchConn) batch(write func() error) error {
 	bc.mu.Lock()
 	bc.pending = true
-	bc.buf = getLeanBuf()
 	bc.mu.Unlock()
 	err := write()
 	for {
@@ -824,42 +904,46 @@ func (bc *batchConn) batch(write func() error) error {
 		buf := bc.buf
 		if len(buf) == 0 {
 			bc.pending = false
-			bc.buf = nil
 			bc.mu.Unlock()
-			putLeanBuf(buf)
 			return err
 		}
-		bc.buf = nil
+		bc.buf, bc.spare = bc.spare[:0], nil
 		bc.mu.Unlock()
 		_, werr := bc.Conn.Write(buf)
-		putLeanBuf(buf)
+		bc.mu.Lock()
+		if bc.spare == nil {
+			bc.spare = buf[:0]
+		}
 		if werr != nil {
-			bc.mu.Lock()
 			bc.pending = false
-			bc.buf = nil
+			bc.buf = bc.buf[:0]
 			bc.mu.Unlock()
 			return errors.Join(err, werr)
 		}
+		bc.mu.Unlock()
 	}
 }
 
-// leanBufPool holds write buffers between bursts, so an idle connection
-// holds none and a busy one doesn't allocate a new one per write.
-var leanBufPool sync.Pool
-
-func getLeanBuf() []byte {
-	if b, ok := leanBufPool.Get().(*[]byte); ok {
-		return (*b)[:0]
-	}
-	return nil
+// overKeep reports whether either buffer is larger than keep.
+func (bc *batchConn) overKeep(keep int) bool {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	return cap(bc.buf) > keep || cap(bc.spare) > keep
 }
 
-func putLeanBuf(b []byte) {
-	if b == nil || cap(b) > 4*leanMaxWriteBuffer {
+// trim drops buffers over keep while no batch is being sent.
+func (bc *batchConn) trim(keep int) {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+	if bc.pending {
 		return
 	}
-	b = b[:0]
-	leanBufPool.Put(&b)
+	if cap(bc.buf) > keep {
+		bc.buf = nil
+	}
+	if cap(bc.spare) > keep {
+		bc.spare = nil
+	}
 }
 
 func appendFrameHeader(b []byte, length int, t http2.FrameType, flags http2.Flags, streamID uint32) []byte {

@@ -32,6 +32,10 @@ type h2Transport struct {
 
 	mu            sync.Mutex
 	activeStreams atomic.Int32
+	// retired is set when x/net's Transport stops using the connection for
+	// new streams (see errSecondDial). The pool stops handing the transport
+	// out, and it closes once its last stream ends.
+	retired atomic.Bool
 	// idleSince is when a stream last closed, in Unix nanoseconds, or when
 	// the transport was created if no stream has.
 	idleSince  atomic.Int64
@@ -122,7 +126,12 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		// subsequent RoundTrip, so retire the transport here; otherwise the
 		// pool keeps handing back the dead transport on each getTransport
 		// until a later cleanup tick, producing sustained error bursts.
-		if connFatal(err) {
+		switch {
+		case errors.Is(err, errSecondDial):
+			// The connection can't take new streams (a GOAWAY, or stream
+			// IDs used up) but may still carry live tunnels; keep them.
+			t.retire()
+		case connFatal(err):
 			t.close()
 		}
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
@@ -178,7 +187,16 @@ func connFatal(err error) bool {
 
 // hasCapacity returns true if the transport can accept more streams.
 func (t *h2Transport) hasCapacity() bool {
-	return int(t.activeStreams.Load()) < t.maxStreams
+	return !t.retired.Load() && int(t.activeStreams.Load()) < t.maxStreams
+}
+
+// retire stops the transport taking new streams and closes it once the ones
+// it carries have ended.
+func (t *h2Transport) retire() {
+	t.retired.Store(true)
+	if t.streamCount() == 0 {
+		t.close()
+	}
 }
 
 // streamCount returns the number of active streams.
@@ -265,7 +283,9 @@ func (s *h2StreamRWC) Close() error {
 		// The timestamp is stored before the count can reach zero, so cleanup
 		// never sees an idle transport with a stale one.
 		s.transport.idleSince.Store(time.Now().UnixNano())
-		s.transport.activeStreams.Add(-1)
+		if s.transport.activeStreams.Add(-1) == 0 && s.transport.retired.Load() {
+			s.transport.close()
+		}
 	})
 	return closeErr
 }
