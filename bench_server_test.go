@@ -1,3 +1,5 @@
+//go:build unix
+
 package samizdat
 
 import (
@@ -27,8 +29,9 @@ import (
 // The server benchmarks run the server in a child process, so the CPU time
 // they report is the server's alone: the client and the load it generates
 // run in the benchmark process. The child prints its listen address and
-// credentials, serves until its stdin closes, then prints the user+system
-// CPU time it used.
+// credentials and serves. A "mark" line on its stdin, sent as the workload
+// starts, records its CPU time so far; when stdin closes it prints the
+// user+system CPU time used since the mark, leaving out its startup.
 //
 // A tunnel's destination names the load: "dl:<bytes>:<chunk>" makes the
 // handler write <bytes> to the stream in Write calls of <chunk> bytes, as a
@@ -72,12 +75,22 @@ func runBenchServer() {
 	}
 	go srv.Serve(ln)
 	fmt.Printf("addr=%s pub=%s sid=%s\n", ln.Addr(), hex.EncodeToString(pub), hex.EncodeToString(shortID[:]))
-	io.Copy(io.Discard, os.Stdin)
+	var mark time.Duration
+	in := bufio.NewScanner(os.Stdin)
+	for in.Scan() {
+		if in.Text() == "mark" {
+			mark = cpuTime()
+		}
+	}
+	fmt.Printf("cpu_ns=%d\n", (cpuTime() - mark).Nanoseconds())
+	os.Exit(0)
+}
+
+// cpuTime is the user+system CPU time this process has used.
+func cpuTime() time.Duration {
 	var ru syscall.Rusage
 	syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
-	cpu := time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
-	fmt.Printf("cpu_ns=%d\n", cpu.Nanoseconds())
-	os.Exit(0)
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
 }
 
 func fatalf(format string, args ...any) {
@@ -184,7 +197,26 @@ func startBenchServer(b *testing.B, env ...string) *benchServerProc {
 		b.Fatal(err)
 	}
 	p.client = client
+	// If the benchmark fails before stop, the child must still go.
+	b.Cleanup(p.kill)
 	return p
+}
+
+// mark tells the child the workload starts now.
+func (p *benchServerProc) mark(b *testing.B) {
+	if _, err := io.WriteString(p.stdin, "mark\n"); err != nil {
+		b.Fatal(err)
+	}
+}
+
+// kill ends the child if stop didn't. It is safe to call after stop.
+func (p *benchServerProc) kill() {
+	p.client.Close()
+	p.stdin.Close()
+	if p.cmd.ProcessState == nil {
+		p.cmd.Process.Kill()
+		p.cmd.Wait()
+	}
 }
 
 // stop ends the child and returns the CPU time it used.
@@ -210,6 +242,7 @@ func benchDownload(b *testing.B, streams, perStream, chunk int, env ...string) {
 	dest := fmt.Sprintf("dl:%d:%d", perStream, chunk)
 	ctx := context.Background()
 	b.SetBytes(int64(streams * perStream))
+	p.mark(b)
 	b.ResetTimer()
 	start := time.Now()
 	for i := 0; i < b.N; i++ {
@@ -260,6 +293,7 @@ func benchUpload(b *testing.B, streams, perStream, chunk int, env ...string) {
 	p := startBenchServer(b, env...)
 	ctx := context.Background()
 	b.SetBytes(int64(streams * perStream))
+	p.mark(b)
 	b.ResetTimer()
 	start := time.Now()
 	for i := 0; i < b.N; i++ {
@@ -282,8 +316,13 @@ func benchUpload(b *testing.B, streams, perStream, chunk int, env ...string) {
 						return
 					}
 				}
-				conn.(interface{ CloseWrite() error }).CloseWrite()
-				io.Copy(io.Discard, conn)
+				if err := conn.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
+					errs <- err
+					return
+				}
+				if _, err := io.Copy(io.Discard, conn); err != nil {
+					errs <- err
+				}
 			}()
 		}
 		wg.Wait()

@@ -83,6 +83,24 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 // destination through the proxy server. Returns a net.Conn backed by the
 // H2 stream.
 func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.Conn, error) {
+	t.activeStreams.Add(1)
+	return t.openReserved(ctx, destination)
+}
+
+// openReserved is openTunnel for a stream slot already reserved, by
+// tryReserve or the pool creating the transport. The slot is released on
+// every path that doesn't produce a tunnel.
+func (t *h2Transport) openReserved(ctx context.Context, destination string) (net.Conn, error) {
+	// The stream has counted since its slot was reserved, not from the
+	// CONNECT's response, so a transport retired meanwhile isn't closed
+	// under a CONNECT in flight.
+	opened := false
+	defer func() {
+		if !opened {
+			t.releaseStream()
+		}
+	}()
+
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -92,16 +110,6 @@ func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.C
 		return nil, fmt.Errorf("transport closed: %w", net.ErrClosed)
 	}
 	t.mu.Unlock()
-
-	// The stream counts from now, not from the CONNECT's response, so a
-	// transport retired meanwhile isn't closed under a CONNECT in flight.
-	t.activeStreams.Add(1)
-	opened := false
-	defer func() {
-		if !opened {
-			t.releaseStream()
-		}
-	}()
 
 	// Issue CONNECT request
 	pr, pw := io.Pipe()
@@ -198,6 +206,20 @@ func connFatal(err error) bool {
 // hasCapacity returns true if the transport can accept more streams.
 func (t *h2Transport) hasCapacity() bool {
 	return !t.retired.Load() && int(t.activeStreams.Load()) < t.maxStreams
+}
+
+// tryReserve takes a stream slot if the transport has one, atomically, so
+// callers choosing a transport at once can't overbook it.
+func (t *h2Transport) tryReserve() bool {
+	for {
+		n := t.activeStreams.Load()
+		if t.retired.Load() || int(n) >= t.maxStreams {
+			return false
+		}
+		if t.activeStreams.CompareAndSwap(n, n+1) {
+			return true
+		}
+	}
 }
 
 // releaseStream ends one of the transport's streams, open or still opening,

@@ -25,9 +25,12 @@ import (
 // the two servers, serveH2 (x/net) or serveLeanH2, run without TLS.
 type h2Peer struct {
 	conn net.Conn
-	fr   *http2.Framer
-	enc  *hpack.Encoder
-	hbuf bytes.Buffer
+	// served is closed when the server's handler for the connection
+	// returns.
+	served chan struct{}
+	fr     *http2.Framer
+	enc    *hpack.Encoder
+	hbuf   bytes.Buffer
 }
 
 // startH2Pair serves one connection with the chosen implementation and
@@ -40,7 +43,9 @@ func startH2Pair(t *testing.T, lean bool, handler ConnHandler) *h2Peer {
 	}
 	t.Cleanup(func() { ln.Close() })
 	s := &Server{config: ServerConfig{MaxConcurrentStreams: 4, Handler: handler}}
+	served := make(chan struct{})
 	go func() {
+		defer close(served)
 		conn, err := ln.Accept()
 		if err != nil {
 			return
@@ -58,7 +63,7 @@ func startH2Pair(t *testing.T, lean bool, handler ConnHandler) *h2Peer {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	p := &h2Peer{conn: conn, fr: http2.NewFramer(conn, conn)}
+	p := &h2Peer{conn: conn, fr: http2.NewFramer(conn, conn), served: served}
 	p.fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
 	p.enc = hpack.NewEncoder(&p.hbuf)
 	conn.SetDeadline(time.Now().Add(20 * time.Second))
@@ -91,10 +96,22 @@ func (p *h2Peer) request(t *testing.T, id uint32, method, authority string, endS
 	for _, f := range extra {
 		p.enc.WriteField(f)
 	}
+	// Large blocks go out as HEADERS plus CONTINUATIONs of at most the
+	// default frame size.
+	block := p.hbuf.Bytes()
+	const chunk = 16384
+	first := block[:min(len(block), chunk)]
 	if err := p.fr.WriteHeaders(http2.HeadersFrameParam{
-		StreamID: id, BlockFragment: p.hbuf.Bytes(), EndHeaders: true, EndStream: endStream,
+		StreamID: id, BlockFragment: first, EndHeaders: len(block) <= chunk, EndStream: endStream,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	for rest := block[len(first):]; len(rest) > 0; {
+		n := min(len(rest), chunk)
+		if err := p.fr.WriteContinuation(id, n == len(rest), rest[:n]); err != nil {
+			t.Fatal(err)
+		}
+		rest = rest[n:]
 	}
 }
 
@@ -123,6 +140,8 @@ func describe(f http2.Frame) string {
 		s += fmt.Sprintf(" len=%d", len(f.Data()))
 	case *http2.RSTStreamFrame:
 		s += fmt.Sprintf(" code=%v", f.ErrCode)
+	case *http2.GoAwayFrame:
+		s += fmt.Sprintf(" last=%d code=%v", f.LastStreamID, f.ErrCode)
 	}
 	return s
 }
@@ -138,6 +157,9 @@ func transcript(t *testing.T, lean bool, method, authority string, extra ...hpac
 	for {
 		f, err := p.fr.ReadFrame()
 		if err != nil {
+			if len(out) > 0 && strings.HasPrefix(out[len(out)-1], "GOAWAY") {
+				return out // the server ended the connection, as expected
+			}
 			t.Fatalf("lean=%v: %v (so far %q)", lean, err, out)
 		}
 		out = append(out, describe(f))
@@ -182,6 +204,8 @@ func TestLeanH2MatchesXNet(t *testing.T) {
 		{"get", "GET", "example.com", path},
 		{"get without path", "GET", "example.com", nil},
 		{"no method", "", "example.com", path},
+		{"header field too large", "CONNECT", "example.com:443", []hpack.HeaderField{{Name: "x-big", Value: strings.Repeat("a", 1100<<10)}}},
+		{"header list too large", "CONNECT", "example.com:443", manyHeaders(70, 16<<10)},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			want := canonical(transcript(t, false, c.method, c.authority, c.extra...))
@@ -412,25 +436,33 @@ func TestLeanH2ManyStreams(t *testing.T) {
 
 // TestLeanH2ClosesOnControlFrameFlood sends PINGs without reading the
 // answers. Once the socket's buffers fill, the answers queue up in the
-// server, which must close the connection past leanMaxQueuedControl rather
+// server, which must end the connection past leanMaxQueuedControl rather
 // than queue them without bound.
 func TestLeanH2ClosesOnControlFrameFlood(t *testing.T) {
 	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {})
 	p.handshake(t)
-	// Small buffers so the flood fills them quickly.
 	if tc, ok := p.conn.(*net.TCPConn); ok {
-		tc.SetReadBuffer(16 << 10)
+		tc.SetReadBuffer(16 << 10) // fill quickly
 	}
-	p.conn.SetWriteDeadline(time.Now().Add(20 * time.Second))
-	for i := 0; i < 5_000_000; i++ {
-		if err := p.fr.WritePing(false, [8]byte{}); err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				t.Fatal("server stopped reading but didn't close the connection")
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
 			}
-			return // the server closed the connection
+			if p.fr.WritePing(false, [8]byte{}) != nil {
+				return
+			}
 		}
+	}()
+	select {
+	case <-p.served:
+	case <-time.After(30 * time.Second):
+		t.Fatal("server kept the connection open under a PING flood")
 	}
-	t.Fatal("server kept the connection open under a PING flood")
 }
 
 // TestLeanH2HandlerPanicResetsOnlyItsStream: a panicking handler must not
@@ -663,13 +695,19 @@ func TestLeanH2HonorsClientHeaderTableSize(t *testing.T) {
 func TestLeanH2LingeringWriteIsNotTruncated(t *testing.T) {
 	const size = 16 << 20
 	client := startLeanPair(t, func(ctx context.Context, conn net.Conn, dest string) {
-		started := make(chan struct{})
-		go func() {
-			close(started)
-			conn.Write(make([]byte, size))
-		}()
-		<-started
-		time.Sleep(50 * time.Millisecond) // the Write is blocked on flow control
+		go conn.Write(make([]byte, size))
+		// Return only once the Write is in progress (blocked on flow
+		// control, since the client isn't reading yet).
+		st := conn.(*leanStreamConn).st
+		for {
+			st.c.mu.Lock()
+			writing := st.writing > 0
+			st.c.mu.Unlock()
+			if writing {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -761,5 +799,95 @@ func TestRetiredTransportWaitsForOpeningStream(t *testing.T) {
 	tr.releaseStream()
 	if !tr.isClosed() {
 		t.Fatal("retired transport stayed open after its last stream ended")
+	}
+}
+
+// manyHeaders returns n distinct fields of size bytes each.
+func manyHeaders(n, size int) []hpack.HeaderField {
+	fs := make([]hpack.HeaderField, n)
+	for i := range fs {
+		fs[i] = hpack.HeaderField{Name: fmt.Sprintf("x-h%d", i), Value: strings.Repeat("a", size)}
+	}
+	return fs
+}
+
+// TestLeanH2AcceptsTrailers: HEADERS with END_STREAM on an open stream are
+// trailers, which x/net's server accepts; they must end the client's side of
+// that stream, not the connection.
+func TestLeanH2AcceptsTrailers(t *testing.T) {
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {
+		n, _ := io.Copy(io.Discard, conn)
+		conn.Write([]byte(strconv.FormatInt(n, 10)))
+	})
+	p.handshake(t)
+	p.request(t, 1, "CONNECT", "example.com:443", false)
+	if err := p.fr.WriteData(1, false, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	p.hbuf.Reset()
+	p.enc.WriteField(hpack.HeaderField{Name: "x-trailer", Value: "1"})
+	if err := p.fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID: 1, BlockFragment: p.hbuf.Bytes(), EndHeaders: true, EndStream: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g, ok := f.(*http2.GoAwayFrame); ok {
+			t.Fatalf("connection ended: %v", g.ErrCode)
+		}
+		if d, ok := f.(*http2.DataFrame); ok && d.StreamID == 1 && string(d.Data()) == "5" {
+			return
+		}
+	}
+}
+
+// TestLeanH2BoundsStartup: a client that never sends its preface is dropped
+// after leanPrefaceTimeout, as with x/net's server.
+func TestLeanH2BoundsStartup(t *testing.T) {
+	old := leanPrefaceTimeout
+	leanPrefaceTimeout = 200 * time.Millisecond
+	defer func() { leanPrefaceTimeout = old }()
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {})
+	select {
+	case <-p.served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server kept a connection that never sent its preface")
+	}
+}
+
+// TestLeanH2SerializesWritesOnAStream: two goroutines writing to the same
+// stream must not have their bytes interleaved, even when a Write waits for
+// flow-control credit partway through, as serverStreamConn serializes them.
+func TestLeanH2SerializesWritesOnAStream(t *testing.T) {
+	const size = 3 << 20
+	client := startLeanPair(t, func(ctx context.Context, conn net.Conn, dest string) {
+		var wg sync.WaitGroup
+		for _, b := range []byte{'a', 'b'} {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				conn.Write(bytes.Repeat([]byte{b}, size))
+			}()
+		}
+		wg.Wait()
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp", "dl:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.(interface{ CloseWrite() error }).CloseWrite()
+	got, err := io.ReadAll(conn)
+	if err != nil || len(got) != 2*size {
+		t.Fatalf("got %d bytes, %v", len(got), err)
+	}
+	if got[0] == got[size] || bytes.Count(got[:size], got[:1]) != size {
+		t.Fatal("the two writes were interleaved")
 	}
 }
