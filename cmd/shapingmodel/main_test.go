@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/hex"
+	"math"
 	"testing"
 )
 
@@ -140,6 +141,14 @@ func TestPruneKeepsTopMass(t *testing.T) {
 	}
 	if kept[0].size != 20 || kept[0].count != 6554 || kept[1].count != 65535 {
 		t.Fatalf("weights %+v, want sorted by outcome and scaled to the most likely", kept)
+	}
+}
+
+func TestBuildRejectsBadKeep(t *testing.T) {
+	for _, keep := range []float64{0, -1, 1.5, math.NaN()} {
+		if _, err := build(tinyProfile(), tinyModel(), 10, keep); err == nil {
+			t.Errorf("keep %v accepted", keep)
+		}
 	}
 }
 

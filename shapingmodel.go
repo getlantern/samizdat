@@ -198,6 +198,9 @@ func parseShapingModel(b []byte) (*shapingModel, error) {
 				return nil, err
 			}
 		}
+		if len(m.positions) == 0 && p.first == nil {
+			return nil, errors.New("shaping model: no row for the first position")
+		}
 		if err := p.validate(); err != nil {
 			return nil, fmt.Errorf("shaping model position %d: %w", len(m.positions), err)
 		}
