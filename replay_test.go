@@ -68,6 +68,31 @@ func TestReplayFilterForgetsAfterIdle(t *testing.T) {
 	}
 }
 
+func TestReplayFilterRetentionStaysOnWindowBoundary(t *testing.T) {
+	now := time.Unix(0, 0)
+	f := newReplayFilter(time.Hour, 1000)
+	f.now = func() time.Time { return now }
+	f.rotatedAt = now
+
+	key := []byte("session")
+	f.seen(key)
+
+	// A late lookup rotates; the window still began at the hour.
+	now = now.Add(90 * time.Minute)
+	f.seen([]byte("other"))
+	now = now.Add(45 * time.Minute) // 2h15m after key was added
+	if f.seen(key) {
+		t.Fatal("remembered more than two windows after it was added")
+	}
+}
+
+func TestReplayFilterSmallCapacity(t *testing.T) {
+	f := newReplayFilter(time.Hour, 1)
+	if f.cur.m < 1024*28 {
+		t.Fatalf("capacity 1 sized to %d bits, want at least the minimum capacity's", f.cur.m)
+	}
+}
+
 func TestServerReplayConfig(t *testing.T) {
 	priv, _, err := GenerateKeyPair()
 	if err != nil {
@@ -131,8 +156,8 @@ func TestReplayFilterFalsePositives(t *testing.T) {
 		rand.Read(key)
 		f.seen(key)
 	}
-	// At 1e-6 per lookup, 100,000 fresh keys against a full filter should
-	// give none; allow a couple before calling the sizing wrong.
+	// At 1e-6 per lookup, 100,000 fresh keys against a full filter give 0.1
+	// on average; more than 5 happens by chance about once in 10^9 runs.
 	fp := 0
 	for range 100_000 {
 		rand.Read(key)
@@ -140,7 +165,7 @@ func TestReplayFilterFalsePositives(t *testing.T) {
 			fp++
 		}
 	}
-	if fp > 2 {
+	if fp > 5 {
 		t.Fatalf("%d false positives in 100,000 lookups", fp)
 	}
 }
