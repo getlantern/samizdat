@@ -482,3 +482,71 @@ func TestShapingServerDropsSilentClient(t *testing.T) {
 		t.Fatalf("dropped only after %v", d)
 	}
 }
+
+// TestShapedConnScheduleTimesOut: a peer that stops reading partway leaves
+// the schedule blocked writing; shapingTimeout fails the connection.
+func TestShapedConnScheduleTimesOut(t *testing.T) {
+	old := shapingTimeout
+	shapingTimeout = 100 * time.Millisecond
+	defer func() { shapingTimeout = old }()
+	cc, sc := net.Pipe()
+	defer sc.Close()
+	c := newShapedConn(cc, []int{100, -100, 100, -100, 100, -100, 100, -100, 100, -100}, true, [shapingMarkerLen]byte{}, false)
+	defer c.Close()
+	start := time.Now()
+	_, err := c.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatal("Read succeeded on a stuck schedule")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("failed after %v", d)
+	}
+}
+
+// failingConn fails every Write after the first n, slowly, so a Read can
+// get into the connection before the failure.
+type failingConn struct {
+	net.Conn
+	mu sync.Mutex
+	n  int
+}
+
+func (c *failingConn) Write(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n == 0 {
+		time.Sleep(200 * time.Millisecond)
+		return 0, errors.New("write failed")
+	}
+	c.n--
+	return c.Conn.Write(b)
+}
+
+// TestShapedConnFlushFailureWakesReader: when the flush of what was queued
+// during the schedule fails, a Read already waiting on the connection
+// returns instead of hanging.
+func TestShapedConnFlushFailureWakesReader(t *testing.T) {
+	sched := []int{100, -100, 100, -100, 100, -100, 100, -100, 100, -100}
+	cc, sc := net.Pipe()
+	// The client's five records go through; the flush after them fails.
+	client := newShapedConn(&failingConn{Conn: cc, n: 5}, sched, true, [shapingMarkerLen]byte{}, false)
+	server := newShapedConn(sc, sched, false, [shapingMarkerLen]byte{}, false)
+	defer client.Close()
+	defer server.Close()
+	// More than the schedule's records carry, so some is left to flush.
+	client.Write(make([]byte, 10<<10))
+	go io.Copy(io.Discard, server)
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Read(make([]byte, 1))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Read succeeded after the flush failed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read still blocked after the flush failed")
+	}
+}

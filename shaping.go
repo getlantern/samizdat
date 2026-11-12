@@ -148,9 +148,9 @@ type shapedConn struct {
 	shaping bool
 	err     error
 	// rdl and wdl are the caller's deadlines. While the schedule runs, Read
-	// and Write wait on cond, and the schedule's own reads on Conn run under
-	// shapingTimeout instead, so the caller's read deadline reaches Conn
-	// only once the schedule is done.
+	// and Write wait on cond, and the schedule's reads on Conn run without
+	// the caller's read deadline (a watchdog bounds the schedule instead),
+	// which reaches Conn once the schedule is done.
 	rdl, wdl time.Time
 	// grace and timeout are shapingGrace and shapingTimeout when the
 	// connection was made.
@@ -201,8 +201,13 @@ func (c *shapedConn) shapingActive() bool {
 }
 
 func (c *shapedConn) run() {
-	c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+	// A peer that stops partway, reading or writing, would leave the
+	// schedule blocked on Conn; closing it fails the schedule.
+	watchdog := time.AfterFunc(c.timeout, func() { c.Conn.Close() })
 	err := c.runSchedule()
+	if !watchdog.Stop() && err == nil {
+		err = errors.New("samizdat: shaping schedule timed out")
+	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	c.mu.Lock()
@@ -212,6 +217,7 @@ func (c *shapedConn) run() {
 	if err != nil {
 		c.err = err
 	} else {
+		// The schedule's reads ran without the caller's read deadline.
 		c.Conn.SetReadDeadline(c.rdl)
 	}
 	c.cond.Broadcast()
@@ -226,6 +232,9 @@ func (c *shapedConn) run() {
 			c.err = err
 			c.cond.Broadcast()
 			c.mu.Unlock()
+			// The Writes that queued these bytes have returned, and a Read
+			// may already be in Conn.Read: closing is what tells them.
+			c.Conn.Close()
 		}
 	}
 }
