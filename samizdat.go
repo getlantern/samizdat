@@ -122,8 +122,8 @@ type ServerConfig struct {
 	ReplayWindow time.Duration
 	// ReplayCapacity is how many SessionIDs one ReplayWindow holds before
 	// the server starts a new one early, which shortens how long each is
-	// remembered under heavy load. Memory is about 7.2 bytes per entry
-	// (default: 2,000,000, about 14 MB).
+	// remembered under heavy load. Memory is about 7.2 bytes per entry, for
+	// at least 1024 entries (default: 2,000,000, about 14 MB).
 	ReplayCapacity int
 
 	// LeanH2 serves tunnels with samizdat's own HTTP/2 server instead of
