@@ -8,6 +8,8 @@ import (
 	"io"
 	"math/rand/v2"
 	"net"
+	"os"
+	"slices"
 	"sync"
 	"time"
 )
@@ -33,9 +35,12 @@ import (
 //     preface) a client that doesn't shape, whose bytes are replayed.
 //   - After the schedule both sides pass data straight through.
 //
-// The record sizes are what real TLS packets measured, so each record goes
-// out as one TCP segment (dynamic record sizing is off on both sides).
-// Timing isn't shaped.
+// The schedule fixes TLS record sizes and directions (dynamic record sizing
+// is off on both sides, so one Write is one record). The model is of TCP
+// packets, and a record usually leaves as one packet of its size, but TCP
+// may split one larger than the path's MSS (a 1460-byte record on a path
+// whose MSS is 1448) or coalesce records written back to back. Timing isn't
+// shaped.
 
 const (
 	shapingRecords = 10
@@ -68,6 +73,9 @@ func shapingSchedule(ekm func(label string, context []byte, length int) ([]byte,
 		return nil, marker, err
 	}
 	copy(marker[:], km[32:])
+	if shapingScheduleOverride != nil {
+		return slices.Clone(shapingScheduleOverride), marker, nil
+	}
 	model, err := loadShapingModel()
 	if err != nil {
 		return nil, marker, err
@@ -139,10 +147,25 @@ type shapedConn struct {
 	in      []byte // received while the schedule ran, not yet Read
 	shaping bool
 	err     error
+	// rdl and wdl are the caller's deadlines. While the schedule runs, Read
+	// and Write wait on cond, and the schedule's own reads on Conn run under
+	// shapingTimeout instead, so the caller's read deadline reaches Conn
+	// only once the schedule is done.
+	rdl, wdl time.Time
+	// grace and timeout are shapingGrace and shapingTimeout when the
+	// connection was made.
+	grace, timeout time.Duration
 	// wmu orders writes on Conn: the schedule's records, the flush of what
 	// was queued, then Writes once the schedule is done.
 	wmu sync.Mutex
 }
+
+// shapingTimeout bounds the whole schedule, so a peer that stops partway
+// can't hold the connection. A variable for tests.
+var shapingTimeout = 30 * time.Second
+
+// shapingScheduleOverride, when set, replaces the drawn schedule. For tests.
+var shapingScheduleOverride []int
 
 // shapingScheduled, when set, is told each schedule a shapedConn runs. For
 // tests.
@@ -159,13 +182,26 @@ func newShapedConn(conn net.Conn, sched []int, client bool, marker [shapingMarke
 		marker:     marker,
 		markerRead: markerRead,
 		shaping:    true,
+		grace:      shapingGrace,
+		timeout:    shapingTimeout,
 	}
 	c.cond = sync.NewCond(&c.mu)
 	go c.run()
 	return c
 }
 
+// shapingActive reports whether the schedule is still running. The lean
+// HTTP/2 writer doesn't batch while it is: a Write blocked on a full queue
+// inside a batch would hold back the schedule's own records, which batchConn
+// keeps behind the batch, and the schedule could then never free the queue.
+func (c *shapedConn) shapingActive() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.shaping
+}
+
 func (c *shapedConn) run() {
+	c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
 	err := c.runSchedule()
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
@@ -175,6 +211,8 @@ func (c *shapedConn) run() {
 	c.shaping = false
 	if err != nil {
 		c.err = err
+	} else {
+		c.Conn.SetReadDeadline(c.rdl)
 	}
 	c.cond.Broadcast()
 	c.mu.Unlock()
@@ -243,22 +281,38 @@ func (c *shapedConn) runSchedule() error {
 	return nil
 }
 
+// waitLocked waits on cond until it's signalled or deadline passes, and
+// reports false if deadline has passed. c.mu must be held.
+func (c *shapedConn) waitLocked(deadline time.Time) bool {
+	if deadline.IsZero() {
+		c.cond.Wait()
+		return true
+	}
+	d := time.Until(deadline)
+	if d <= 0 {
+		return false
+	}
+	expired := false
+	t := time.AfterFunc(d, func() {
+		c.mu.Lock()
+		expired = true
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	})
+	c.cond.Wait()
+	t.Stop()
+	return !expired || time.Now().Before(deadline)
+}
+
 // take returns up to n queued bytes, waiting up to shapingGrace for some if
 // none are queued.
 func (c *shapedConn) take(n int) []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.out) == 0 && c.err == nil {
-		t := time.AfterFunc(shapingGrace, func() {
-			c.mu.Lock()
-			c.cond.Broadcast()
-			c.mu.Unlock()
-		})
-		deadline := time.Now().Add(shapingGrace)
-		for len(c.out) == 0 && c.err == nil && time.Now().Before(deadline) {
-			c.cond.Wait()
+		deadline := time.Now().Add(c.grace)
+		for len(c.out) == 0 && c.err == nil && c.waitLocked(deadline) {
 		}
-		t.Stop()
 	}
 	n = min(n, len(c.out))
 	data := bytes.Clone(c.out[:n])
@@ -270,7 +324,10 @@ func (c *shapedConn) take(n int) []byte {
 func (c *shapedConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	for c.shaping && len(c.out)+len(b) > shapingMaxQueued && c.err == nil {
-		c.cond.Wait()
+		if !c.waitLocked(c.wdl) {
+			c.mu.Unlock()
+			return 0, os.ErrDeadlineExceeded
+		}
 	}
 	if c.err != nil {
 		err := c.err
@@ -295,7 +352,10 @@ func (c *shapedConn) Read(b []byte) (int, error) {
 	}
 	c.mu.Lock()
 	for len(c.in) == 0 && c.shaping && c.err == nil {
-		c.cond.Wait()
+		if !c.waitLocked(c.rdl) {
+			c.mu.Unlock()
+			return 0, os.ErrDeadlineExceeded
+		}
 	}
 	if len(c.in) > 0 {
 		n := copy(b, c.in)
@@ -309,6 +369,32 @@ func (c *shapedConn) Read(b []byte) (int, error) {
 		return 0, err
 	}
 	return c.Conn.Read(b)
+}
+
+func (c *shapedConn) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
+}
+
+func (c *shapedConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rdl = t
+	c.cond.Broadcast()
+	if c.shaping {
+		return nil
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *shapedConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.wdl = t
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	return c.Conn.SetWriteDeadline(t)
 }
 
 func (c *shapedConn) Close() error {

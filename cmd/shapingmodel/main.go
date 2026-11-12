@@ -50,33 +50,43 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	profile, err := decodeProfile(hist)
+	raw, err := build(hist, modelJSON, *positions, *keep)
 	if err != nil {
 		log.Fatal(err)
-	}
-	quantizers, err := decodeQuantizers(modelJSON, profile.markovOrder)
-	if err != nil {
-		log.Fatal(err)
-	}
-	if profile.markovOrder != 1 {
-		log.Fatalf("want a Markov order 1 model, got %d", profile.markovOrder)
-	}
-	n := min(*positions, len(profile.hists), len(quantizers))
-	var buf bytes.Buffer
-	buf.WriteString("SZSM")
-	buf.WriteByte(1) // format version
-	buf.WriteByte(byte(n))
-	for i := 0; i < n; i++ {
-		writePosition(&buf, i, profile.hists[i], quantizers[i], *keep)
 	}
 	var gz bytes.Buffer
 	zw, _ := gzip.NewWriterLevel(&gz, gzip.BestCompression)
-	zw.Write(buf.Bytes())
+	zw.Write(raw)
 	zw.Close()
 	if err := os.WriteFile(*out, gz.Bytes(), 0o644); err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("wrote %s: %d positions, %d bytes (%d before gzip)", *out, n, gz.Len(), buf.Len())
+	log.Printf("wrote %s: %d bytes (%d before gzip)", *out, gz.Len(), len(raw))
+}
+
+// build decodes a CenKL TrafficProfile and its model assumptions and
+// returns the model in samizdat's format, before gzip.
+func build(hist, modelJSON []byte, positions int, keep float64) ([]byte, error) {
+	profile, err := decodeProfile(hist)
+	if err != nil {
+		return nil, err
+	}
+	if profile.markovOrder != 1 {
+		return nil, fmt.Errorf("want a Markov order 1 model, got %d", profile.markovOrder)
+	}
+	quantizers, err := decodeQuantizers(modelJSON, profile.markovOrder)
+	if err != nil {
+		return nil, err
+	}
+	n := min(positions, len(profile.hists), len(quantizers))
+	var buf bytes.Buffer
+	buf.WriteString("SZSM")
+	buf.WriteByte(1) // format version
+	buf.WriteByte(byte(n))
+	for i := range n {
+		writePosition(&buf, i, profile.hists[i], quantizers[i], keep)
+	}
+	return buf.Bytes(), nil
 }
 
 // projection is a packet's quantized direction and size. dir is 1 for client
