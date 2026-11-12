@@ -569,6 +569,12 @@ func TestShapingParseRejectsBadBins(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := &m.positions[1]
+	lookup := p.lookup
+	p.lookup = nil
+	if p.validate() == nil {
+		t.Fatal("empty size lookup accepted")
+	}
+	p.lookup = lookup
 	p.fallback[0].outs[0].value = uint16(len(p.bins))
 	if p.validate() == nil {
 		t.Fatal("outcome past the last bin accepted")
