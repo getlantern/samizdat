@@ -217,6 +217,9 @@ func (p *shapingPosition) validate() error {
 	if p.exact {
 		return nil
 	}
+	if len(p.lookup) == 0 {
+		return errors.New("empty size lookup")
+	}
 	for _, b := range p.lookup {
 		if int(b) >= len(p.bins) {
 			return fmt.Errorf("lookup refers to bin %d of %d", b, len(p.bins))
