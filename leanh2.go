@@ -47,6 +47,7 @@ const (
 	leanMaxWriteBuffer    = 512 << 10
 	leanReadBuffer        = 32 << 10
 	leanFrameHeaderLen    = 9
+	leanMaxWindow         = 1<<31 - 1 // the largest a flow-control window may grow
 	// An idle connection keeps write buffers up to this size and drops larger
 	// ones, so thousands of idle connections don't each hold a burst's worth
 	// while a busy one reuses its buffers write after write.
@@ -250,6 +251,13 @@ func (c *leanConn) serve() {
 			return
 		}
 		if err := c.handleFrame(f); err != nil {
+			if errors.Is(err, errLeanProtocol) {
+				// x/net's server counts the stream of a frame that's a
+				// connection error toward the GOAWAY's last stream ID.
+				c.mu.Lock()
+				c.peekedStreamID = max(c.peekedStreamID, f.Header().StreamID)
+				c.mu.Unlock()
+			}
 			c.goAway(err)
 			return
 		}
@@ -278,7 +286,7 @@ func (c *leanConn) handleFrame(f http2.Frame) error {
 	case *http2.DataFrame:
 		return c.handleData(f)
 	case *http2.WindowUpdateFrame:
-		c.handleWindowUpdate(f)
+		return c.handleWindowUpdate(f)
 	case *http2.SettingsFrame:
 		return c.handleSettings(f)
 	case *http2.PingFrame:
@@ -292,6 +300,10 @@ func (c *leanConn) handleFrame(f http2.Frame) error {
 		}
 	case *http2.RSTStreamFrame:
 		c.mu.Lock()
+		if c.idleLocked(f.StreamID) {
+			c.mu.Unlock()
+			return errLeanProtocol
+		}
 		if st := c.streams[f.StreamID]; st != nil && !st.reset {
 			st.markResetLocked()
 			st.wakeLocked()
@@ -342,6 +354,11 @@ func (c *leanConn) handleSettings(f *http2.SettingsFrame) error {
 	}
 	if delta := c.peerInitWin - oldInitWin; delta != 0 {
 		for _, st := range c.streams {
+			if !st.reset && st.sendWin+delta > leanMaxWindow {
+				return errLeanFlow
+			}
+		}
+		for _, st := range c.streams {
 			st.sendWin += delta
 			st.cond.Broadcast()
 		}
@@ -350,18 +367,45 @@ func (c *leanConn) handleSettings(f *http2.SettingsFrame) error {
 	return c.queuedControlFrame()
 }
 
-func (c *leanConn) handleWindowUpdate(f *http2.WindowUpdateFrame) {
+// handleWindowUpdate adds credit. A window pushed past 2^31-1 is a
+// connection error for the connection's window and a stream error for a
+// stream's, as in x/net's server.
+func (c *leanConn) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	inc := int64(f.Increment)
 	if f.StreamID == 0 {
-		c.connSendWin += int64(f.Increment)
+		if c.connSendWin+inc > leanMaxWindow {
+			return errLeanFlow
+		}
+		c.connSendWin += inc
 		for _, st := range c.streams {
 			st.cond.Broadcast()
 		}
-	} else if st := c.streams[f.StreamID]; st != nil {
-		st.sendWin += int64(f.Increment)
-		st.cond.Broadcast()
+		return nil
 	}
+	if c.idleLocked(f.StreamID) {
+		return errLeanProtocol
+	}
+	st := c.streams[f.StreamID]
+	if st == nil || st.reset {
+		return nil
+	}
+	if st.sendWin+inc > leanMaxWindow {
+		c.resetStreamLocked(st, http2.ErrCodeFlowControl)
+		return c.queuedControlFrame()
+	}
+	st.sendWin += inc
+	st.cond.Broadcast()
+	return nil
+}
+
+// idleLocked reports whether the client hasn't opened stream id yet, so
+// that a frame other than HEADERS or PRIORITY on it is a connection error.
+// A HEADERS frame the framer failed to decode still opened its stream.
+// c.mu must be held.
+func (c *leanConn) idleLocked(id uint32) bool {
+	return id%2 == 0 || id > max(c.lastStreamID, c.peekedStreamID)
 }
 
 func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
@@ -383,7 +427,7 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		case st.remoteDone:
 			c.resetStreamLocked(st, http2.ErrCodeStreamClosed)
 			return c.queuedControlFrame()
-		case !f.StreamEnded():
+		case !f.StreamEnded(), len(f.PseudoFields()) > 0:
 			c.resetStreamLocked(st, http2.ErrCodeProtocol)
 			return c.queuedControlFrame()
 		}
@@ -454,17 +498,25 @@ func (c *leanConn) handleData(f *http2.DataFrame) error {
 	data := f.Data()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.idleLocked(f.StreamID) {
+		return errLeanProtocol
+	}
 	if n > c.connRecvAvail {
 		return errLeanFlow
 	}
 	c.connRecvAvail -= n
 	st := c.streams[f.StreamID]
 	if st == nil || st.remoteDone || st.reset {
-		// The client spent connection window on a stream that's gone; give
-		// it back.
+		// The client spent connection window on a stream it can't send on;
+		// give it back. A stream it already ended, or one that's gone, gets
+		// STREAM_CLOSED, as from x/net's server; a reset one has its answer.
 		c.creditConn(n)
-		if st == nil && f.StreamID <= c.lastStreamID {
+		switch {
+		case st == nil:
 			c.wbuf = appendRSTStream(c.wbuf, f.StreamID, http2.ErrCodeStreamClosed)
+			return c.queuedControlFrame()
+		case !st.reset:
+			c.resetStreamLocked(st, http2.ErrCodeStreamClosed)
 			return c.queuedControlFrame()
 		}
 		return nil
@@ -767,11 +819,13 @@ func (st *leanStream) run(method, authority, scheme, path string, truncated bool
 			c.mu.Unlock()
 		}
 	}()
+	// A response to HEAD has the headers a GET would get and no body.
+	head := method == http.MethodHead
 	if truncated {
 		// The header list passed MaxHeaderListSize; x/net's server answers
 		// 431 without calling the handler (handleHeaderListTooLong).
 		st.reply(http.StatusRequestHeaderFieldsTooLarge, "text/html; charset=utf-8", false,
-			"<h1>HTTP Error 431</h1><p>Request Header Field(s) Too Large</p>")
+			"<h1>HTTP Error 431</h1><p>Request Header Field(s) Too Large</p>", head)
 		return
 	}
 	// x/net's server rejects a malformed request with RST_STREAM before any
@@ -790,10 +844,10 @@ func (st *leanStream) run(method, authority, scheme, path string, truncated bool
 		return
 	}
 	if !connect {
-		st.replyError(http.StatusMethodNotAllowed, "Method not allowed")
+		st.replyError(http.StatusMethodNotAllowed, "Method not allowed", head)
 		return
 	}
-	if err := st.writeHeaders(http.StatusOK, nil); err != nil {
+	if err := st.writeHeaders(http.StatusOK, nil, false); err != nil {
 		return
 	}
 
@@ -895,10 +949,17 @@ func (st *leanStream) endLocked(body []byte) {
 			break
 		}
 	}
+	st.resetIfOpenLocked()
+}
+
+// resetIfOpenLocked sends RST_STREAM(NO_ERROR) once the response has ended
+// if the client hasn't ended its side, as x/net's server does. c.mu must be
+// held.
+func (st *leanStream) resetIfOpenLocked() {
 	if !st.remoteDone {
-		c.wbuf = appendRSTStream(c.wbuf, st.id, http2.ErrCodeNo)
+		st.c.wbuf = appendRSTStream(st.c.wbuf, st.id, http2.ErrCodeNo)
 		st.markResetLocked()
-		c.queued()
+		st.c.queued()
 	}
 }
 
@@ -926,28 +987,33 @@ func (st *leanStream) finish() {
 }
 
 // replyError answers with msg as http.Error writes it.
-func (st *leanStream) replyError(status int, msg string) {
-	st.reply(status, "text/plain; charset=utf-8", true, msg+"\n")
+func (st *leanStream) replyError(status int, msg string, head bool) {
+	st.reply(status, "text/plain; charset=utf-8", true, msg+"\n", head)
 }
 
-// reply answers with body and the headers net/http adds for it.
-func (st *leanStream) reply(status int, contentType string, nosniff bool, body string) {
+// reply answers with body and the headers net/http adds for it. A HEAD
+// response keeps the headers, Content-Length included, and ends with them.
+func (st *leanStream) reply(status int, contentType string, nosniff bool, body string, head bool) {
 	hdrs := []hpack.HeaderField{{Name: "content-type", Value: contentType}}
 	if nosniff {
 		hdrs = append(hdrs, hpack.HeaderField{Name: "x-content-type-options", Value: "nosniff"})
 	}
 	hdrs = append(hdrs, hpack.HeaderField{Name: "content-length", Value: strconv.Itoa(len(body))})
-	if err := st.writeHeaders(status, hdrs); err != nil {
+	if err := st.writeHeaders(status, hdrs, head); err != nil {
 		return
 	}
 	st.c.mu.Lock()
 	defer st.c.mu.Unlock() // deferred, so run's recover can take c.mu
+	if head {
+		st.resetIfOpenLocked()
+		return
+	}
 	st.endLocked([]byte(body))
 }
 
 // writeHeaders sends response HEADERS with :status, extra and date, the
-// fields x/net's server sends for these responses.
-func (st *leanStream) writeHeaders(status int, extra []hpack.HeaderField) error {
+// fields x/net's server sends for these responses, ending the stream if end.
+func (st *leanStream) writeHeaders(status int, extra []hpack.HeaderField, end bool) error {
 	c := st.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -961,7 +1027,11 @@ func (st *leanStream) writeHeaders(status int, extra []hpack.HeaderField) error 
 	}
 	c.hpackEnc.WriteField(hpack.HeaderField{Name: "date", Value: time.Now().UTC().Format(http.TimeFormat)})
 	block := c.hpackBuf.Bytes()
-	c.wbuf = appendFrameHeader(c.wbuf, len(block), http2.FrameHeaders, http2.FlagHeadersEndHeaders, st.id)
+	flags := http2.FlagHeadersEndHeaders
+	if end {
+		flags |= http2.FlagHeadersEndStream
+	}
+	c.wbuf = appendFrameHeader(c.wbuf, len(block), http2.FrameHeaders, flags, st.id)
 	c.wbuf = append(c.wbuf, block...)
 	c.queued()
 	return nil
