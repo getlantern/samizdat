@@ -3,6 +3,7 @@ package samizdat
 import (
 	"hash/maphash"
 	"log"
+	"math"
 	"math/bits"
 	"sync"
 	"time"
@@ -111,6 +112,10 @@ func (f *replayFilter) rotate() {
 	f.prev = f.cur
 	f.cur = newFingerprintSet(f.capacity)
 }
+
+// maxReplayCapacity is the largest ReplayCapacity whose table size,
+// capacity + capacity/3 + 1, still fits in an int.
+const maxReplayCapacity = math.MaxInt / 4 * 3
 
 // fingerprintSetMinSlots is the size a fingerprintSet starts at.
 const fingerprintSetMinSlots = 64
