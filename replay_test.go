@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"hash/maphash"
 	"log"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -153,6 +154,21 @@ func TestServerReplayConfig(t *testing.T) {
 	c.ReplayCapacity = -1
 	if _, err := NewServer(c); err == nil {
 		t.Fatal("negative ReplayCapacity accepted")
+	}
+
+	// Past maxReplayCapacity the table size overflows int, and make would
+	// panic in NewServer.
+	c = base
+	c.ReplayCapacity = math.MaxInt
+	if _, err := NewServer(c); err == nil {
+		t.Fatal("ReplayCapacity of math.MaxInt accepted")
+	}
+	c.ReplayCapacity = maxReplayCapacity
+	if s, err = NewServer(c); err != nil {
+		t.Fatalf("ReplayCapacity of maxReplayCapacity refused: %v", err)
+	}
+	if n := s.replay.cur.maxSlots; n <= 0 {
+		t.Fatalf("maxReplayCapacity gives a table limit of %d slots", n)
 	}
 }
 
