@@ -108,6 +108,11 @@ func NewServer(config ServerConfig) (*Server, error) {
 			Certificates: []tls.Certificate{cert},
 			NextProtos:   []string{"h2"},
 			MinVersion:   tls.VersionTLS13,
+			// Go's dynamic record sizing grows a connection's early records
+			// in steps of one assumed 1208-byte segment, a pattern no
+			// mainstream TLS server produces. Full-size records, as nginx
+			// sends by default, leave segmentation to TCP.
+			DynamicRecordSizingDisabled: true,
 		}, nil
 	})
 
