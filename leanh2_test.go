@@ -35,7 +35,7 @@ type h2Peer struct {
 
 // startH2Pair serves one connection with the chosen implementation and
 // returns a client connected to it.
-func startH2Pair(t *testing.T, lean bool, handler ConnHandler) *h2Peer {
+func startH2Pair(t *testing.T, lean bool, handler ConnHandler, serverConn ...func(*net.TCPConn)) *h2Peer {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -51,6 +51,11 @@ func startH2Pair(t *testing.T, lean bool, handler ConnHandler) *h2Peer {
 			return
 		}
 		defer conn.Close()
+		if tc, ok := conn.(*net.TCPConn); ok {
+			for _, f := range serverConn {
+				f(tc)
+			}
+		}
 		if lean {
 			bc := &batchConn{Conn: conn}
 			s.serveLeanH2(bc, bc, conn, [8]byte{})
@@ -439,10 +444,19 @@ func TestLeanH2ManyStreams(t *testing.T) {
 // server, which must end the connection past leanMaxQueuedControl rather
 // than queue them without bound.
 func TestLeanH2ClosesOnControlFrameFlood(t *testing.T) {
-	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {})
+	// Small socket buffers on both ends, so the answers back up into the
+	// server quickly even on a slow machine.
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {},
+		func(c *net.TCPConn) { c.SetWriteBuffer(16 << 10) })
 	p.handshake(t)
 	if tc, ok := p.conn.(*net.TCPConn); ok {
-		tc.SetReadBuffer(16 << 10) // fill quickly
+		tc.SetReadBuffer(16 << 10)
+	}
+	// PINGs go out a thousand to a write.
+	var pings bytes.Buffer
+	fr := http2.NewFramer(&pings, nil)
+	for i := 0; i < 1000; i++ {
+		fr.WritePing(false, [8]byte{})
 	}
 	stop := make(chan struct{})
 	defer close(stop)
@@ -453,7 +467,7 @@ func TestLeanH2ClosesOnControlFrameFlood(t *testing.T) {
 				return
 			default:
 			}
-			if p.fr.WritePing(false, [8]byte{}) != nil {
+			if _, err := p.conn.Write(pings.Bytes()); err != nil {
 				return
 			}
 		}
