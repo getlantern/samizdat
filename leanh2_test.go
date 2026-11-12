@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -475,7 +476,8 @@ func TestLeanH2ClosesOnControlFrameFlood(t *testing.T) {
 	select {
 	case <-p.served:
 	case <-time.After(30 * time.Second):
-		t.Fatal("server kept the connection open under a PING flood")
+		buf := make([]byte, 1<<20)
+		t.Fatalf("server kept the connection open under a PING flood; goroutines:\n%s", buf[:runtime.Stack(buf, true)])
 	}
 }
 
