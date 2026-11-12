@@ -357,8 +357,8 @@ func (c *Client) applyAuthV2(uConn *utls.UConn) error {
 	if err != nil {
 		return err
 	}
-	// Written into the marshaled ClientHello in place: marshaling again
-	// would leave the additional data the SessionID was sealed over.
+	// Written into the marshaled bytes in place, which are what uTLS sends:
+	// the SessionID was sealed over exactly these bytes with it zeroed.
 	copy(raw[sessionIDOffset:], sid[:])
 	hs.Hello.SessionId = sid[:]
 	return nil
