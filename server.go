@@ -77,6 +77,13 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if config.MaxClockSkew < 0 {
 		return nil, fmt.Errorf("MaxClockSkew must not be negative, got %v", config.MaxClockSkew)
 	}
+	if config.ReplayWindow > 0 && config.ReplayWindow < 2*config.MaxClockSkew {
+		// A version 2 ClientHello sent again unchanged authenticates for up
+		// to twice MaxClockSkew after its first use (a client whose clock
+		// runs ahead by MaxClockSkew), and only the replay filter refuses it.
+		return nil, fmt.Errorf("ReplayWindow (%v) must be at least twice MaxClockSkew (%v), or negative",
+			config.ReplayWindow, config.MaxClockSkew)
+	}
 	if config.ReplayCapacity < 0 || config.ReplayCapacity > maxReplayCapacity {
 		return nil, fmt.Errorf("ReplayCapacity must be between 0 and %d, got %d", maxReplayCapacity, config.ReplayCapacity)
 	}
@@ -338,7 +345,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}
 
 	// Version 2 auth, then version 1 for older clients (authv2.go).
-	shortID, authenticated := AuthenticateClientHello(handshakeMsg, s.config.PrivateKey, *s.shortIDs.Load(), s.config.MaxClockSkew)
+	shortID, authenticated := authenticateClientHello(handshakeMsg, s.config.PrivateKey, s.serverPubKey,
+		*s.shortIDs.Load(), s.config.MaxClockSkew, s.config.RequireAuthV2)
 	if !authenticated {
 		// Auth failed — enter masquerade mode
 		s.doMasquerade(conn, clientHelloRecord)

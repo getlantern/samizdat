@@ -266,3 +266,132 @@ func TestNewServerRejectsNegativeClockSkew(t *testing.T) {
 		t.Fatal("negative MaxClockSkew accepted")
 	}
 }
+
+// TestAuthenticateClientHelloZeroSkew: a caller that leaves maxSkew zero gets
+// the default, as ServerConfig's zero value does, not a tolerance of nothing.
+func TestAuthenticateClientHelloZeroSkew(t *testing.T) {
+	serverPriv, serverPub, _ := GenerateKeyPair()
+	id, _ := GenerateShortID()
+	clientKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	now := time.Unix(1_800_000_000, 0)
+	hello := buildTestHello(t, map[uint16][]byte{groupX25519: clientKey.PublicKey().Bytes()})
+	msg := sealTestHello(t, hello, clientKey, serverPub, id, now)
+
+	old := authNow
+	defer func() { authNow = old }()
+	authNow = func() time.Time { return now.Add(time.Hour) }
+	if got, ok := AuthenticateClientHello(msg, serverPriv, [][8]byte{id}, 0); !ok || got != id {
+		t.Fatal("zero maxSkew refused a SessionID an hour old")
+	}
+	authNow = func() time.Time { return now.Add(DefaultMaxClockSkew + time.Hour) }
+	if _, ok := AuthenticateClientHello(msg, serverPriv, [][8]byte{id}, 0); ok {
+		t.Fatal("zero maxSkew accepted a SessionID past the default skew")
+	}
+}
+
+// TestRequireAuthV2: with v2Only, a version 1 SessionID is refused and a
+// version 2 one still authenticates.
+func TestRequireAuthV2(t *testing.T) {
+	serverPriv, serverPub, _ := GenerateKeyPair()
+	id, _ := GenerateShortID()
+	ids := [][8]byte{id}
+	now := authNow()
+
+	sid, err := BuildSessionID(serverPub, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1 := buildTestHello(t, map[uint16][]byte{groupX25519: make([]byte, 32)})
+	copy(v1[sessionIDOffset:], sid[:])
+	if _, ok := authenticateClientHello(v1, serverPriv, serverPub, ids, DefaultMaxClockSkew, false); !ok {
+		t.Fatal("version 1 refused by a server that accepts it")
+	}
+	if _, ok := authenticateClientHello(v1, serverPriv, serverPub, ids, DefaultMaxClockSkew, true); ok {
+		t.Fatal("version 1 accepted with RequireAuthV2")
+	}
+
+	clientKey, _ := ecdh.X25519().GenerateKey(rand.Reader)
+	hello := buildTestHello(t, map[uint16][]byte{groupX25519: clientKey.PublicKey().Bytes()})
+	v2 := sealTestHello(t, hello, clientKey, serverPub, id, now)
+	if got, ok := authenticateClientHello(v2, serverPriv, serverPub, ids, DefaultMaxClockSkew, true); !ok || got != id {
+		t.Fatal("version 2 refused with RequireAuthV2")
+	}
+}
+
+// TestRequireAuthV2EndToEnd: a server with RequireAuthV2 serves a version 2
+// client and not a version 1 one.
+func TestRequireAuthV2EndToEnd(t *testing.T) {
+	if testLegacyClients {
+		t.Skip("every client sends version 1 in this mode")
+	}
+	for _, legacy := range []bool{false, true} {
+		priv, pub, _ := GenerateKeyPair()
+		id, _ := GenerateShortID()
+		certPEM, keyPEM := generateSelfSignedCert(t)
+		_, ln := startTestServer(t, ServerConfig{
+			ListenAddr:    "127.0.0.1:0",
+			PrivateKey:    priv,
+			ShortIDs:      [][8]byte{id},
+			CertPEM:       certPEM,
+			KeyPEM:        keyPEM,
+			RequireAuthV2: true,
+			Handler: func(ctx context.Context, conn net.Conn, dest string) {
+				defer conn.Close()
+				io.Copy(conn, conn)
+			},
+		})
+		client, err := NewClient(ClientConfig{
+			PublicKey:  pub,
+			ShortID:    id,
+			ServerAddr: ln.Addr().String(),
+			ServerName: "example.com",
+			LegacyAuth: legacy,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		conn, err := client.DialContext(ctx, "tcp", "example.com:443")
+		if err == nil {
+			conn.Close()
+		}
+		cancel()
+		client.Close()
+		if legacy && err == nil {
+			t.Error("version 1 client served by a server with RequireAuthV2")
+		}
+		if !legacy && err != nil {
+			t.Errorf("version 2 client refused by a server with RequireAuthV2: %v", err)
+		}
+	}
+}
+
+// TestReplayWindowCoversClockSkew: the replay filter has to remember a
+// version 2 ClientHello for as long as it stays valid, so MaxClockSkew
+// defaults to no more than half of ReplayWindow and an explicit one past
+// that is refused. With the filter off, any skew is allowed.
+func TestReplayWindowCoversClockSkew(t *testing.T) {
+	priv, _, _ := GenerateKeyPair()
+	base := ServerConfig{
+		PrivateKey: priv,
+		ShortIDs:   [][8]byte{{1}},
+		Handler:    func(ctx context.Context, conn net.Conn, dest string) {},
+	}
+	c := base
+	if s, err := NewServer(c); err != nil || s.config.MaxClockSkew != DefaultMaxClockSkew {
+		t.Fatalf("defaults: %v", err)
+	}
+	c = base
+	c.ReplayWindow = 2 * time.Hour
+	if s, err := NewServer(c); err != nil || s.config.MaxClockSkew != time.Hour {
+		t.Fatalf("ReplayWindow of 2h: err %v, want a MaxClockSkew of 1h", err)
+	}
+	c.MaxClockSkew = 90 * time.Minute
+	if _, err := NewServer(c); err == nil {
+		t.Fatal("a ReplayWindow shorter than twice MaxClockSkew was accepted")
+	}
+	c.ReplayWindow = -1
+	if _, err := NewServer(c); err != nil {
+		t.Fatalf("replay protection off: %v", err)
+	}
+}
