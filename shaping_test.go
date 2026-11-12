@@ -603,3 +603,69 @@ func TestShapingParseRejectsMissingFirstRow(t *testing.T) {
 		t.Fatal("model without a first row accepted")
 	}
 }
+
+// TestShapingMarkerBindsSchedule: the marker depends on the schedule as well
+// as the keying material, so a client that drew a different schedule from
+// the server's, from another version of the model, isn't taken for a shaping
+// client and misread record by record.
+func TestShapingMarkerBindsSchedule(t *testing.T) {
+	secret := []byte("12345678")
+	a := []int{100, -200, 300}
+	if shapingMarker(secret, a) != shapingMarker(secret, slices.Clone(a)) {
+		t.Fatal("same schedule, different markers")
+	}
+	for _, b := range [][]int{{100, -200, 301}, {100, 200, 300}, {100, -200}, {100, -200, 300, 40}} {
+		if shapingMarker(secret, a) == shapingMarker(secret, b) {
+			t.Errorf("schedules %v and %v share a marker", a, b)
+		}
+	}
+	if shapingMarker(secret, a) == shapingMarker([]byte("87654321"), a) {
+		t.Error("different keying material, same marker")
+	}
+
+	// The same keying material under two models gives two markers.
+	_, withModel, err := shapingSchedule(fixedEKM(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	shapingScheduleOverride = []int{100, -200, 300}
+	defer func() { shapingScheduleOverride = nil }()
+	_, withOther, err := shapingSchedule(fixedEKM(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withModel == withOther {
+		t.Fatal("two schedules from the same keying material share a marker")
+	}
+}
+
+// TestShapingServerSendsNoSessionTickets: a ticket would be a record of the
+// server's ahead of the schedule's first, so a server that accepts shaping
+// sends none; one that doesn't is unchanged.
+func TestShapingServerSendsNoSessionTickets(t *testing.T) {
+	for _, disable := range []bool{false, true} {
+		priv, _, err := GenerateKeyPair()
+		if err != nil {
+			t.Fatal(err)
+		}
+		certPEM, keyPEM := generateSelfSignedCert(t)
+		s, err := NewServer(ServerConfig{
+			PrivateKey:     priv,
+			ShortIDs:       [][8]byte{{1}},
+			CertPEM:        certPEM,
+			KeyPEM:         keyPEM,
+			Handler:        func(ctx context.Context, conn net.Conn, dest string) {},
+			DisableShaping: disable,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := s.tlsConfig()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.SessionTicketsDisabled == disable {
+			t.Errorf("DisableShaping=%v: SessionTicketsDisabled=%v", disable, cfg.SessionTicketsDisabled)
+		}
+	}
+}

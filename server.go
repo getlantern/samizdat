@@ -114,6 +114,13 @@ func NewServer(config ServerConfig) (*Server, error) {
 			// produces. Full-size records, as nginx sends by default, leave
 			// segmentation to TCP.
 			DynamicRecordSizingDisabled: true,
+			// A session ticket is a record of the server's, of a fixed
+			// size, sent as the handshake ends: ahead of the first record
+			// of a shaped connection's schedule, which is meant to be the
+			// connection's first. Samizdat's client keeps no session cache
+			// and never resumes, so today the ticket carries nothing; if
+			// resumption is added, shaping has to account for this record.
+			SessionTicketsDisabled: !config.DisableShaping && config.SessionHandler == nil,
 		}, nil
 	})
 
