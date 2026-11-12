@@ -1,13 +1,19 @@
 package samizdat
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/pem"
+	"hash/maphash"
+	"log"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -370,4 +376,102 @@ func leafOf(t *testing.T, certPEM []byte) *x509.Certificate {
 		t.Fatal(err)
 	}
 	return leaf
+}
+
+// TestFingerprintSetGrowsWithUse: a set starts small, whatever its capacity,
+// grows as it fills without losing a fingerprint, and never passes the size
+// its capacity allows.
+func TestFingerprintSetGrowsWithUse(t *testing.T) {
+	const capacity = 100_000
+	s := newFingerprintSet(capacity)
+	if len(s.slots) != fingerprintSetMinSlots {
+		t.Fatalf("starts with %d slots, want %d", len(s.slots), fingerprintSetMinSlots)
+	}
+	seed := maphash.MakeSeed()
+	fp := func(i int) uint64 { return maphash.String(seed, strconv.Itoa(i)) | 1 }
+	for i := range capacity {
+		s.add(fp(i))
+		if 4*s.n > 3*len(s.slots) {
+			t.Fatalf("%d fingerprints in %d slots: more than three quarters full", s.n, len(s.slots))
+		}
+	}
+	if s.n != capacity {
+		t.Fatalf("holds %d, want %d", s.n, capacity)
+	}
+	if len(s.slots) > s.maxSlots {
+		t.Fatalf("grew to %d slots, past its limit of %d", len(s.slots), s.maxSlots)
+	}
+	for i := range capacity {
+		if !s.has(fp(i)) {
+			t.Fatalf("lost fingerprint %d", i)
+		}
+	}
+	if s.has(fp(capacity)) {
+		t.Fatal("found a fingerprint never added")
+	}
+}
+
+// TestReplayFilterMemoryFollowsLoad: a filter with a large capacity and few
+// SessionIDs holds small tables, through rotations too, and a rotation with
+// nothing in the current generation allocates none.
+func TestReplayFilterMemoryFollowsLoad(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	f := newReplayFilter(time.Hour, 1_000_000)
+	f.now = func() time.Time { return now }
+	f.rotatedAt = now
+	for i := range 10 {
+		f.seen([]byte(strconv.Itoa(i)))
+	}
+	now = now.Add(time.Hour)
+	f.seen([]byte("next window"))
+	if len(f.cur.slots) != fingerprintSetMinSlots || len(f.prev.slots) != fingerprintSetMinSlots {
+		t.Fatalf("tables of %d and %d slots for 11 SessionIDs", len(f.cur.slots), len(f.prev.slots))
+	}
+	// Two windows on, both generations are forgotten and the filter holds
+	// one small table again.
+	now = now.Add(2 * time.Hour)
+	if f.seen([]byte("next window")) {
+		t.Fatal("SessionID still remembered two windows later")
+	}
+	if f.prev != nil || f.cur.n != 1 {
+		t.Fatalf("after an idle period: prev=%v, cur holds %d", f.prev, f.cur.n)
+	}
+	// A window with nothing new drops the older generation and keeps the
+	// empty current one.
+	f.cur.reset()
+	f.prev = newFingerprintSet(f.capacity)
+	cur := f.cur
+	f.mu.Lock()
+	f.rotate()
+	f.mu.Unlock()
+	if f.prev != nil || f.cur != cur {
+		t.Fatal("rotating an empty generation allocated a new one or kept the old")
+	}
+}
+
+// TestReplayFilterLogsEarlyRotation: rotating early because ReplayCapacity
+// was reached shortens retention, so it is logged; a rotation on time is not.
+func TestReplayFilterLogsEarlyRotation(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	now := time.Unix(1_700_000_000, 0)
+	f := newReplayFilter(time.Hour, 3)
+	f.now = func() time.Time { return now }
+	f.rotatedAt = now
+	for i := range 3 {
+		f.seen([]byte(strconv.Itoa(i)))
+	}
+	now = now.Add(time.Hour)
+	f.seen([]byte("on time"))
+	if buf.Len() != 0 {
+		t.Fatalf("a rotation on time logged: %s", buf.String())
+	}
+	f.seen([]byte("a"))
+	f.seen([]byte("b"))
+	f.seen([]byte("over capacity"))
+	if !strings.Contains(buf.String(), "ReplayCapacity") {
+		t.Fatalf("early rotation was not logged; log: %q", buf.String())
+	}
 }

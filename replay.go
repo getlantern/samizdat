@@ -2,6 +2,7 @@ package samizdat
 
 import (
 	"hash/maphash"
+	"log"
 	"math/bits"
 	"sync"
 	"time"
@@ -25,8 +26,12 @@ import (
 // generation stores a keyed 63-bit fingerprint of every SessionID exactly,
 // not a Bloom filter: a fresh SessionID matches one of n stored by chance
 // with probability about n/2^63, around 2e-13 when both generations hold a
-// million. Memory is about 10.7 bytes per capacity entry per generation,
-// whatever the load.
+// million. A generation grows with the SessionIDs it holds, to at most
+// about 10.7 bytes per capacity entry.
+//
+// The filter belongs to one Server and lives in memory: a restart, a Server
+// created anew, or another server using the same key pair has not seen the
+// SessionIDs this one has, and accepts a copy of them.
 type replayFilter struct {
 	mu        sync.Mutex
 	window    time.Duration
@@ -56,50 +61,84 @@ func (f *replayFilter) seen(key []byte) bool {
 	fp := maphash.Bytes(f.seed, key) | 1
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	now := f.now()
 	if elapsed := now.Sub(f.rotatedAt); elapsed >= f.window {
 		// After two windows with no lookup, cur is as old as prev would be
 		// and goes too.
-		f.rotate()
 		if elapsed >= 2*f.window {
-			f.prev = nil
+			f.cur.reset()
 		}
+		f.rotate()
 		// A rotation on time stays on the window's boundary, however late
 		// the lookup that triggers it, so nothing outlives two windows.
 		f.rotatedAt = now.Add(-(elapsed % f.window))
 	}
 
 	if f.cur.has(fp) || (f.prev != nil && f.prev.has(fp)) {
+		f.mu.Unlock()
 		return true
 	}
 
 	// Rotating for capacity only to make room for a new key, after the
 	// lookup, so a repeat can't push its own generation out first.
+	var early time.Duration
 	if f.cur.n >= f.capacity {
+		early = max(now.Sub(f.rotatedAt), 1)
 		f.rotate()
 		f.rotatedAt = now
 	}
 	f.cur.add(fp)
+	f.mu.Unlock()
+
+	if early > 0 {
+		// Retention is now shorter than the operator asked for, which
+		// nothing else would show.
+		log.Printf("[samizdat] replay filter: %d SessionIDs authenticated in %v, within ReplayWindow (%v); "+
+			"they are remembered for less than ReplayWindow until the load drops or ReplayCapacity is raised",
+			f.capacity, early.Round(time.Second), f.window)
+	}
 	return false
 }
 
+// rotate drops the older generation and starts a new current one. An empty
+// current generation is kept as it is, since there is nothing in it to age.
 func (f *replayFilter) rotate() {
+	if f.cur.n == 0 {
+		f.prev = nil
+		return
+	}
 	f.prev = f.cur
 	f.cur = newFingerprintSet(f.capacity)
 }
 
+// fingerprintSetMinSlots is the size a fingerprintSet starts at.
+const fingerprintSetMinSlots = 64
+
 // fingerprintSet is an open-addressing hash set of nonzero uint64s with
-// linear probing. It holds at most the capacity it was made for, which
-// keeps it at most three quarters full.
+// linear probing. It starts small and doubles as it fills, up to the size
+// that holds the capacity it was made for at most three quarters full, so
+// its memory follows what it holds and not what it could.
 type fingerprintSet struct {
-	slots []uint64
-	n     int
+	slots    []uint64
+	n        int
+	maxSlots int
 }
 
 func newFingerprintSet(capacity int) *fingerprintSet {
-	return &fingerprintSet{slots: make([]uint64, capacity+capacity/3+1)}
+	maxSlots := capacity + capacity/3 + 1
+	return &fingerprintSet{
+		slots:    make([]uint64, min(maxSlots, fingerprintSetMinSlots)),
+		maxSlots: maxSlots,
+	}
+}
+
+// reset empties the set.
+func (s *fingerprintSet) reset() {
+	if s.n > 0 {
+		s.slots = make([]uint64, min(s.maxSlots, fingerprintSetMinSlots))
+		s.n = 0
+	}
 }
 
 // find returns the slot holding fp, or the empty slot where it belongs.
@@ -120,9 +159,29 @@ func (s *fingerprintSet) has(fp uint64) bool {
 	return s.slots[s.find(fp)] == fp
 }
 
+// add puts fp in the set. The caller keeps the set within its capacity,
+// which is what leaves find an empty slot to stop at.
 func (s *fingerprintSet) add(fp uint64) {
-	if i := s.find(fp); s.slots[i] == 0 {
-		s.slots[i] = fp
-		s.n++
+	i := s.find(fp)
+	if s.slots[i] != 0 {
+		return
+	}
+	if 4*(s.n+1) > 3*len(s.slots) && len(s.slots) < s.maxSlots {
+		s.grow()
+		i = s.find(fp)
+	}
+	s.slots[i] = fp
+	s.n++
+}
+
+// grow doubles the table, up to maxSlots, and puts every fingerprint in its
+// new place.
+func (s *fingerprintSet) grow() {
+	old := s.slots
+	s.slots = make([]uint64, min(2*len(old), s.maxSlots))
+	for _, fp := range old {
+		if fp != 0 {
+			s.slots[s.find(fp)] = fp
+		}
 	}
 }

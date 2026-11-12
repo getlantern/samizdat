@@ -118,13 +118,16 @@ type ServerConfig struct {
 	// SessionID and refuses it again, sending the connection to the
 	// masquerade as if auth had failed. Each is remembered for between
 	// ReplayWindow and twice that (default: 24h). Negative turns replay
-	// protection off.
+	// protection off. The record is this Server's alone and is kept in
+	// memory: a restarted or newly created Server, or another one using the
+	// same key pair, accepts a SessionID this one has seen.
 	ReplayWindow time.Duration
 	// ReplayCapacity is how many SessionIDs one ReplayWindow holds before
 	// the server starts a new one early, which shortens how long each is
-	// remembered under heavy load. Memory is about 10.7 bytes per entry per
-	// generation, two generations once the first window has passed
-	// (default: 1,000,000, about 21 MB in all).
+	// remembered under heavy load; the server logs when that happens. Memory
+	// grows with the SessionIDs remembered, to at most about 10.7 bytes per
+	// entry per generation, two generations once the first window has
+	// passed (default: 1,000,000, at most about 21 MB in all).
 	ReplayCapacity int
 
 	// LeanH2 serves tunnels with samizdat's own HTTP/2 server instead of
