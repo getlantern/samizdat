@@ -79,16 +79,10 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 	return t, nil
 }
 
-// openTunnel issues an HTTP/2 CONNECT request to open a tunnel to the
-// destination through the proxy server. Returns a net.Conn backed by the
-// H2 stream.
-func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.Conn, error) {
-	t.activeStreams.Add(1)
-	return t.openReserved(ctx, destination)
-}
-
-// openReserved is openTunnel for a stream slot already reserved, by
-// tryReserve or the pool creating the transport. The slot is released on
+// openReserved issues an HTTP/2 CONNECT request to open a tunnel to the
+// destination through the proxy server, and returns a net.Conn backed by the
+// H2 stream. The caller must hold a stream slot for it, reserved by
+// tryReserve or by the pool creating the transport. The slot is released on
 // every path that doesn't produce a tunnel.
 func (t *h2Transport) openReserved(ctx context.Context, destination string) (net.Conn, error) {
 	// The stream has counted since its slot was reserved, not from the
@@ -97,7 +91,7 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	opened := false
 	defer func() {
 		if !opened {
-			t.releaseStream()
+			t.releaseReserved()
 		}
 	}()
 
@@ -203,11 +197,6 @@ func connFatal(err error) bool {
 		errors.Is(err, syscall.EPIPE)
 }
 
-// hasCapacity returns true if the transport can accept more streams.
-func (t *h2Transport) hasCapacity() bool {
-	return !t.retired.Load() && int(t.activeStreams.Load()) < t.maxStreams
-}
-
 // tryReserve takes a stream slot if the transport has one, atomically, so
 // callers choosing a transport at once can't overbook it.
 func (t *h2Transport) tryReserve() bool {
@@ -222,12 +211,20 @@ func (t *h2Transport) tryReserve() bool {
 	}
 }
 
-// releaseStream ends one of the transport's streams, open or still opening,
-// and closes a retired transport once none is left.
+// releaseStream ends one of the transport's open streams, and closes a
+// retired transport once none is left.
 func (t *h2Transport) releaseStream() {
 	// The timestamp is stored before the count can reach zero, so cleanup
 	// never sees an idle transport with a stale one.
 	t.idleSince.Store(time.Now().UnixNano())
+	t.releaseReserved()
+}
+
+// releaseReserved gives back a stream slot whose CONNECT produced no tunnel,
+// and closes a retired transport once no stream is left. Unlike a stream
+// ending, it leaves idleSince alone: a transport whose CONNECTs keep failing
+// carried nothing, and must still idle out.
+func (t *h2Transport) releaseReserved() {
 	if t.activeStreams.Add(-1) == 0 && t.retired.Load() {
 		t.close()
 	}

@@ -1161,3 +1161,10 @@ func TestClosingLastStreamRestartsIdleClock(t *testing.T) {
 		t.Error("a transport whose last stream just closed was retired at once")
 	}
 }
+
+// openTunnel reserves a stream slot on t and opens a tunnel on it, as
+// DialContext does through the pool.
+func (t *h2Transport) openTunnel(ctx context.Context, destination string) (net.Conn, error) {
+	t.activeStreams.Add(1)
+	return t.openReserved(ctx, destination)
+}

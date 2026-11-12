@@ -58,7 +58,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 }
 
 // maxDialAttempts caps DialContext's redials after a conn-fatal failure. Each
-// conn-fatal openTunnel retires its dead transport, so a retry gets a fresh one;
+// conn-fatal openReserved retires its dead transport, so a retry gets a fresh one;
 // the cap bounds the reconnect burst when the server is genuinely unreachable.
 const maxDialAttempts = 3
 

@@ -61,7 +61,11 @@ type ClientConfig struct {
 	RecordFragmentation bool // fragment inner TLS records across H2 DATA frames (default: true)
 
 	// Connection management
-	MaxStreamsPerConn int           // max H2 streams per TCP conn (default: 100)
+	// MaxStreamsPerConn is the most H2 streams the client opens per TCP
+	// conn (default: 100). It must not exceed the server's
+	// MaxConcurrentStreams (default: 250): a tunnel past the server's limit
+	// waits for a stream to end rather than opening on a new connection.
+	MaxStreamsPerConn int
 	IdleTimeout      time.Duration // close idle connections after (default: 5m)
 	ConnectTimeout   time.Duration // TCP+TLS connect timeout (default: 15s)
 
@@ -112,7 +116,9 @@ type ServerConfig struct {
 
 	// LeanH2 serves tunnels with samizdat's own HTTP/2 server instead of
 	// x/net's. Clients see the same frames; the server uses much less CPU
-	// per byte (see leanh2.go).
+	// per byte (see leanh2.go). It applies to tunnels served through Handler
+	// and has no effect when SessionHandler is set, since a session runs no
+	// HTTP/2 server.
 	LeanH2 bool
 
 	// Handler: called for each authenticated proxied connection
