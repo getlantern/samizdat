@@ -27,15 +27,16 @@ type Client struct {
 }
 
 // NewClient creates a new Samizdat client.
-// testLegacyClients makes every client a legacy one that doesn't shape, so
-// the tests can run as today's clients against shaping servers. Set from
-// SAMIZDAT_TEST_LEGACY_CLIENTS in tests.
+// testLegacyClients makes every client a legacy one, sending version 1 auth
+// and not shaping, so the tests can run as today's clients against current
+// servers. Set from SAMIZDAT_TEST_LEGACY_CLIENTS in tests.
 var testLegacyClients bool
 
 func NewClient(config ClientConfig) (*Client, error) {
 	config.applyDefaults()
 	if testLegacyClients {
 		config.DisableShaping = true
+		config.LegacyAuth = true
 	}
 
 	if len(config.PublicKey) != 32 {

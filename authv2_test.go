@@ -170,6 +170,11 @@ func echoPair(t *testing.T, cfg ClientConfig) (*Client, *writeRecorder) {
 		}
 		return &recordedConn{Conn: c, r: rec}, nil
 	}
+	// These tests choose the client's auth version;
+	// SAMIZDAT_TEST_LEGACY_CLIENTS mustn't override it.
+	legacy := testLegacyClients
+	testLegacyClients = false
+	defer func() { testLegacyClients = legacy }()
 	c, err := NewClient(cfg)
 	if err != nil {
 		t.Fatal(err)

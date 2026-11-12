@@ -20,8 +20,8 @@ import (
 	"time"
 )
 
-// SAMIZDAT_TEST_LEGACY_CLIENTS runs every test with clients that don't
-// shape, as today's do, against servers that accept shaping (the default).
+// SAMIZDAT_TEST_LEGACY_CLIENTS runs every test with clients that send
+// version 1 auth and don't shape, as today's do, against current servers.
 func init() {
 	testLegacyClients = os.Getenv("SAMIZDAT_TEST_LEGACY_CLIENTS") != ""
 }
