@@ -86,6 +86,21 @@ func TestReplayFilterRetentionStaysOnWindowBoundary(t *testing.T) {
 	}
 }
 
+func TestReplayFilterRepeatAtCapacityBoundary(t *testing.T) {
+	f := newReplayFilter(time.Hour, 2)
+	for _, k := range []string{"a", "b", "c", "d"} {
+		f.seen([]byte(k))
+	}
+	// cur holds c and d and is full; a is in prev. Looking a up must find
+	// it before any rotation for capacity drops prev.
+	if !f.seen([]byte("a")) {
+		t.Fatal("repeat accepted when the current generation was full")
+	}
+	if !f.seen([]byte("c")) {
+		t.Fatal("repeat from the full current generation accepted")
+	}
+}
+
 func TestReplayFilterSmallCapacity(t *testing.T) {
 	f := newReplayFilter(time.Hour, 1)
 	if f.cur.m < 1024*28 {

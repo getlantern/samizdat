@@ -51,33 +51,38 @@ func (f *replayFilter) seen(key []byte) bool {
 	defer f.mu.Unlock()
 
 	now := f.now()
-	if elapsed := now.Sub(f.rotatedAt); elapsed >= f.window || f.cur.n >= f.capacity {
+	if elapsed := now.Sub(f.rotatedAt); elapsed >= f.window {
 		// After two windows with no lookup, cur is as old as prev would be
 		// and goes too.
-		f.prev = f.cur
+		f.rotate()
 		if elapsed >= 2*f.window {
 			f.prev = nil
 		}
-		f.cur = newBloomFilter(f.capacity, replayFalsePositiveRate)
 		// A rotation on time stays on the window's boundary, however late
 		// the lookup that triggers it, so nothing outlives two windows.
-		f.rotatedAt = now
-		if elapsed >= f.window {
-			f.rotatedAt = now.Add(-(elapsed % f.window))
-		}
+		f.rotatedAt = now.Add(-(elapsed % f.window))
 	}
 
-	h1, h2 := f.cur.hash(key)
-	if f.cur.has(h1, h2) {
+	if f.cur.has(f.cur.hash(key)) {
 		return true
 	}
-	if f.prev != nil {
-		if p1, p2 := f.prev.hash(key); f.prev.has(p1, p2) {
-			return true
-		}
+	if f.prev != nil && f.prev.has(f.prev.hash(key)) {
+		return true
 	}
-	f.cur.add(h1, h2)
+
+	// Rotating for capacity only to make room for a new key, after the
+	// lookup, so a repeat can't push its own generation out first.
+	if f.cur.n >= f.capacity {
+		f.rotate()
+		f.rotatedAt = now
+	}
+	f.cur.add(f.cur.hash(key))
 	return false
+}
+
+func (f *replayFilter) rotate() {
+	f.prev = f.cur
+	f.cur = newBloomFilter(f.capacity, replayFalsePositiveRate)
 }
 
 // bloomFilter is a Bloom filter over keys hashed with random seeds, so that
