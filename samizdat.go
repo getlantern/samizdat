@@ -114,6 +114,18 @@ type ServerConfig struct {
 	// Limits
 	MaxConcurrentStreams int // per connection (default: 250)
 
+	// ReplayWindow is how long the server remembers an authenticated
+	// SessionID and refuses it again, sending the connection to the
+	// masquerade as if auth had failed. Each is remembered for between
+	// ReplayWindow and twice that (default: 24h). Negative turns replay
+	// protection off.
+	ReplayWindow time.Duration
+	// ReplayCapacity is how many SessionIDs one ReplayWindow holds before
+	// the server starts a new one early, which shortens how long each is
+	// remembered under heavy load. Memory is about 7.2 bytes per entry
+	// (default: 2,000,000, about 14 MB).
+	ReplayCapacity int
+
 	// LeanH2 serves tunnels with samizdat's own HTTP/2 server instead of
 	// x/net's. Clients see the same frames; the server uses much less CPU
 	// per byte (see leanh2.go). It applies to tunnels served through Handler
@@ -139,5 +151,11 @@ func (c *ServerConfig) applyDefaults() {
 	}
 	if c.MaxConcurrentStreams == 0 {
 		c.MaxConcurrentStreams = 250
+	}
+	if c.ReplayWindow == 0 {
+		c.ReplayWindow = 24 * time.Hour
+	}
+	if c.ReplayCapacity == 0 {
+		c.ReplayCapacity = 2_000_000
 	}
 }
