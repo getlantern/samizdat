@@ -574,3 +574,21 @@ func TestShapingParseRejectsBadBins(t *testing.T) {
 		t.Fatal("outcome past the last bin accepted")
 	}
 }
+
+// TestShapingParseRejectsMissingFirstRow: a model with nothing to draw the
+// first record from is refused at load, not left to panic while sampling.
+func TestShapingParseRejectsMissingFirstRow(t *testing.T) {
+	raw, err := hex.DecodeString(shapingModelGolden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Position 0's row count is the uint16 right after the 6-byte header and
+	// its size kind; the row follows.
+	bad := append([]byte(nil), raw[:7]...)
+	bad = append(bad, 0, 0)
+	rowLen := 1 + 2 + 2 + 2*4 // prefix dir, prefix value, count, two outcomes
+	bad = append(bad, raw[9+rowLen:]...)
+	if _, err := parseShapingModel(bad); err == nil {
+		t.Fatal("model without a first row accepted")
+	}
+}

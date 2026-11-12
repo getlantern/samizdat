@@ -67,6 +67,9 @@ func main() {
 // build decodes a CenKL TrafficProfile and its model assumptions and
 // returns the model in samizdat's format, before gzip.
 func build(hist, modelJSON []byte, positions int, keep float64) ([]byte, error) {
+	if !(keep > 0 && keep <= 1) { // also rejects NaN
+		return nil, fmt.Errorf("keep %v: want a fraction in (0, 1]", keep)
+	}
 	profile, err := decodeProfile(hist)
 	if err != nil {
 		return nil, err
