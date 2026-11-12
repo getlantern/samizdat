@@ -201,6 +201,8 @@ func TestLeanH2MatchesXNet(t *testing.T) {
 		{"connect without authority", "CONNECT", "", nil},
 		{"connect with path", "CONNECT", "example.com:443", path},
 		{"connect with only scheme", "CONNECT", "example.com:443", path[:1]},
+		{"extended connect", "CONNECT", "example.com:443", append(slices.Clone(path), hpack.HeaderField{Name: ":protocol", Value: "websocket"})},
+		{"connect with protocol only", "CONNECT", "example.com:443", []hpack.HeaderField{{Name: ":protocol", Value: "websocket"}}},
 		{"get with ftp scheme", "GET", "example.com", []hpack.HeaderField{{Name: ":scheme", Value: "ftp"}, {Name: ":path", Value: "/"}}},
 		{"get", "GET", "example.com", path},
 		{"head", "HEAD", "example.com", path},

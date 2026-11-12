@@ -467,7 +467,7 @@ func (c *leanConn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	c.active++
 	c.mu.Unlock()
 
-	go st.run(f.PseudoValue("method"), f.PseudoValue("authority"), f.PseudoValue("scheme"), f.PseudoValue("path"), f.Truncated)
+	go st.run(f.PseudoValue("method"), f.PseudoValue("authority"), f.PseudoValue("scheme"), f.PseudoValue("path"), f.PseudoValue("protocol"), f.Truncated)
 	return nil
 }
 
@@ -806,7 +806,7 @@ func (st *leanStream) creditStream(n int64) {
 
 // run answers the request and, for a CONNECT, runs the handler on the tunnel,
 // as serveH2's handler does with x/net's server.
-func (st *leanStream) run(method, authority, scheme, path string, truncated bool) {
+func (st *leanStream) run(method, authority, scheme, path, protocol string, truncated bool) {
 	c := st.c
 	defer st.finish()
 	// A bug in serving one stream must not end the process and every tunnel
@@ -831,9 +831,11 @@ func (st *leanStream) run(method, authority, scheme, path string, truncated bool
 	// x/net's server rejects a malformed request with RST_STREAM before any
 	// handler sees it: every request needs a :method, a CONNECT must have
 	// :authority and neither :scheme nor :path, and any other request needs a
-	// :path and an http or https :scheme.
+	// :path and an http or https :scheme. :protocol (extended CONNECT) is
+	// refused, as x/net's server refuses it by default and neither server
+	// advertises it.
 	connect := method == http.MethodConnect
-	malformed := method == "" ||
+	malformed := method == "" || protocol != "" ||
 		connect && (authority == "" || scheme != "" || path != "") ||
 		!connect && (path == "" || scheme != "http" && scheme != "https")
 	if malformed {
