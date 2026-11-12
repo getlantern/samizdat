@@ -169,13 +169,13 @@ func startShapingPairWith(t *testing.T, lean, serverShapes, clientShapes bool, h
 	}
 	certPEM, keyPEM := generateSelfSignedCert(t)
 	server, err := NewServer(ServerConfig{
-		PrivateKey:   priv,
-		ShortIDs:     [][8]byte{sid},
-		CertPEM:      certPEM,
-		KeyPEM:       keyPEM,
-		LeanH2:       lean,
-		ShapeTraffic: serverShapes,
-		Handler:      handler,
+		PrivateKey:     priv,
+		ShortIDs:       [][8]byte{sid},
+		CertPEM:        certPEM,
+		KeyPEM:         keyPEM,
+		LeanH2:         lean,
+		DisableShaping: !serverShapes,
+		Handler:        handler,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -187,12 +187,17 @@ func startShapingPairWith(t *testing.T, lean, serverShapes, clientShapes bool, h
 	fromServer, fromClient := &writeRecorder{}, &writeRecorder{}
 	go server.Serve(&recordedListener{Listener: ln, r: fromServer})
 	t.Cleanup(func() { server.Close() })
+	// These tests choose whether the client shapes; SAMIZDAT_TEST_LEGACY_CLIENTS
+	// mustn't override that.
+	legacy := testLegacyClients
+	testLegacyClients = false
+	defer func() { testLegacyClients = legacy }()
 	client, err := NewClient(ClientConfig{
 		ServerAddr:     ln.Addr().String(),
 		ServerName:     "test.example.com",
 		PublicKey:      pub,
 		ShortID:        sid,
-		ShapeTraffic:   clientShapes,
+		DisableShaping: !clientShapes,
 		ConnectTimeout: 5 * time.Second,
 		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			c, err := (&net.Dialer{}).DialContext(ctx, network, addr)

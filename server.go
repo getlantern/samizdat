@@ -412,7 +412,7 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 	}
 
 	var h2Conn net.Conn = tlsConn
-	if s.config.ShapeTraffic {
+	if !s.config.DisableShaping {
 		c, err := acceptShaping(tlsConn)
 		if err != nil {
 			tlsConn.Close()

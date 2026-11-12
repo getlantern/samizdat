@@ -27,7 +27,7 @@ jobs:
         env:
           SAMIZDAT_TEST_LEAN_H2: "1"
 
-      - name: Test with a shaping server
+      - name: Test with clients that don't shape, as today's
         run: go test -race -count=1 -timeout 5m ./...
         env:
-          SAMIZDAT_TEST_SHAPING_SERVER: "1"
+          SAMIZDAT_TEST_LEGACY_CLIENTS: "1"

@@ -25,8 +25,16 @@ type Client struct {
 }
 
 // NewClient creates a new Samizdat client.
+// testLegacyClients makes every client a legacy one that doesn't shape, so
+// the tests can run as today's clients against shaping servers. Set from
+// SAMIZDAT_TEST_LEGACY_CLIENTS in tests.
+var testLegacyClients bool
+
 func NewClient(config ClientConfig) (*Client, error) {
 	config.applyDefaults()
+	if testLegacyClients {
+		config.DisableShaping = true
+	}
 
 	if len(config.PublicKey) != 32 {
 		return nil, fmt.Errorf("PublicKey must be exactly 32 bytes, got %d", len(config.PublicKey))
@@ -166,7 +174,7 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	}
 
 	var conn net.Conn = uConn
-	if state := uConn.ConnectionState(); c.config.ShapeTraffic && state.Version == utls.VersionTLS13 {
+	if state := uConn.ConnectionState(); !c.config.DisableShaping && state.Version == utls.VersionTLS13 {
 		sched, marker, err := shapingSchedule(state.ExportKeyingMaterial)
 		if err != nil {
 			uConn.Close()
