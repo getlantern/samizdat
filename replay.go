@@ -23,7 +23,8 @@ const replayFalsePositiveRate = 1e-6
 // and twice window, or for less when more than capacity authenticate within
 // a window. It is two Bloom filters: new SessionIDs go into the current one,
 // both are searched, and rotation drops the older. Memory stays at about 3.6
-// bytes per capacity entry per generation, whatever the load.
+// bytes per capacity entry, or per minBloomCapacity entry if that's larger,
+// per generation, whatever the load.
 type replayFilter struct {
 	mu        sync.Mutex
 	window    time.Duration
