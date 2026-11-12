@@ -154,6 +154,12 @@ func TestCloseTwiceAndRacingAccepts(t *testing.T) {
 	wg.Wait()
 	close(conns)
 	for c := range conns {
+		// A dial that raced the listener closing can leave the client with
+		// a connection the server never accepted: no socket on the server's
+		// side, and nothing sent to say so until the client sends. A byte
+		// draws the reset. A connection the server did accept and failed to
+		// close would take the byte and still time out below.
+		c.Write([]byte{22})
 		expectClosed(t, c)
 		c.Close()
 	}
