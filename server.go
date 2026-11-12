@@ -74,6 +74,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if config.Handler == nil && config.SessionHandler == nil {
 		return nil, fmt.Errorf("Handler or SessionHandler is required")
 	}
+	if config.MaxClockSkew < 0 {
+		return nil, fmt.Errorf("MaxClockSkew must not be negative, got %v", config.MaxClockSkew)
+	}
 	if config.ReplayCapacity < 0 || config.ReplayCapacity > maxReplayCapacity {
 		return nil, fmt.Errorf("ReplayCapacity must be between 0 and %d, got %d", maxReplayCapacity, config.ReplayCapacity)
 	}

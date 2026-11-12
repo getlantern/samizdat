@@ -102,10 +102,10 @@ func TestAuthV2SealAndVerify(t *testing.T) {
 		}
 	}
 
-	// Any other byte of the ClientHello is bound in: change one past the
-	// SessionID and it fails.
+	// Every other byte of the ClientHello is bound in, not only the key
+	// share: change a cipher suite's and it fails.
 	tampered := bytes.Clone(msg)
-	tampered[len(tampered)-1] ^= 1
+	tampered[sessionIDOffset+sessionIDLen+3] ^= 1
 	if _, ok := authenticateAt(tampered, serverPriv, ids, now); ok {
 		t.Fatal("accepted a ClientHello changed after sealing")
 	}
@@ -228,5 +228,36 @@ func TestAuthV2SessionIDsDontRepeat(t *testing.T) {
 				t.Fatalf("SessionIDs %d and %d share their first 8 bytes", i, j)
 			}
 		}
+	}
+}
+
+// TestAuthV1SplitClientHello: a version 1 ClientHello split across TLS
+// records still authenticates from its first record, which holds the
+// SessionID, as it did before version 2.
+func TestAuthV1SplitClientHello(t *testing.T) {
+	serverPriv, serverPub, _ := GenerateKeyPair()
+	id, _ := GenerateShortID()
+	sid, err := BuildSessionID(serverPub, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := buildTestHello(t, map[uint16][]byte{groupX25519: make([]byte, 32)})
+	copy(hello[sessionIDOffset:], sid[:])
+	first := hello[:sessionIDOffset+sessionIDLen+4]
+	if got, ok := AuthenticateClientHello(first, serverPriv, [][8]byte{id}, DefaultMaxClockSkew); !ok || got != id {
+		t.Fatal("version 1 SessionID in a split ClientHello refused")
+	}
+}
+
+func TestNewServerRejectsNegativeClockSkew(t *testing.T) {
+	priv, _, _ := GenerateKeyPair()
+	_, err := NewServer(ServerConfig{
+		PrivateKey:   priv,
+		ShortIDs:     [][8]byte{{1}},
+		Handler:      func(ctx context.Context, conn net.Conn, dest string) {},
+		MaxClockSkew: -time.Second,
+	})
+	if err == nil {
+		t.Fatal("negative MaxClockSkew accepted")
 	}
 }

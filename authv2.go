@@ -214,22 +214,28 @@ func verifyClientHelloV2(msg []byte, ch *clientHello, privateKey []byte, shortID
 
 // AuthenticateClientHello checks a ClientHello handshake message, as read
 // from its TLS record (starting with its type and length), for a version 2
-// or version 1 SessionID under the server's X25519 private key and one of
+// or version 1 SessionID. Version 2 needs the whole ClientHello, which
+// samizdat's client sends in one record under the server's X25519 private key and one of
 // shortIDs. It returns the shortID and true if either authenticates. It
 // doesn't remember SessionIDs: a caller that admits connections itself
 // must refuse repeats, as Server does.
 func AuthenticateClientHello(msg, privateKey []byte, shortIDs [][shortIDLen]byte, maxSkew time.Duration) ([shortIDLen]byte, bool) {
-	ch, err := parseClientHello(msg)
+	if ch, err := parseClientHello(msg); err == nil {
+		if id, ok := verifyClientHelloV2(msg, ch, privateKey, shortIDs, maxSkew, authNow()); ok {
+			return id, true
+		}
+	}
+	// Version 1 needs only the SessionID, near the start: msg may be the
+	// first of several records a ClientHello was split across, which version
+	// 1 clients have always been able to send.
+	sessionID, err := ExtractSessionID(msg)
 	if err != nil {
 		return [shortIDLen]byte{}, false
-	}
-	if id, ok := verifyClientHelloV2(msg, ch, privateKey, shortIDs, maxSkew, authNow()); ok {
-		return id, true
 	}
 	pub, err := curve25519.X25519(privateKey, curve25519.Basepoint)
 	if err != nil {
 		return [shortIDLen]byte{}, false
 	}
-	id, ok, err := VerifySessionID(ch.sessionID, pub, shortIDs)
+	id, ok, err := VerifySessionID(sessionID, pub, shortIDs)
 	return id, ok && err == nil
 }
