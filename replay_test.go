@@ -51,6 +51,60 @@ func TestReplayFilterWindow(t *testing.T) {
 	}
 }
 
+func TestReplayFilterForgetsAfterIdle(t *testing.T) {
+	now := time.Unix(0, 0)
+	f := newReplayFilter(time.Hour, 1000)
+	f.now = func() time.Time { return now }
+	f.rotatedAt = now
+
+	key := []byte("session")
+	f.seen(key)
+
+	// No lookups for three windows: the next one must not find key in a
+	// generation that was never rotated out.
+	now = now.Add(3 * time.Hour)
+	if f.seen(key) {
+		t.Fatal("remembered after three idle windows")
+	}
+}
+
+func TestServerReplayConfig(t *testing.T) {
+	priv, _, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := ServerConfig{
+		PrivateKey: priv,
+		ShortIDs:   [][8]byte{{1}},
+		Handler:    func(ctx context.Context, conn net.Conn, destination string) {},
+	}
+
+	c := base
+	c.ReplayWindow, c.ReplayCapacity = 2*time.Hour, 500
+	s, err := NewServer(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.replay == nil || s.replay.window != 2*time.Hour || s.replay.capacity != 500 {
+		t.Fatalf("replay filter = %+v, want window 2h and capacity 500", s.replay)
+	}
+
+	c = base
+	c.ReplayWindow = -1
+	if s, err = NewServer(c); err != nil {
+		t.Fatal(err)
+	}
+	if s.replay != nil {
+		t.Fatal("negative ReplayWindow left replay protection on")
+	}
+
+	c = base
+	c.ReplayCapacity = -1
+	if _, err := NewServer(c); err == nil {
+		t.Fatal("negative ReplayCapacity accepted")
+	}
+}
+
 func TestReplayFilterRotatesAtCapacity(t *testing.T) {
 	f := newReplayFilter(time.Hour, 100)
 	first := []byte("first")

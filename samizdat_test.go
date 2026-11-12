@@ -929,6 +929,12 @@ func TestServerConfigDefaults(t *testing.T) {
 	if config.MaxConcurrentStreams != 250 {
 		t.Errorf("MaxConcurrentStreams = %d, want 250", config.MaxConcurrentStreams)
 	}
+	if config.ReplayWindow != 24*time.Hour {
+		t.Errorf("ReplayWindow = %v, want 24h", config.ReplayWindow)
+	}
+	if config.ReplayCapacity != 2_000_000 {
+		t.Errorf("ReplayCapacity = %d, want 2000000", config.ReplayCapacity)
+	}
 }
 
 // --- Masquerade tests ---

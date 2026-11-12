@@ -50,7 +50,12 @@ func (f *replayFilter) seen(key []byte) bool {
 	defer f.mu.Unlock()
 
 	if now := f.now(); now.Sub(f.rotatedAt) >= f.window || f.cur.n >= f.capacity {
+		// After two windows with no lookup, cur is as old as prev would be
+		// and goes too.
 		f.prev = f.cur
+		if now.Sub(f.rotatedAt) >= 2*f.window {
+			f.prev = nil
+		}
 		f.cur = newBloomFilter(f.capacity, replayFalsePositiveRate)
 		f.rotatedAt = now
 	}
