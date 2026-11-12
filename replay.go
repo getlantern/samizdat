@@ -49,15 +49,21 @@ func (f *replayFilter) seen(key []byte) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if now := f.now(); now.Sub(f.rotatedAt) >= f.window || f.cur.n >= f.capacity {
+	now := f.now()
+	if elapsed := now.Sub(f.rotatedAt); elapsed >= f.window || f.cur.n >= f.capacity {
 		// After two windows with no lookup, cur is as old as prev would be
 		// and goes too.
 		f.prev = f.cur
-		if now.Sub(f.rotatedAt) >= 2*f.window {
+		if elapsed >= 2*f.window {
 			f.prev = nil
 		}
 		f.cur = newBloomFilter(f.capacity, replayFalsePositiveRate)
+		// A rotation on time stays on the window's boundary, however late
+		// the lookup that triggers it, so nothing outlives two windows.
 		f.rotatedAt = now
+		if elapsed >= f.window {
+			f.rotatedAt = now.Add(-(elapsed % f.window))
+		}
 	}
 
 	h1, h2 := f.cur.hash(key)
@@ -83,10 +89,16 @@ type bloomFilter struct {
 	s1, s2 maphash.Seed
 }
 
+// minBloomCapacity is the smallest capacity a filter is sized for. Below it,
+// double hashing over so few bits has too few distinct probe sequences to
+// reach the target false-positive rate.
+const minBloomCapacity = 1024
+
 func newBloomFilter(capacity int, p float64) *bloomFilter {
-	m := uint64(math.Ceil(-float64(capacity) * math.Log(p) / (math.Ln2 * math.Ln2)))
+	n := float64(max(capacity, minBloomCapacity))
+	m := uint64(math.Ceil(-n * math.Log(p) / (math.Ln2 * math.Ln2)))
 	m = (m + 63) &^ 63
-	k := max(1, int(math.Round(float64(m)/float64(capacity)*math.Ln2)))
+	k := max(1, int(math.Round(float64(m)/n*math.Ln2)))
 	return &bloomFilter{
 		bits: make([]uint64, m/64),
 		m:    m,
