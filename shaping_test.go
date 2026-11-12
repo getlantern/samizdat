@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
+	mrand "math/rand/v2"
 	"net"
+	"os"
 	"slices"
 	"sync"
 	"testing"
@@ -147,6 +151,14 @@ func TestShapedConnRejectsWrongMarker(t *testing.T) {
 // side writes.
 func startShapingPair(t *testing.T, lean, serverShapes, clientShapes bool) (*Client, *writeRecorder, *writeRecorder) {
 	t.Helper()
+	return startShapingPairWith(t, lean, serverShapes, clientShapes, func(ctx context.Context, conn net.Conn, dest string) {
+		defer conn.Close()
+		io.Copy(conn, conn)
+	})
+}
+
+func startShapingPairWith(t *testing.T, lean, serverShapes, clientShapes bool, handler ConnHandler) (*Client, *writeRecorder, *writeRecorder) {
+	t.Helper()
 	priv, pub, err := GenerateKeyPair()
 	if err != nil {
 		t.Fatal(err)
@@ -163,10 +175,7 @@ func startShapingPair(t *testing.T, lean, serverShapes, clientShapes bool) (*Cli
 		KeyPEM:       keyPEM,
 		LeanH2:       lean,
 		ShapeTraffic: serverShapes,
-		Handler: func(ctx context.Context, conn net.Conn, dest string) {
-			defer conn.Close()
-			io.Copy(conn, conn)
-		},
+		Handler:      handler,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -293,5 +302,183 @@ func TestShapingClientFailsOnServerWithout(t *testing.T) {
 	}
 	if d := time.Since(start); d > 9*time.Second {
 		t.Fatalf("failed only after %v", d)
+	}
+}
+
+// shapingModelGolden is cmd/shapingmodel's output for its tiny test profile
+// (goldenHex in cmd/shapingmodel/main_test.go): position 0 is a client
+// packet of 100 bytes (weight 3) or a server packet of 200 (weight 1); at
+// position 1, after a client packet under 150 bytes comes a server packet
+// of 777, and after a server packet of 150 or more a client packet of 100.
+const shapingModelGolden = "535a534d0102000100ff00000200c80055556480ffff00000000012c01000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000001000100010001000100010001000100010001000100010001" +
+	"0001000100010001000100010001000100010001000100010001000100010001" +
+	"0001000100010001000100010001000100010001000100010001000100010001" +
+	"0001000100010001000100010001000100010001000100010001000100010001" +
+	"0001000100010001000100010001000100010001000100010001000100010001" +
+	"0001000100010001000100010001000100010001000100010001000100010001" +
+	"0001000100010001000100010001000100010001000100010001000100010001" +
+	"0001000100010001000100010001000100010001000100010001000100010001" +
+	"0001000100010001000100010001000100010001000100010001000100010001" +
+	"0001000100010001000100010001000100010001000200020064000100000078" +
+	"00000000000100090305000000020000010001000080ffff01000001000100ff" +
+	"ff01000080ffff01000100ffff"
+
+// TestShapingModelGolden: the runtime reads the generator's format, follows
+// each position's conditional rows, draws sizes from the bins, falls back on
+// direction when the previous packet has no row, and weights outcomes.
+func TestShapingModelGolden(t *testing.T) {
+	raw, err := hex.DecodeString(shapingModelGolden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := parseShapingModel(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := mrand.New(mrand.NewChaCha8([32]byte{}))
+	counts := map[string]int{}
+	for range 4000 {
+		s := m.schedule(rng, 10, false)
+		counts[fmt.Sprint(s)]++
+	}
+	if len(counts) != 2 || counts["[100 -777]"] < 2800 || counts["[100 -777]"] > 3200 || counts["[-200 100]"] < 800 {
+		t.Fatalf("schedules %v, want [100 -777] about 3 times as often as [-200 100] and nothing else", counts)
+	}
+	for range 100 {
+		if s := m.schedule(rng, 10, true); !slices.Equal(s, []int{100, -777}) {
+			t.Fatalf("client-first schedule %v, want [100 -777]", s)
+		}
+	}
+	// Without its row, a client packet falls back to what follows client
+	// packets in general.
+	clear(m.positions[1].rows)
+	if s := m.schedule(rng, 10, true); !slices.Equal(s, []int{100, -777}) {
+		t.Fatalf("fallback schedule %v, want [100 -777]", s)
+	}
+}
+
+// TestShapingLeanEarlyBulkDownload: a download that fills the shaping queue
+// while the schedule still runs completes on the lean server, whose batching
+// would otherwise hold the schedule's own records behind a blocked Write.
+func TestShapingLeanEarlyBulkDownload(t *testing.T) {
+	const size = 4 << 20
+	// Each client turn after the CONNECT waits out a long grace period, so
+	// the handler fills the server's queue while server records remain.
+	old := shapingGrace
+	shapingGrace = 300 * time.Millisecond
+	shapingScheduleOverride = []int{400, -100, 400, -100, 100, -100, 100, -100, 100, -100}
+	defer func() { shapingGrace, shapingScheduleOverride = old, nil }()
+	client, _, _ := startShapingPairWith(t, true, true, true, func(ctx context.Context, conn net.Conn, dest string) {
+		defer conn.Close()
+		conn.Write(make([]byte, size))
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp", "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	if n, err := io.CopyN(io.Discard, conn, size); err != nil {
+		t.Fatalf("downloaded %d of %d bytes: %v", n, size, err)
+	}
+}
+
+// TestShapedConnZeroGraceIdleSchedules: with a grace period that expires at
+// once, idle schedules still run to the end, time after time.
+func TestShapedConnZeroGraceIdleSchedules(t *testing.T) {
+	old := shapingGrace
+	shapingGrace = time.Nanosecond
+	defer func() { shapingGrace = old }()
+	for i := range 50 {
+		client, server := shapedPipe(t, []int{60, -70, 80, -90, 100, -110, 120, -130, 140, -150})
+		go client.Write([]byte("x"))
+		buf := make([]byte, 1)
+		server.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if _, err := io.ReadFull(server, buf); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+}
+
+// TestShapedConnHonorsDeadlines: while the schedule is stuck (its peer never
+// reads), Read and a Write that must wait for queue room return at their
+// deadlines.
+func TestShapedConnHonorsDeadlines(t *testing.T) {
+	cc, sc := net.Pipe()
+	defer sc.Close()
+	c := newShapedConn(cc, []int{100, -100, 100, -100, 100, -100, 100, -100, 100, -100}, true, [shapingMarkerLen]byte{}, false)
+	defer c.Close()
+
+	c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	start := time.Now()
+	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Read: %v, want a deadline error", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Read returned after %v", d)
+	}
+
+	c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+	start = time.Now()
+	if _, err := c.Write(make([]byte, 2*shapingMaxQueued)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write: %v, want a deadline error", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Write returned after %v", d)
+	}
+}
+
+// TestShapedConnRejectsOversizedLength: a record whose length field runs
+// past its end fails the connection instead of panicking.
+func TestShapedConnRejectsOversizedLength(t *testing.T) {
+	cc, sc := net.Pipe()
+	defer cc.Close()
+	sched := []int{100, -100, 100, -100, 100, -100, 100, -100, 100, -100}
+	server := newShapedConn(sc, sched, false, [shapingMarkerLen]byte{}, true)
+	defer server.Close()
+	rec := make([]byte, 100-tls13RecordOverhead-shapingMarkerLen)
+	rec[0], rec[1] = 0xff, 0xff
+	go cc.Write(rec)
+	server.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err := server.Read(make([]byte, 1))
+	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Read: %v, want the connection failed", err)
+	}
+}
+
+// TestShapingServerDropsSilentClient: an authenticated client that never
+// sends anything is dropped once shapingPeekTimeout passes.
+func TestShapingServerDropsSilentClient(t *testing.T) {
+	old := shapingPeekTimeout
+	shapingPeekTimeout = 200 * time.Millisecond
+	defer func() { shapingPeekTimeout = old }()
+	client, _, _ := startShapingPair(t, false, true, false)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	uc, err := client.dialConn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uc.Close()
+	uc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	_, err = uc.Read(make([]byte, 1))
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("server kept a silent client past shapingPeekTimeout")
+	}
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("dropped only after %v", d)
 	}
 }

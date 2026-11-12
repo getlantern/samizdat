@@ -673,7 +673,7 @@ func (c *leanConn) writeLoop() {
 
 		chunk := leanChunk(cur)
 		cur = cur[len(chunk):]
-		err := c.bc.batch(func() error {
+		write := func() error {
 			if len(ctl) > 0 {
 				if _, err := c.conn.Write(ctl); err != nil {
 					return err
@@ -685,7 +685,14 @@ func (c *leanConn) writeLoop() {
 				}
 			}
 			return nil
-		})
+		}
+		var err error
+		if sc, ok := c.conn.(interface{ shapingActive() bool }); ok && sc.shapingActive() {
+			// See shapedConn.shapingActive.
+			err = write()
+		} else {
+			err = c.bc.batch(write)
+		}
 
 		c.mu.Lock()
 		if ctl != nil && c.cspare == nil {
