@@ -64,7 +64,10 @@ type ClientConfig struct {
 	// connection's first TLS records (see shaping.go), which is on by
 	// default. A shaping client needs a server that accepts shaping, as every
 	// server does unless ServerConfig.DisableShaping is set; against one that
-	// doesn't, the connection fails.
+	// doesn't, the connection fails. The two ends take turns sending those
+	// records, so a new connection's first request can take a few round
+	// trips longer than without shaping; requests on a connection already
+	// open don't.
 	DisableShaping bool
 
 	// Connection management
@@ -147,8 +150,9 @@ type ServerConfig struct {
 	// DisableShaping stops the server accepting clients that shape their
 	// connections' first TLS records (see shaping.go), which it does by
 	// default; clients that don't shape work either way. Shaping clients
-	// fail against a server with it set. It has no effect when SessionHandler
-	// is set.
+	// fail against a server with it set. A server that accepts shaping sends
+	// no TLS session tickets, to any client, since a ticket would be a record
+	// ahead of the shaped ones. It has no effect when SessionHandler is set.
 	DisableShaping bool
 
 	// Handler: called for each authenticated proxied connection

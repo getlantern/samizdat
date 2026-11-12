@@ -2,6 +2,8 @@ package samizdat
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -30,9 +32,13 @@ import (
 //     With nothing queued it sends padding alone. It reads exactly the
 //     records the schedule gives the peer.
 //   - The client's first record starts with a marker from the keying
-//     material. A server that accepts shaping reads the client's first 8
-//     bytes: the marker means a shaping client, anything else (an HTTP/2
-//     preface) a client that doesn't shape, whose bytes are replayed.
+//     material and the schedule. A server that accepts shaping reads the
+//     client's first 8 bytes: the marker means a shaping client that drew
+//     the server's schedule, anything else (an HTTP/2 preface) a client
+//     that doesn't shape, whose bytes are replayed. A client that drew
+//     another schedule, from another version of the model or the sampler,
+//     sends another marker, and the connection fails at once as a bad
+//     HTTP/2 preface rather than partway through mismatched records.
 //   - After the schedule both sides pass data straight through.
 //
 // The schedule fixes TLS record sizes and directions (dynamic record sizing
@@ -67,25 +73,45 @@ var shapingGrace = 5 * time.Millisecond
 // shapingSchedule derives the schedule and the client's marker from a TLS
 // session's exported keying material.
 func shapingSchedule(ekm func(label string, context []byte, length int) ([]byte, error)) ([]int, [shapingMarkerLen]byte, error) {
-	var marker [shapingMarkerLen]byte
 	km, err := ekm(shapingLabel, nil, 32+shapingMarkerLen)
 	if err != nil {
-		return nil, marker, err
+		return nil, [shapingMarkerLen]byte{}, err
 	}
-	copy(marker[:], km[32:])
+	sched, err := shapingDraw([32]byte(km[:32]))
+	if err != nil {
+		return nil, [shapingMarkerLen]byte{}, err
+	}
+	return sched, shapingMarker(km[32:], sched), nil
+}
+
+// shapingMarker is the marker a client that drew sched sends: the two ends
+// each draw the schedule from their own copy of the model, and the marker
+// matches only if they drew the same one.
+func shapingMarker(secret []byte, sched []int) [shapingMarkerLen]byte {
+	mac := hmac.New(sha256.New, secret)
+	for _, s := range sched {
+		binary.Write(mac, binary.BigEndian, int32(s))
+	}
+	var marker [shapingMarkerLen]byte
+	copy(marker[:], mac.Sum(nil))
+	return marker
+}
+
+// shapingDraw draws a schedule from the model with a sampler seeded by seed.
+func shapingDraw(seed [32]byte) ([]int, error) {
 	if shapingScheduleOverride != nil {
-		return slices.Clone(shapingScheduleOverride), marker, nil
+		return slices.Clone(shapingScheduleOverride), nil
 	}
 	model, err := loadShapingModel()
 	if err != nil {
-		return nil, marker, err
+		return nil, err
 	}
-	rng := rand.New(rand.NewChaCha8([32]byte(km[:32])))
+	rng := rand.New(rand.NewChaCha8(seed))
 	var sched []int
 	for range shapingTries {
 		sched = model.schedule(rng, shapingRecords, true)
 		if shapingScheduleFits(sched) {
-			return sched, marker, nil
+			return sched, nil
 		}
 	}
 	// Rare: bring each record within what the framing and a TLS record
@@ -100,7 +126,7 @@ func shapingSchedule(ekm func(label string, context []byte, length int) ([]byte,
 		}
 		sched[i] = size
 	}
-	return sched, marker, nil
+	return sched, nil
 }
 
 func shapingMinSize(i int) int {
