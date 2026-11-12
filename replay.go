@@ -2,15 +2,10 @@ package samizdat
 
 import (
 	"hash/maphash"
-	"math"
+	"math/bits"
 	"sync"
 	"time"
 )
-
-// replayFalsePositiveRate is the chance that a fresh SessionID is taken for a
-// replay, per generation searched. A false positive sends a real client to
-// the masquerade, and the client then fails that dial.
-const replayFalsePositiveRate = 1e-6
 
 // replayFilter remembers the SessionIDs that have authenticated, so that one
 // copied from an observed ClientHello can't authenticate again. Without it,
@@ -21,15 +16,23 @@ const replayFalsePositiveRate = 1e-6
 // Legacy SessionIDs carry no timestamp, so there's no point after which a
 // copy stops being valid: the filter remembers each one for between window
 // and twice window, or for less when more than capacity authenticate within
-// a window. It is two Bloom filters: new SessionIDs go into the current one,
-// both are searched, and rotation drops the older. Memory stays at about 3.6
-// bytes per capacity entry, or per minBloomCapacity entry if that's larger,
-// per generation, whatever the load.
+// a window. It is two generations: new SessionIDs go into the current one,
+// both are searched, and rotation drops the older.
+//
+// A false match must be all but impossible. It sends a real client to the
+// cover site, and a client that doesn't pin the server's certificate accepts
+// that handshake and sends its CONNECT requests to the cover site. So each
+// generation stores a keyed 63-bit fingerprint of every SessionID exactly,
+// not a Bloom filter: a fresh SessionID matches one of n stored by chance
+// with probability about n/2^63, around 2e-13 when both generations hold a
+// million. Memory is about 10.7 bytes per capacity entry per generation,
+// whatever the load.
 type replayFilter struct {
 	mu        sync.Mutex
 	window    time.Duration
 	capacity  int
-	cur, prev *bloomFilter
+	seed      maphash.Seed
+	cur, prev *fingerprintSet
 	rotatedAt time.Time
 	now       func() time.Time
 }
@@ -38,15 +41,20 @@ func newReplayFilter(window time.Duration, capacity int) *replayFilter {
 	f := &replayFilter{
 		window:   window,
 		capacity: capacity,
+		seed:     maphash.MakeSeed(),
 		now:      time.Now,
 	}
-	f.cur = newBloomFilter(capacity, replayFalsePositiveRate)
+	f.cur = newFingerprintSet(capacity)
 	f.rotatedAt = f.now()
 	return f
 }
 
 // seen reports whether key was added before, and adds it if not.
 func (f *replayFilter) seen(key []byte) bool {
+	// The seed is secret, so no one can choose keys whose fingerprints
+	// collide. Zero marks an empty slot, so fingerprints are never zero.
+	fp := maphash.Bytes(f.seed, key) | 1
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -63,10 +71,7 @@ func (f *replayFilter) seen(key []byte) bool {
 		f.rotatedAt = now.Add(-(elapsed % f.window))
 	}
 
-	if f.cur.has(f.cur.hash(key)) {
-		return true
-	}
-	if f.prev != nil && f.prev.has(f.prev.hash(key)) {
+	if f.cur.has(fp) || (f.prev != nil && f.prev.has(fp)) {
 		return true
 	}
 
@@ -76,63 +81,48 @@ func (f *replayFilter) seen(key []byte) bool {
 		f.rotate()
 		f.rotatedAt = now
 	}
-	f.cur.add(f.cur.hash(key))
+	f.cur.add(fp)
 	return false
 }
 
 func (f *replayFilter) rotate() {
 	f.prev = f.cur
-	f.cur = newBloomFilter(f.capacity, replayFalsePositiveRate)
+	f.cur = newFingerprintSet(f.capacity)
 }
 
-// bloomFilter is a Bloom filter over keys hashed with random seeds, so that
-// no one can choose keys that collide in it.
-type bloomFilter struct {
-	bits   []uint64
-	m      uint64 // number of bits
-	k      int    // probes per key
-	n      int    // keys added
-	s1, s2 maphash.Seed
+// fingerprintSet is an open-addressing hash set of nonzero uint64s with
+// linear probing. It holds at most the capacity it was made for, which
+// keeps it at most three quarters full.
+type fingerprintSet struct {
+	slots []uint64
+	n     int
 }
 
-// minBloomCapacity is the smallest capacity a filter is sized for. Below it,
-// double hashing over so few bits has too few distinct probe sequences to
-// reach the target false-positive rate.
-const minBloomCapacity = 1024
-
-func newBloomFilter(capacity int, p float64) *bloomFilter {
-	n := float64(max(capacity, minBloomCapacity))
-	m := uint64(math.Ceil(-n * math.Log(p) / (math.Ln2 * math.Ln2)))
-	m = (m + 63) &^ 63
-	k := max(1, int(math.Round(float64(m)/n*math.Ln2)))
-	return &bloomFilter{
-		bits: make([]uint64, m/64),
-		m:    m,
-		k:    k,
-		s1:   maphash.MakeSeed(),
-		s2:   maphash.MakeSeed(),
-	}
+func newFingerprintSet(capacity int) *fingerprintSet {
+	return &fingerprintSet{slots: make([]uint64, capacity+capacity/3+1)}
 }
 
-func (b *bloomFilter) hash(key []byte) (uint64, uint64) {
-	// Double hashing: k probes from two hashes. The step is odd so it's never 0.
-	return maphash.Bytes(b.s1, key), maphash.Bytes(b.s2, key) | 1
-}
-
-func (b *bloomFilter) has(h1, h2 uint64) bool {
-	for i := 0; i < b.k; i++ {
-		bit := (h1 + uint64(i)*h2) % b.m
-		if b.bits[bit/64]&(1<<(bit%64)) == 0 {
-			return false
+// find returns the slot holding fp, or the empty slot where it belongs.
+func (s *fingerprintSet) find(fp uint64) int {
+	// fp is already a keyed hash; its high bits pick the starting slot.
+	i, _ := bits.Mul64(fp, uint64(len(s.slots)))
+	for {
+		if v := s.slots[i]; v == fp || v == 0 {
+			return int(i)
+		}
+		if i++; i == uint64(len(s.slots)) {
+			i = 0
 		}
 	}
-	return true
 }
 
-func (b *bloomFilter) add(h1, h2 uint64) {
-	for i := 0; i < b.k; i++ {
-		bit := (h1 + uint64(i)*h2) % b.m
-		b.bits[bit/64] |= 1 << (bit % 64)
+func (s *fingerprintSet) has(fp uint64) bool {
+	return s.slots[s.find(fp)] == fp
+}
+
+func (s *fingerprintSet) add(fp uint64) {
+	if i := s.find(fp); s.slots[i] == 0 {
+		s.slots[i] = fp
+		s.n++
 	}
-	b.n++
 }
