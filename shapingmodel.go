@@ -198,12 +198,49 @@ func parseShapingModel(b []byte) (*shapingModel, error) {
 				return nil, err
 			}
 		}
+		if err := p.validate(); err != nil {
+			return nil, fmt.Errorf("shaping model position %d: %w", len(m.positions), err)
+		}
 		m.positions = append(m.positions, p)
 	}
 	if r.Len() != 0 {
 		return nil, fmt.Errorf("shaping model: %d trailing bytes", r.Len())
 	}
 	return m, nil
+}
+
+// validate checks that every bin a position refers to exists.
+func (p *shapingPosition) validate() error {
+	if p.exact {
+		return nil
+	}
+	for _, b := range p.lookup {
+		if int(b) >= len(p.bins) {
+			return fmt.Errorf("lookup refers to bin %d of %d", b, len(p.bins))
+		}
+	}
+	check := func(o *shapingOutcomes) error {
+		for _, x := range o.outs {
+			if int(x.value) >= len(p.bins) {
+				return fmt.Errorf("outcome refers to bin %d of %d", x.value, len(p.bins))
+			}
+		}
+		return nil
+	}
+	for _, o := range p.rows {
+		if err := check(o); err != nil {
+			return err
+		}
+	}
+	for i := range p.fallback {
+		if err := check(&p.fallback[i]); err != nil {
+			return err
+		}
+	}
+	if p.first != nil {
+		return check(p.first)
+	}
+	return nil
 }
 
 // quantize maps a packet size to this position's value for it.
@@ -222,8 +259,8 @@ func (p *shapingPosition) size(rng *rand.Rand, value uint16) int {
 		return int(value)
 	}
 	b := &p.bins[value]
-	if len(b.values) == 0 {
-		return 0
+	if len(b.values) == 0 || b.cum[len(b.cum)-1] == 0 {
+		return 1
 	}
 	r := rng.Uint64N(b.cum[len(b.cum)-1])
 	return int(b.values[sort.Search(len(b.cum), func(i int) bool { return b.cum[i] > r })])
@@ -255,7 +292,8 @@ func (m *shapingModel) schedule(rng *rand.Rand, n int, clientFirst bool) []int {
 		if !ok {
 			o, _ = p.fallback[prevDir].sample(rng, keep)
 		}
-		size := p.size(rng, o.value)
+		// A size of 0 would lose its direction in the signed schedule.
+		size := max(1, p.size(rng, o.value))
 		prevDir, prevSize = o.dir, size
 		if o.dir == 1 {
 			sched = append(sched, size)

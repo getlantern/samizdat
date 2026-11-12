@@ -142,3 +142,16 @@ func TestPruneKeepsTopMass(t *testing.T) {
 		t.Fatalf("weights %+v, want sorted by outcome and scaled to the most likely", kept)
 	}
 }
+
+func TestBuildRejectsBadPositionsAndSequences(t *testing.T) {
+	if _, err := build(tinyProfile(), tinyModel(), 0, 1); err == nil {
+		t.Fatal("0 positions accepted")
+	}
+	var p postcard
+	p = p.varint(1)
+	p = p.histogram([]tinyEntry{{[][2]uint64{{1, 100}, {0, 200}}, 1}}, 2)
+	p = p.varint(1)
+	if _, err := build(p, tinyModel(), 10, 1); err == nil {
+		t.Fatal("a two-packet sequence at position 0 accepted")
+	}
+}
