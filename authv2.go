@@ -30,7 +30,13 @@ import (
 // fails to open, since the copier has neither the key share's private key
 // nor the same ClientHello; and no part of it is the same from one
 // connection to the next, where version 1 starts with the shortID in the
-// clear. A server accepts both versions, so older clients keep working.
+// clear. A server accepts both versions, so older clients keep working,
+// unless ServerConfig.RequireAuthV2 is set.
+//
+// The binding doesn't stop a ClientHello being sent again whole. That one
+// authenticates until its time is more than MaxClockSkew from the server's,
+// which is what the time is for, and until then the replay filter refuses
+// it (replay.go), as it does a version 1 SessionID.
 
 const (
 	authV2Label   = "SAMIZDAT-v2"
@@ -214,16 +220,41 @@ func verifyClientHelloV2(msg []byte, ch *clientHello, privateKey []byte, shortID
 
 // AuthenticateClientHello checks a ClientHello handshake message, as read
 // from its TLS record (starting with its type and length), for a version 2
-// or version 1 SessionID. Version 2 needs the whole ClientHello, which
-// samizdat's client sends in one record under the server's X25519 private key and one of
-// shortIDs. It returns the shortID and true if either authenticates. It
-// doesn't remember SessionIDs: a caller that admits connections itself
-// must refuse repeats, as Server does.
+// or version 1 SessionID, and returns its shortID and true if either
+// authenticates.
+//
+// privateKey is the server's X25519 private key and shortIDs the ones it
+// accepts. maxSkew is how far a version 2 SessionID's time may be from this
+// machine's; zero means DefaultMaxClockSkew. Version 2 needs the whole
+// ClientHello, which samizdat's client sends in one record.
+//
+// It doesn't remember SessionIDs: a caller that admits connections itself
+// must refuse repeats, as Server does. That matters for version 2 as well
+// as version 1: a version 2 SessionID fails in any other ClientHello, but
+// its own ClientHello, sent again unchanged, authenticates until its time
+// is more than maxSkew away.
 func AuthenticateClientHello(msg, privateKey []byte, shortIDs [][shortIDLen]byte, maxSkew time.Duration) ([shortIDLen]byte, bool) {
+	pub, err := curve25519.X25519(privateKey, curve25519.Basepoint)
+	if err != nil {
+		return [shortIDLen]byte{}, false
+	}
+	if maxSkew == 0 {
+		maxSkew = DefaultMaxClockSkew
+	}
+	return authenticateClientHello(msg, privateKey, pub, shortIDs, maxSkew, false)
+}
+
+// authenticateClientHello is AuthenticateClientHello with the server's
+// public key, which version 1 is keyed by, already derived, and with version
+// 1 refused when v2Only is set.
+func authenticateClientHello(msg, privateKey, publicKey []byte, shortIDs [][shortIDLen]byte, maxSkew time.Duration, v2Only bool) ([shortIDLen]byte, bool) {
 	if ch, err := parseClientHello(msg); err == nil {
 		if id, ok := verifyClientHelloV2(msg, ch, privateKey, shortIDs, maxSkew, authNow()); ok {
 			return id, true
 		}
+	}
+	if v2Only {
+		return [shortIDLen]byte{}, false
 	}
 	// Version 1 needs only the SessionID, near the start: msg may be the
 	// first of several records a ClientHello was split across, which version
@@ -232,10 +263,6 @@ func AuthenticateClientHello(msg, privateKey []byte, shortIDs [][shortIDLen]byte
 	if err != nil {
 		return [shortIDLen]byte{}, false
 	}
-	pub, err := curve25519.X25519(privateKey, curve25519.Basepoint)
-	if err != nil {
-		return [shortIDLen]byte{}, false
-	}
-	id, ok, err := VerifySessionID(sessionID, pub, shortIDs)
+	id, ok, err := VerifySessionID(sessionID, publicKey, shortIDs)
 	return id, ok && err == nil
 }

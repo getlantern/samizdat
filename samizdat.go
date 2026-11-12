@@ -74,6 +74,13 @@ type ClientConfig struct {
 	// 2 (authv2.go), which servers from before version 2 need. Version 1's
 	// SessionID can be copied into another ClientHello and starts with the
 	// shortID in the clear.
+	//
+	// Version 2 carries the client's time, and a server refuses one more
+	// than its MaxClockSkew (12 hours by default) from its own, as it does
+	// any failed auth: by passing the connection to its cover site. A client
+	// whose clock is that far off can't tell, unless ServerCertSPKISHA256 is
+	// set: without it the client completes the cover site's handshake and
+	// sends its CONNECT requests there. Set ServerCertSPKISHA256.
 	LegacyAuth bool
 
 	// Connection management
@@ -134,7 +141,9 @@ type ServerConfig struct {
 	// SessionID and refuses it again, sending the connection to the
 	// masquerade as if auth had failed. Each is remembered for between
 	// ReplayWindow and twice that (default: 24h). Negative turns replay
-	// protection off. The record is this Server's alone and is kept in
+	// protection off, and with it off a version 2 ClientHello sent again
+	// unchanged authenticates until MaxClockSkew has passed. It must be at
+	// least twice MaxClockSkew. The record is this Server's alone and is kept in
 	// memory: a restarted or newly created Server, or another one using the
 	// same key pair, accepts a SessionID this one has seen.
 	ReplayWindow time.Duration
@@ -147,8 +156,16 @@ type ServerConfig struct {
 	ReplayCapacity int
 
 	// MaxClockSkew is how far a version 2 SessionID's time may be from the
-	// server's (default: DefaultMaxClockSkew).
+	// server's (default: DefaultMaxClockSkew, or half of ReplayWindow if
+	// that is less). A client whose clock is further off is refused like any
+	// failed auth and sent to the masquerade; see ClientConfig.LegacyAuth.
 	MaxClockSkew time.Duration
+
+	// RequireAuthV2 refuses version 1 SessionIDs (auth.go), which can be
+	// copied into another ClientHello and carry the shortID in the clear.
+	// Set it once every client of this server sends version 2: clients from
+	// before version 2, and ones with ClientConfig.LegacyAuth, then fail.
+	RequireAuthV2 bool
 
 	// LeanH2 serves tunnels with samizdat's own HTTP/2 server instead of
 	// x/net's. Clients see the same frames; the server uses much less CPU
@@ -189,6 +206,11 @@ func (c *ServerConfig) applyDefaults() {
 	}
 	if c.MaxClockSkew == 0 {
 		c.MaxClockSkew = DefaultMaxClockSkew
+		// The replay filter has to outlast the time a version 2 ClientHello
+		// stays valid; see NewServer.
+		if c.ReplayWindow > 0 && c.ReplayWindow/2 < c.MaxClockSkew {
+			c.MaxClockSkew = c.ReplayWindow / 2
+		}
 	}
 	if c.ReplayCapacity == 0 {
 		c.ReplayCapacity = 1_000_000
