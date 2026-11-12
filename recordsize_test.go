@@ -13,9 +13,10 @@ import (
 
 // With dynamic record sizing on, crypto/tls (and uTLS) cap the kth
 // application-data record of a connection's first 128 KB at k times the
-// payload that fits an assumed 1208-byte TCP segment: with TLS 1.3's 22
-// bytes of record overhead (header, AEAD tag, content type), a full record
-// is goTLSRecordOverhead + k*goTLSRecordUnit bytes on the wire. A bulk
+// payload that fits an assumed 1208-byte TCP segment, up to the 16 KB most a
+// record holds: with TLS 1.3's 22 bytes of record overhead (header, AEAD
+// tag, content type), a full record is goTLSRecordOverhead +
+// min(k*goTLSRecordUnit, 16384) bytes on the wire. A bulk
 // transfer then shows a run of records growing by exactly goTLSRecordUnit,
 // which no browser or mainstream server produces (CenKL, IEEE S&P 2027).
 const (
