@@ -1218,3 +1218,91 @@ func TestFailedOpenLeavesIdleSince(t *testing.T) {
 		t.Error("a stream ending left idleSince unchanged")
 	}
 }
+
+// TestLeanH2CapsDataFrames: a client that accepts large frames still gets
+// DATA frames of at most leanWriteChunk, so a control frame queued behind
+// one waits for a chunk and no more.
+func TestLeanH2CapsDataFrames(t *testing.T) {
+	const total = 300 << 10
+	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {
+		conn.Write(make([]byte, total))
+	})
+	p.fr.SetMaxReadFrameSize(1 << 20)
+	if _, err := p.conn.Write([]byte(http2.ClientPreface)); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.fr.WriteSettings(
+		http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4 << 20},
+		http2.Setting{ID: http2.SettingMaxFrameSize, Val: 1 << 20},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.fr.WriteWindowUpdate(0, 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	p.request(t, 1, "CONNECT", "example.com:443", true)
+	got := 0
+	for {
+		f, err := p.fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("after %d bytes: %v", got, err)
+		}
+		df, ok := f.(*http2.DataFrame)
+		if !ok {
+			continue
+		}
+		if n := len(df.Data()); n > leanWriteChunk {
+			t.Fatalf("DATA frame of %d bytes, want at most %d", n, leanWriteChunk)
+		}
+		got += len(df.Data())
+		if df.StreamEnded() {
+			break
+		}
+	}
+	if got != total {
+		t.Errorf("received %d bytes, want %d", got, total)
+	}
+}
+
+// TestLeanH2CountsResetsBehindUnsentData: the control frames queued in wbuf
+// stay counted against leanMaxQueuedControl until the writer takes wbuf, not
+// each time it sends a chunk of the buffer it took before.
+func TestLeanH2CountsResetsBehindUnsentData(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	bc := &batchConn{Conn: c1}
+	c := &leanConn{conn: bc, bc: bc, cancel: func() {}, writerDone: make(chan struct{})}
+	c.wcond = sync.NewCond(&c.mu)
+	for range 12 { // three chunks of DATA
+		c.wbuf = appendFrameHeader(c.wbuf, 16384, http2.FrameData, 0, 1)
+		c.wbuf = append(c.wbuf, make([]byte, 16384)...)
+	}
+	go c.writeLoop()
+	defer c.close()
+
+	c2.SetDeadline(time.Now().Add(10 * time.Second))
+	fr := http2.NewFramer(nil, c2)
+	if _, err := fr.ReadFrame(); err != nil { // the writer has taken wbuf
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.wbuf = appendRSTStream(c.wbuf, 3, http2.ErrCodeStreamClosed)
+	err := c.queuedControlFrame()
+	c.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read into the second chunk: the writer has gone round its loop, with
+	// the reset still waiting in wbuf.
+	for range leanWriteChunk/16384 + 1 {
+		if _, err := fr.ReadFrame(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.mu.Lock()
+	n := c.queuedControl
+	c.mu.Unlock()
+	if n != 1 {
+		t.Errorf("queuedControl = %d with a reset still queued, want 1", n)
+	}
+}

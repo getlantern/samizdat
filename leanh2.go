@@ -49,7 +49,9 @@ const (
 	// each one socket write, and sends any control frames queued meanwhile
 	// ahead of the next chunk. A PING or SETTINGS acknowledgement or a
 	// WINDOW_UPDATE then waits behind one chunk at most, not behind a full
-	// write buffer, which on a slow link is seconds of a bulk download.
+	// write buffer, which on a slow link is seconds of a bulk download. No
+	// DATA frame carries more, whatever frame size the client accepts, so
+	// one frame can't make a chunk much larger.
 	leanWriteChunk     = 64 << 10
 	leanReadBuffer     = 32 << 10
 	leanFrameHeaderLen = 9
@@ -150,10 +152,13 @@ type leanConn struct {
 
 	wbuf  []byte // stream frames queued for the writer, and RST_STREAM and GOAWAY
 	spare []byte // the writer's previous buffer, for reuse
-	// cbuf holds the control frames that have no place in a stream's order
-	// (PING and SETTINGS acknowledgements, SETTINGS, WINDOW_UPDATE). The
-	// writer sends them ahead of wbuf, as x/net's server sends control
-	// frames first. cspare is its previous buffer, for reuse.
+	// cbuf holds the control frames that have no place in the order of the
+	// frames in wbuf (PING acknowledgements, WINDOW_UPDATE, the first
+	// SETTINGS). The writer sends them ahead of wbuf, as x/net's server sends
+	// control frames first. A SETTINGS acknowledgement is not one of them:
+	// it tells the client its settings are in effect, so it must follow the
+	// frames queued under the old ones. cspare is cbuf's previous buffer,
+	// for reuse.
 	cbuf   []byte
 	cspare []byte
 	closed bool
@@ -167,9 +172,11 @@ type leanConn struct {
 	// the buffers once it has stayed idle for leanIdleTrimDelay.
 	writerIdle bool
 	trimTimer  *time.Timer
-	// queuedControl counts the control frames the read loop queued since the
-	// writer last took the buffer; see leanMaxQueuedControl.
-	queuedControl int
+	// queuedControl counts the control frames the read loop queued in wbuf
+	// since the writer last took it, and queuedPriority those it queued in
+	// cbuf since the writer last took that; see leanMaxQueuedControl.
+	queuedControl  int
+	queuedPriority int
 
 	streams map[uint32]*leanStream
 	// peekedStreamID is the highest stream ID of a HEADERS frame read so
@@ -287,8 +294,21 @@ func (c *leanConn) queued() { c.wcond.Signal() }
 // reading, which ends the connection. c.mu must be held.
 func (c *leanConn) queuedControlFrame() error {
 	c.queuedControl++
+	return c.queuedAnswer()
+}
+
+// queuedPriorityFrame is queuedControlFrame for a frame queued in cbuf.
+// c.mu must be held.
+func (c *leanConn) queuedPriorityFrame() error {
+	c.queuedPriority++
+	return c.queuedAnswer()
+}
+
+// queuedAnswer wakes the writer and fails once the answers it hasn't taken,
+// in either buffer, pass leanMaxQueuedControl. c.mu must be held.
+func (c *leanConn) queuedAnswer() error {
 	c.queued()
-	if c.queuedControl > leanMaxQueuedControl {
+	if c.queuedControl+c.queuedPriority > leanMaxQueuedControl {
 		return errLeanCalm
 	}
 	return nil
@@ -309,7 +329,7 @@ func (c *leanConn) handleFrame(f http2.Frame) error {
 			c.mu.Lock()
 			c.cbuf = appendFrameHeader(c.cbuf, 8, http2.FramePing, http2.FlagPingAck, 0)
 			c.cbuf = append(c.cbuf, f.Data[:]...)
-			err := c.queuedControlFrame()
+			err := c.queuedPriorityFrame()
 			c.mu.Unlock()
 			return err
 		}
@@ -378,7 +398,11 @@ func (c *leanConn) handleSettings(f *http2.SettingsFrame) error {
 			st.cond.Broadcast()
 		}
 	}
-	c.cbuf = appendFrameHeader(c.cbuf, 0, http2.FrameSettings, http2.FlagSettingsAck, 0)
+	// The acknowledgement goes in wbuf, behind the frames queued under the
+	// client's previous settings: sent ahead of them, it would tell the
+	// client that frames sized or encoded for the old settings follow the
+	// new ones.
+	c.wbuf = appendFrameHeader(c.wbuf, 0, http2.FrameSettings, http2.FlagSettingsAck, 0)
 	return c.queuedControlFrame()
 }
 
@@ -629,11 +653,15 @@ func (c *leanConn) writeLoop() {
 		if len(c.cbuf) > 0 {
 			ctl = c.cbuf
 			c.cbuf, c.cspare = c.cspare[:0], nil
+			c.queuedPriority = 0
 		}
 		if len(cur) == 0 && len(c.wbuf) > 0 {
 			taken = c.wbuf
 			cur = taken
 			c.wbuf, c.spare = c.spare[:0], nil
+			// Only now: the control frames in wbuf stay queued, and counted,
+			// while the writer works through the buffer it took before.
+			c.queuedControl = 0
 			for _, st := range c.roomWaiters {
 				st.waitingRoom = false
 				st.roomCond.Broadcast()
@@ -641,7 +669,6 @@ func (c *leanConn) writeLoop() {
 			clear(c.roomWaiters)
 			c.roomWaiters = c.roomWaiters[:0]
 		}
-		c.queuedControl = 0
 		c.mu.Unlock()
 
 		chunk := leanChunk(cur)
@@ -1015,7 +1042,7 @@ func (st *leanStream) endLocked(body []byte) {
 		// negative length here panics.
 		n := 0
 		if len(body) > 0 {
-			n = max(0, min(len(body), c.peerMaxFrame, int(st.sendWin), int(c.connSendWin)))
+			n = max(0, min(len(body), c.peerMaxFrame, leanWriteChunk, int(st.sendWin), int(c.connSendWin)))
 		}
 		last := n == len(body)
 		flags := http2.Flags(0)
@@ -1208,7 +1235,7 @@ func (sc *leanStreamConn) Write(b []byte) (int, error) {
 		// Bounded by the buffer's room too, so one large frame can't carry
 		// the buffer far past leanMaxWriteBuffer.
 		room := leanMaxWriteBuffer - len(c.wbuf) - leanFrameHeaderLen
-		n := min(len(b)-written, c.peerMaxFrame, int(st.sendWin), int(c.connSendWin), room)
+		n := min(len(b)-written, c.peerMaxFrame, leanWriteChunk, int(st.sendWin), int(c.connSendWin), room)
 		c.wbuf = appendFrameHeader(c.wbuf, n, http2.FrameData, 0, st.id)
 		c.wbuf = append(c.wbuf, b[written:written+n]...)
 		st.sendWin -= int64(n)
