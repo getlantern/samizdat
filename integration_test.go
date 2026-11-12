@@ -71,6 +71,11 @@ func startTestServer(t *testing.T, config ServerConfig) (*Server, net.Listener) 
 	if os.Getenv("SAMIZDAT_TEST_LEAN_H2") != "" {
 		config.LeanH2 = true
 	}
+	// SAMIZDAT_TEST_SHAPING_SERVER runs them against a server that accepts
+	// shaping clients, with the tests' clients, which don't shape.
+	if os.Getenv("SAMIZDAT_TEST_SHAPING_SERVER") != "" && config.SessionHandler == nil {
+		config.ShapeTraffic = true
+	}
 	server, err := NewServer(config)
 	if err != nil {
 		ln.Close()

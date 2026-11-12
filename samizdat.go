@@ -58,6 +58,12 @@ type ClientConfig struct {
 
 	// TCP fragmentation (Geneva-inspired)
 	TCPFragmentation    bool // fragment ClientHello across TCP segments (default: true)
+
+	// ShapeTraffic shapes the sizes and directions of each connection's
+	// first TLS records to match real TLS traffic (see shaping.go). Set it
+	// only for servers with ServerConfig.ShapeTraffic: a server without it
+	// fails the connection.
+	ShapeTraffic bool
 	RecordFragmentation bool // fragment inner TLS records across H2 DATA frames (default: true)
 
 	// Connection management
@@ -136,6 +142,11 @@ type ServerConfig struct {
 	// and has no effect when SessionHandler is set, since a session runs no
 	// HTTP/2 server.
 	LeanH2 bool
+
+	// ShapeTraffic accepts clients that shape their connections' first TLS
+	// records (ClientConfig.ShapeTraffic; see shaping.go). Clients that don't
+	// shape keep working. It has no effect when SessionHandler is set.
+	ShapeTraffic bool
 
 	// Handler: called for each authenticated proxied connection
 	Handler ConnHandler
