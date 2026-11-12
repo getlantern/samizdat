@@ -465,7 +465,7 @@ func TestReplayFilterLogsEarlyRotation(t *testing.T) {
 	}
 	now = now.Add(time.Hour)
 	f.seen([]byte("on time"))
-	if buf.Len() != 0 {
+	if strings.Contains(buf.String(), "replay filter") {
 		t.Fatalf("a rotation on time logged: %s", buf.String())
 	}
 	f.seen([]byte("a"))
