@@ -669,3 +669,27 @@ func TestShapingServerSendsNoSessionTickets(t *testing.T) {
 		}
 	}
 }
+
+// TestShapingScheduleCapsPackets: no schedule asks for a packet larger than
+// shapingMaxPacket, though the model has many 1460-byte packets.
+func TestShapingScheduleCapsPackets(t *testing.T) {
+	m, err := loadShapingModel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rng := mrand.New(mrand.NewChaCha8([32]byte{7}))
+	at1448 := 0
+	for range 5000 {
+		for _, s := range m.schedule(rng, shapingRecords, true) {
+			if abs(s) > shapingMaxPacket {
+				t.Fatalf("schedule asks for a %d-byte packet", abs(s))
+			}
+			if abs(s) == shapingMaxPacket {
+				at1448++
+			}
+		}
+	}
+	if at1448 == 0 {
+		t.Fatal("no full-size packets drawn: the cap left out more than sizes above it")
+	}
+}

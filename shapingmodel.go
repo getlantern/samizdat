@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
+	"slices"
 	"sort"
 	"sync"
 )
@@ -31,8 +32,21 @@ import (
 // where outcomes are a count and (direction<<15 | size or bin, weight u16)...
 // Direction 1 is client to server.
 //
+// The model and the sampler are part of the protocol: both ends draw the
+// schedule from their own copy, and a client and server that draw different
+// schedules fail to connect (see shapingMarker). Changing either, the model,
+// the cap below or how schedule samples, needs a new version that servers
+// accept alongside the old one for as long as clients use it.
+//
 //go:embed shaping_model.bin.gz
 var shapingModelGz []byte
+
+// shapingMaxPacket is the largest packet the schedule asks for. The model
+// counts 1460-byte packets, from senders without TCP timestamps, but Linux
+// servers send timestamps and fit 1448 bytes in a packet, so a 1460-byte
+// record leaves as 1448 and 12. Larger sizes are left out and the rest keep
+// their weights.
+const shapingMaxPacket = 1448
 
 type shapingOutcome struct {
 	dir    uint8
@@ -204,6 +218,7 @@ func parseShapingModel(b []byte) (*shapingModel, error) {
 		if err := p.validate(); err != nil {
 			return nil, fmt.Errorf("shaping model position %d: %w", len(m.positions), err)
 		}
+		p.capSizes(shapingMaxPacket)
 		m.positions = append(m.positions, p)
 	}
 	if r.Len() != 0 {
@@ -247,6 +262,49 @@ func (p *shapingPosition) validate() error {
 		return check(p.first)
 	}
 	return nil
+}
+
+// capSizes leaves out sizes above max: values of empirical bins, and the
+// outcomes that then have nothing left to draw.
+func (p *shapingPosition) capSizes(max int) {
+	if !p.exact {
+		for i := range p.bins {
+			b := &p.bins[i]
+			var values []uint16
+			var cum []uint64
+			var total, prev uint64
+			for j, v := range b.values {
+				c := b.cum[j] - prev
+				prev = b.cum[j]
+				if int(v) > max {
+					continue
+				}
+				total += c
+				values = append(values, v)
+				cum = append(cum, total)
+			}
+			b.values, b.cum = values, cum
+		}
+	}
+	usable := func(o shapingOutcome) bool {
+		if p.exact {
+			return int(o.value) <= max
+		}
+		b := &p.bins[o.value]
+		return len(b.values) > 0 && b.cum[len(b.cum)-1] > 0
+	}
+	filter := func(o *shapingOutcomes) {
+		o.outs = slices.DeleteFunc(o.outs, func(x shapingOutcome) bool { return !usable(x) })
+	}
+	if p.first != nil {
+		filter(p.first)
+	}
+	for _, o := range p.rows {
+		filter(o)
+	}
+	for i := range p.fallback {
+		filter(&p.fallback[i])
+	}
 }
 
 // quantize maps a packet size to this position's value for it.
