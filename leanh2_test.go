@@ -203,6 +203,8 @@ func TestLeanH2MatchesXNet(t *testing.T) {
 		{"connect with only scheme", "CONNECT", "example.com:443", path[:1]},
 		{"get with ftp scheme", "GET", "example.com", []hpack.HeaderField{{Name: ":scheme", Value: "ftp"}, {Name: ":path", Value: "/"}}},
 		{"get", "GET", "example.com", path},
+		{"head", "HEAD", "example.com", path},
+		{"head with header list too large", "HEAD", "example.com", append(slices.Clone(path), manyHeaders(70, 16<<10)...)},
 		{"get without path", "GET", "example.com", nil},
 		{"no method", "", "example.com", path},
 		{"header field too large", "CONNECT", "example.com:443", []hpack.HeaderField{{Name: "x-big", Value: strings.Repeat("a", 1100<<10)}}},
@@ -947,29 +949,95 @@ func TestLeanH2EndsStreamWithNegativeWindow(t *testing.T) {
 // servers and compares the frames each sends back before ending the
 // connection.
 func TestLeanH2MatchesXNetOnBadPeers(t *testing.T) {
+	// settle lets a stream's response HEADERS go out first: x/net's server
+	// writes them from another goroutine, so they could otherwise follow the
+	// frames under test.
+	settle := func() { time.Sleep(200 * time.Millisecond) }
+	// idleData ends a script whose server would otherwise keep the
+	// connection open: DATA on a stream never opened is a connection error.
+	idleData := func(p *h2Peer) {
+		settle()
+		p.fr.WriteData(99, false, []byte("x"))
+	}
+	trailers := func(p *h2Peer, fields ...hpack.HeaderField) {
+		p.hbuf.Reset()
+		for _, f := range fields {
+			p.enc.WriteField(f)
+		}
+		p.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: p.hbuf.Bytes(), EndHeaders: true, EndStream: true})
+	}
 	cases := []struct {
 		name   string
+		hold   bool // the handler runs until its stream ends
 		script func(t *testing.T, p *h2Peer)
 	}{
-		{"no settings after the preface", func(t *testing.T, p *h2Peer) {
+		{"no settings after the preface", false, func(t *testing.T, p *h2Peer) {
 			p.conn.Write([]byte(http2.ClientPreface))
 			p.fr.WritePing(false, [8]byte{})
 		}},
-		{"frame too large", func(t *testing.T, p *h2Peer) {
+		{"frame too large", false, func(t *testing.T, p *h2Peer) {
 			p.handshake(t)
 			p.fr.WriteRawFrame(http2.FrameData, 0, 1, make([]byte, leanMaxReadFrameSize+1))
 		}},
-		{"headers for a gone stream", func(t *testing.T, p *h2Peer) {
+		{"headers for a gone stream", false, func(t *testing.T, p *h2Peer) {
 			p.handshake(t)
 			p.request(t, 1, "CONNECT", "example.com:443", true)
 			time.Sleep(300 * time.Millisecond) // the stream finishes
 			p.request(t, 1, "CONNECT", "example.com:443", true)
 		}},
+		{"data on an idle stream", false, func(t *testing.T, p *h2Peer) {
+			p.handshake(t)
+			p.fr.WriteData(3, false, []byte("x"))
+		}},
+		{"window update on an idle stream", false, func(t *testing.T, p *h2Peer) {
+			p.handshake(t)
+			p.fr.WriteWindowUpdate(3, 1)
+		}},
+		{"rst_stream on an idle stream", false, func(t *testing.T, p *h2Peer) {
+			p.handshake(t)
+			p.fr.WriteRSTStream(3, http2.ErrCodeCancel)
+		}},
+		{"data after end_stream", true, func(t *testing.T, p *h2Peer) {
+			p.handshake(t)
+			p.request(t, 1, "CONNECT", "example.com:443", true)
+			settle()
+			p.fr.WriteData(1, false, []byte("x"))
+			idleData(p)
+		}},
+		{"trailers with a pseudo-header", true, func(t *testing.T, p *h2Peer) {
+			p.handshake(t)
+			p.request(t, 1, "CONNECT", "example.com:443", false)
+			settle()
+			trailers(p, hpack.HeaderField{Name: ":path", Value: "/"})
+			idleData(p)
+		}},
+		{"stream window overflow", true, func(t *testing.T, p *h2Peer) {
+			p.handshake(t)
+			p.request(t, 1, "CONNECT", "example.com:443", false)
+			settle()
+			p.fr.WriteWindowUpdate(1, 1<<31-1)
+			idleData(p)
+		}},
+		{"connection window overflow", false, func(t *testing.T, p *h2Peer) {
+			p.handshake(t) // the connection window is now 1<<30 + 65535
+			p.fr.WriteWindowUpdate(0, 1<<30)
+		}},
+		{"initial window size overflow", true, func(t *testing.T, p *h2Peer) {
+			p.handshake(t) // initial window 4 MiB
+			p.request(t, 1, "CONNECT", "example.com:443", false)
+			settle()
+			p.fr.WriteWindowUpdate(1, 1<<31-1-4<<20)
+			p.fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 4<<20 + 1})
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			run := func(lean bool) string {
-				p := startH2Pair(t, lean, func(ctx context.Context, conn net.Conn, dest string) {})
+				p := startH2Pair(t, lean, func(ctx context.Context, conn net.Conn, dest string) {
+					if c.hold {
+						<-ctx.Done()
+					}
+				})
 				go c.script(t, p)
 				var out []string
 				for {
