@@ -206,6 +206,9 @@ func (c *Client) dialConn(ctx context.Context) (*utls.UConn, error) {
 		ServerName:         c.config.ServerName,
 		InsecureSkipVerify: true, // We verify via Reality auth, not PKI
 		NextProtos:         []string{"h2"},
+		// Go's dynamic record sizing grows early records in steps of one
+		// assumed 1208-byte segment, which Chrome never does.
+		DynamicRecordSizingDisabled: true,
 	}
 	if pin := c.config.ServerCertSPKISHA256; len(pin) > 0 {
 		// InsecureSkipVerify skips only chain verification; this still runs.
