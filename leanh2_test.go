@@ -646,7 +646,7 @@ func TestRetiredTransportKeepsItsStreams(t *testing.T) {
 	if tr.isClosed() {
 		t.Fatal("retiring closed a transport that still carries a stream")
 	}
-	if tr.hasCapacity() {
+	if tr.tryReserve() {
 		t.Fatal("a retired transport still takes new streams")
 	}
 	pr, pw := io.Pipe()
@@ -802,7 +802,7 @@ func TestRetiredTransportWaitsForOpeningStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr.activeStreams.Add(1) // what openTunnel counts before RoundTrip
+	tr.activeStreams.Add(1) // the slot reserved before RoundTrip
 	tr.retire()
 	if tr.isClosed() {
 		t.Fatal("retiring closed a transport with a CONNECT in flight")
@@ -1075,5 +1075,146 @@ func TestPoolClosedWhileDialing(t *testing.T) {
 	}
 	if !created.isClosed() {
 		t.Fatal("the transport dialed for a closed pool was left open")
+	}
+}
+
+// TestLeanChunk: the writer's chunks are whole frames, as few as reach
+// leanWriteChunk.
+func TestLeanChunk(t *testing.T) {
+	var b []byte
+	for range 10 {
+		b = appendFrameHeader(b, 16384, http2.FrameData, 0, 1)
+		b = append(b, make([]byte, 16384)...)
+	}
+	const frame = leanFrameHeaderLen + 16384
+	if got, want := len(leanChunk(b)), 4*frame; got != want {
+		t.Errorf("chunk of ten frames = %d bytes, want %d", got, want)
+	}
+	if got := len(leanChunk(b[:2*frame])); got != 2*frame {
+		t.Errorf("chunk of two frames = %d bytes, want %d", got, 2*frame)
+	}
+	if got := len(leanChunk(nil)); got != 0 {
+		t.Errorf("chunk of nothing = %d bytes", got)
+	}
+}
+
+// TestLeanH2ControlFramesPassQueuedData: a control frame queued while the
+// writer is sending a full buffer of DATA to a slow client must go out after
+// the chunk in flight, not after the whole buffer.
+func TestLeanH2ControlFramesPassQueuedData(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	bc := &batchConn{Conn: c1}
+	c := &leanConn{conn: bc, bc: bc, cancel: func() {}, writerDone: make(chan struct{})}
+	c.wcond = sync.NewCond(&c.mu)
+	const frames = 24 // 384 KiB of DATA, several chunks
+	for range frames {
+		c.wbuf = appendFrameHeader(c.wbuf, 16384, http2.FrameData, 0, 1)
+		c.wbuf = append(c.wbuf, make([]byte, 16384)...)
+	}
+	go c.writeLoop()
+	defer c.close()
+
+	c2.SetDeadline(time.Now().Add(10 * time.Second))
+	fr := http2.NewFramer(nil, c2)
+	// The writer is now blocked sending its first chunk: the pipe hands over
+	// only what is read.
+	if _, err := fr.ReadFrame(); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.cbuf = appendFrameHeader(c.cbuf, 8, http2.FramePing, http2.FlagPingAck, 0)
+	c.cbuf = append(c.cbuf, make([]byte, 8)...)
+	c.queued()
+	c.mu.Unlock()
+
+	data := 1
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			t.Fatalf("after %d DATA frames: %v", data, err)
+		}
+		if f.Header().Type == http2.FramePing {
+			break
+		}
+		data++
+	}
+	if most := leanWriteChunk/16384 + 1; data > most {
+		t.Errorf("PING ACK followed %d DATA frames, want at most %d (one chunk)", data, most)
+	}
+	// The rest of the buffer still arrives, in order.
+	for ; data < frames; data++ {
+		if f, err := fr.ReadFrame(); err != nil || f.Header().Type != http2.FrameData {
+			t.Fatalf("DATA frame %d: %v, %v", data, f, err)
+		}
+	}
+}
+
+// TestLeanH2ConnWindowUpdateWakesOnlyWaiters: a connection WINDOW_UPDATE
+// wakes the streams waiting for connection credit, and no others.
+func TestLeanH2ConnWindowUpdateWakesOnlyWaiters(t *testing.T) {
+	c := &leanConn{streams: make(map[uint32]*leanStream), connSendWin: 0}
+	c.wcond = sync.NewCond(&c.mu)
+	waiter := &leanStream{c: c, id: 1, cond: sync.NewCond(&c.mu)}
+	other := &leanStream{c: c, id: 3, cond: sync.NewCond(&c.mu)}
+	c.streams[1], c.streams[3] = waiter, other
+
+	woke := make(chan struct{})
+	c.mu.Lock()
+	go func() {
+		c.mu.Lock()
+		waiter.awaitCreditLocked()
+		c.mu.Unlock()
+		close(woke)
+	}()
+	c.mu.Unlock()
+	for {
+		c.mu.Lock()
+		registered := waiter.waitingConn
+		c.mu.Unlock()
+		if registered {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if other.waitingConn || len(c.connWaiters) != 1 {
+		t.Fatalf("connWaiters = %d streams, want only the waiting one", len(c.connWaiters))
+	}
+	if err := c.handleWindowUpdate(&http2.WindowUpdateFrame{Increment: 100}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-woke:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting stream was not woken")
+	}
+}
+
+// TestFailedOpenLeavesIdleSince: a CONNECT that produces no tunnel gives its
+// slot back without making the transport look recently used, so one whose
+// CONNECTs keep failing still idles out.
+func TestFailedOpenLeavesIdleSince(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	tr, err := newH2Transport(c1, "example.com:443", 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.close()
+	old := time.Now().Add(-time.Hour).UnixNano()
+	tr.idleSince.Store(old)
+	if !tr.tryReserve() {
+		t.Fatal("tryReserve failed on an empty transport")
+	}
+	tr.releaseReserved()
+	if got := tr.idleSince.Load(); got != old {
+		t.Errorf("a failed open moved idleSince by %v", time.Duration(got-old))
+	}
+	if !tr.tryReserve() {
+		t.Fatal("tryReserve failed on an empty transport")
+	}
+	tr.releaseStream()
+	if tr.idleSince.Load() == old {
+		t.Error("a stream ending left idleSince unchanged")
 	}
 }
