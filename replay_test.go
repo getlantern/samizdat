@@ -103,8 +103,13 @@ func TestReplayFilterRepeatAtCapacityBoundary(t *testing.T) {
 
 func TestReplayFilterSmallCapacity(t *testing.T) {
 	f := newReplayFilter(time.Hour, 1)
-	if f.cur.m < 1024*28 {
-		t.Fatalf("capacity 1 sized to %d bits, want at least the minimum capacity's", f.cur.m)
+	for _, k := range []string{"a", "b", "c"} {
+		if f.seen([]byte(k)) {
+			t.Fatalf("first use of %s reported as seen", k)
+		}
+	}
+	if !f.seen([]byte("b")) {
+		t.Fatal("repeat accepted with capacity 1")
 	}
 }
 
@@ -163,25 +168,44 @@ func TestReplayFilterRotatesAtCapacity(t *testing.T) {
 	}
 }
 
-func TestReplayFilterFalsePositives(t *testing.T) {
+// TestReplayFilterNoFalseMatches fills both generations and checks that no
+// fresh key matches. A false match sends a real client to the cover site.
+func TestReplayFilterNoFalseMatches(t *testing.T) {
 	const capacity = 100_000
 	f := newReplayFilter(time.Hour, capacity)
 	key := make([]byte, 16)
-	for range capacity - 1 {
+	for range 2 * capacity {
 		rand.Read(key)
-		f.seen(key)
-	}
-	// At 1e-6 per lookup, 100,000 fresh keys against a full filter give 0.1
-	// on average; more than 5 happens by chance about once in 10^9 runs.
-	fp := 0
-	for range 100_000 {
-		rand.Read(key)
-		if f.cur.has(f.cur.hash(key)) {
-			fp++
+		if f.seen(key) {
+			t.Fatal("fresh key matched while filling")
 		}
 	}
-	if fp > 5 {
-		t.Fatalf("%d false positives in 100,000 lookups", fp)
+	for range 200_000 {
+		rand.Read(key)
+		if f.seen(key) {
+			t.Fatal("fresh key matched a full filter")
+		}
+	}
+}
+
+func TestFingerprintSetFull(t *testing.T) {
+	// Filled to capacity, every fingerprint is still found and an absent one
+	// still ends its probe on an empty slot.
+	const capacity = 1000
+	s := newFingerprintSet(capacity)
+	for i := range uint64(capacity) {
+		s.add(i<<1 | 1)
+	}
+	if s.n != capacity {
+		t.Fatalf("holds %d, want %d", s.n, capacity)
+	}
+	for i := range uint64(capacity) {
+		if !s.has(i<<1 | 1) {
+			t.Fatalf("lost %d", i<<1|1)
+		}
+	}
+	if s.has(capacity<<1 | 1) {
+		t.Fatal("found a fingerprint never added")
 	}
 }
 
