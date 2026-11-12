@@ -79,6 +79,20 @@ func build(hist, modelJSON []byte, positions int, keep float64) ([]byte, error) 
 		return nil, err
 	}
 	n := min(positions, len(profile.hists), len(quantizers))
+	if n < 1 || n > 255 {
+		return nil, fmt.Errorf("%d positions; the format holds 1 to 255", n)
+	}
+	for i, h := range profile.hists[:n] {
+		want := 2
+		if i == 0 {
+			want = 1
+		}
+		for _, e := range h.counts {
+			if len(e.seq) != want {
+				return nil, fmt.Errorf("position %d: sequence of %d packets, want %d for a Markov order 1 model", i, len(e.seq), want)
+			}
+		}
+	}
 	var buf bytes.Buffer
 	buf.WriteString("SZSM")
 	buf.WriteByte(1) // format version

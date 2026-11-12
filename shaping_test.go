@@ -430,6 +430,12 @@ func TestShapedConnHonorsDeadlines(t *testing.T) {
 		t.Fatalf("Read returned after %v", d)
 	}
 
+	// An expired write deadline fails even a Write the queue has room for.
+	c.SetWriteDeadline(time.Now().Add(-time.Second))
+	if _, err := c.Write([]byte("x")); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("short Write past its deadline: %v, want a deadline error", err)
+	}
+
 	c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 	start = time.Now()
 	if _, err := c.Write(make([]byte, 2*shapingMaxQueued)); !errors.Is(err, os.ErrDeadlineExceeded) {
@@ -548,5 +554,23 @@ func TestShapedConnFlushFailureWakesReader(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Read still blocked after the flush failed")
+	}
+}
+
+// TestShapingParseRejectsBadBins: a model whose outcomes refer to bins it
+// doesn't have is refused at load, not left to panic while sampling.
+func TestShapingParseRejectsBadBins(t *testing.T) {
+	raw, err := hex.DecodeString(shapingModelGolden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := parseShapingModel(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &m.positions[1]
+	p.fallback[0].outs[0].value = uint16(len(p.bins))
+	if p.validate() == nil {
+		t.Fatal("outcome past the last bin accepted")
 	}
 }

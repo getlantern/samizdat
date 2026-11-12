@@ -88,17 +88,17 @@ func shapingSchedule(ekm func(label string, context []byte, length int) ([]byte,
 			return sched, marker, nil
 		}
 	}
-	// Rare: raise each record to the smallest that holds its framing.
+	// Rare: bring each record within what the framing and a TLS record
+	// allow, keeping its direction.
 	if len(sched) > 0 && sched[0] < 0 {
 		sched[0] = -sched[0]
 	}
 	for i, s := range sched {
-		minSize := shapingMinSize(i)
-		if s > 0 && s < minSize {
-			sched[i] = minSize
-		} else if s < 0 && -s < minSize {
-			sched[i] = -minSize
+		size := min(max(abs(s), shapingMinSize(i)), shapingMaxSize)
+		if s < 0 {
+			size = -size
 		}
+		sched[i] = size
 	}
 	return sched, marker, nil
 }
@@ -111,12 +111,15 @@ func shapingMinSize(i int) int {
 	return n
 }
 
+// shapingMaxSize is the largest TLS 1.3 record on the wire.
+const shapingMaxSize = tls13RecordOverhead + 1<<14
+
 func shapingScheduleFits(sched []int) bool {
 	if len(sched) == 0 || sched[0] <= 0 {
 		return false
 	}
 	for i, s := range sched {
-		if abs(s) < shapingMinSize(i) || abs(s)-tls13RecordOverhead > 1<<14 {
+		if abs(s) < shapingMinSize(i) || abs(s) > shapingMaxSize {
 			return false
 		}
 	}
@@ -248,6 +251,9 @@ func (c *shapedConn) runSchedule() error {
 		if i == 0 {
 			head = shapingMarkerLen
 		}
+		if plain < head+shapingLenLen || plain > len(buf) {
+			return errors.New("samizdat: shaping schedule record out of range")
+		}
 		if mine {
 			rec := buf[:plain]
 			clear(rec)
@@ -344,6 +350,10 @@ func (c *shapedConn) Write(b []byte) (int, error) {
 		return 0, err
 	}
 	if c.shaping {
+		if !c.wdl.IsZero() && !time.Now().Before(c.wdl) {
+			c.mu.Unlock()
+			return 0, os.ErrDeadlineExceeded
+		}
 		c.out = append(c.out, b...)
 		c.cond.Broadcast()
 		c.mu.Unlock()
