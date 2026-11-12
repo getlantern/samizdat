@@ -237,13 +237,18 @@ func TestFingerprintSetFull(t *testing.T) {
 // and pass it to the cover site, not complete the handshake with its own
 // certificate.
 func TestReplayedSessionIDGetsMasquerade(t *testing.T) {
-	t.Run("protected", func(t *testing.T) { testReplayedSessionID(t, 0, true) })
+	// A version 1 SessionID authenticates in any ClientHello, so only the
+	// replay filter stops the copy.
+	t.Run("v1 protected", func(t *testing.T) { testReplayedSessionID(t, true, 0, true) })
 	// Without the filter the copy gets the server's own certificate: the
 	// attack the filter is there for.
-	t.Run("unprotected", func(t *testing.T) { testReplayedSessionID(t, -1, false) })
+	t.Run("v1 unprotected", func(t *testing.T) { testReplayedSessionID(t, true, -1, false) })
+	// A version 2 SessionID is bound to its ClientHello: in another one it
+	// doesn't authenticate, filter or not.
+	t.Run("v2 unprotected", func(t *testing.T) { testReplayedSessionID(t, false, -1, true) })
 }
 
-func testReplayedSessionID(t *testing.T, replayWindow time.Duration, wantCover bool) {
+func testReplayedSessionID(t *testing.T, legacyAuth bool, replayWindow time.Duration, wantCover bool) {
 	coverCertPEM, coverKeyPEM := generateSelfSignedCert(t)
 	coverCert, err := tls.X509KeyPair(coverCertPEM, coverKeyPEM)
 	if err != nil {
@@ -297,6 +302,7 @@ func testReplayedSessionID(t *testing.T, replayWindow time.Duration, wantCover b
 		PublicKey:  serverPub,
 		ShortID:    shortID,
 		Dialer:     rec.dial,
+		LegacyAuth: legacyAuth,
 	})
 	if err != nil {
 		t.Fatal(err)
