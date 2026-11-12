@@ -334,9 +334,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Verify Samizdat auth using PSK derived from server public key
-	shortID, authenticated, err := VerifySessionID(sessionID, s.serverPubKey, *s.shortIDs.Load())
-	if err != nil || !authenticated {
+	// Version 2 auth, then version 1 for older clients (authv2.go).
+	shortID, authenticated := AuthenticateClientHello(handshakeMsg, s.config.PrivateKey, *s.shortIDs.Load(), s.config.MaxClockSkew)
+	if !authenticated {
 		// Auth failed — enter masquerade mode
 		s.doMasquerade(conn, clientHelloRecord)
 		return

@@ -70,6 +70,12 @@ type ClientConfig struct {
 	// open don't.
 	DisableShaping bool
 
+	// LegacyAuth sends the version 1 SessionID (auth.go) instead of version
+	// 2 (authv2.go), which servers from before version 2 need. Version 1's
+	// SessionID can be copied into another ClientHello and starts with the
+	// shortID in the clear.
+	LegacyAuth bool
+
 	// Connection management
 	// MaxStreamsPerConn is the most H2 streams the client opens per TCP
 	// conn (default: 100). It must not exceed the server's
@@ -140,6 +146,10 @@ type ServerConfig struct {
 	// passed (default: 1,000,000, at most about 21 MB in all).
 	ReplayCapacity int
 
+	// MaxClockSkew is how far a version 2 SessionID's time may be from the
+	// server's (default: DefaultMaxClockSkew).
+	MaxClockSkew time.Duration
+
 	// LeanH2 serves tunnels with samizdat's own HTTP/2 server instead of
 	// x/net's. Clients see the same frames; the server uses much less CPU
 	// per byte (see leanh2.go). It applies to tunnels served through Handler
@@ -176,6 +186,9 @@ func (c *ServerConfig) applyDefaults() {
 	}
 	if c.ReplayWindow == 0 {
 		c.ReplayWindow = 24 * time.Hour
+	}
+	if c.MaxClockSkew == 0 {
+		c.MaxClockSkew = DefaultMaxClockSkew
 	}
 	if c.ReplayCapacity == 0 {
 		c.ReplayCapacity = 1_000_000

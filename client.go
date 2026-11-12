@@ -1,7 +1,9 @@
 package samizdat
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -253,15 +255,17 @@ func (c *Client) dialConn(ctx context.Context) (*utls.UConn, error) {
 
 	uConn := utls.UClient(conn, tlsConfig, helloID)
 
-	// Build auth-embedded SessionID using PSK derived from server public key
-	sessionID, err := BuildSessionID(c.config.PublicKey, c.config.ShortID)
-	if err != nil {
-		uConn.Close()
-		return nil, fmt.Errorf("building session ID: %w", err)
-	}
-
-	// Apply the SessionID to the ClientHello
-	if err := c.applyAuthToClientHello(uConn, sessionID[:]); err != nil {
+	if c.config.LegacyAuth {
+		sessionID, err := BuildSessionID(c.config.PublicKey, c.config.ShortID)
+		if err != nil {
+			uConn.Close()
+			return nil, fmt.Errorf("building session ID: %w", err)
+		}
+		if err := c.applyAuthToClientHello(uConn, sessionID[:]); err != nil {
+			uConn.Close()
+			return nil, fmt.Errorf("applying auth: %w", err)
+		}
+	} else if err := c.applyAuthV2(uConn); err != nil {
 		uConn.Close()
 		return nil, fmt.Errorf("applying auth: %w", err)
 	}
@@ -308,6 +312,55 @@ func (c *Client) applyAuthToClientHello(uConn *utls.UConn, sessionID []byte) err
 		return fmt.Errorf("marshaling client hello: %w", err)
 	}
 
+	return nil
+}
+
+// applyAuthV2 builds the ClientHello and puts a version 2 SessionID in it
+// (authv2.go), sealed under the shared secret between the client's own
+// X25519 key share and the server's key.
+func (c *Client) applyAuthV2(uConn *utls.UConn) error {
+	if err := uConn.BuildHandshakeState(); err != nil {
+		return fmt.Errorf("building handshake state: %w", err)
+	}
+	hs := &uConn.HandshakeState
+	hs.Hello.SessionId = make([]byte, sessionIDLen)
+	if err := uConn.MarshalClientHello(); err != nil {
+		return fmt.Errorf("marshaling client hello: %w", err)
+	}
+	raw := hs.Hello.Raw
+	// Use the key share the server will: parse the ClientHello as it does
+	// and take the private key whose public key it finds.
+	ch, err := parseClientHello(raw)
+	if err != nil {
+		return err
+	}
+	keys := hs.State13.KeyShareKeys
+	var priv *ecdh.PrivateKey
+	for _, k := range []*ecdh.PrivateKey{keys.Ecdhe, keys.MlkemEcdhe} {
+		if k != nil && k.Curve() == ecdh.X25519() && bytes.Equal(k.PublicKey().Bytes(), ch.x25519) {
+			priv = k
+			break
+		}
+	}
+	if priv == nil {
+		return errors.New("samizdat: the ClientHello has no X25519 key share")
+	}
+	serverPub, err := ecdh.X25519().NewPublicKey(c.config.PublicKey)
+	if err != nil {
+		return err
+	}
+	shared, err := priv.ECDH(serverPub)
+	if err != nil {
+		return err
+	}
+	sid, err := sealSessionIDv2(shared, raw, c.config.ShortID, authNow())
+	if err != nil {
+		return err
+	}
+	// Written into the marshaled ClientHello in place: marshaling again
+	// would leave the additional data the SessionID was sealed over.
+	copy(raw[sessionIDOffset:], sid[:])
+	hs.Hello.SessionId = sid[:]
 	return nil
 }
 
