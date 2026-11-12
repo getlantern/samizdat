@@ -20,6 +20,12 @@ import (
 	"time"
 )
 
+// SAMIZDAT_TEST_LEGACY_CLIENTS runs every test with clients that don't
+// shape, as today's do, against servers that accept shaping (the default).
+func init() {
+	testLegacyClients = os.Getenv("SAMIZDAT_TEST_LEGACY_CLIENTS") != ""
+}
+
 // generateSelfSignedCert creates a self-signed TLS certificate for testing.
 func generateSelfSignedCert(t *testing.T) (certPEM, keyPEM []byte) {
 	t.Helper()
@@ -70,11 +76,6 @@ func startTestServer(t *testing.T, config ServerConfig) (*Server, net.Listener) 
 	// against the lean HTTP/2 server.
 	if os.Getenv("SAMIZDAT_TEST_LEAN_H2") != "" {
 		config.LeanH2 = true
-	}
-	// SAMIZDAT_TEST_SHAPING_SERVER runs them against a server that accepts
-	// shaping clients, with the tests' clients, which don't shape.
-	if os.Getenv("SAMIZDAT_TEST_SHAPING_SERVER") != "" && config.SessionHandler == nil {
-		config.ShapeTraffic = true
 	}
 	server, err := NewServer(config)
 	if err != nil {

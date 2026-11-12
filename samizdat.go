@@ -58,13 +58,14 @@ type ClientConfig struct {
 
 	// TCP fragmentation (Geneva-inspired)
 	TCPFragmentation    bool // fragment ClientHello across TCP segments (default: true)
-
-	// ShapeTraffic shapes the sizes and directions of each connection's
-	// first TLS records to match real TLS traffic (see shaping.go). Set it
-	// only for servers with ServerConfig.ShapeTraffic: a server without it
-	// fails the connection.
-	ShapeTraffic bool
 	RecordFragmentation bool // fragment inner TLS records across H2 DATA frames (default: true)
+
+	// DisableShaping turns off shaping of the sizes and directions of each
+	// connection's first TLS records (see shaping.go), which is on by
+	// default. A shaping client needs a server that accepts shaping, as every
+	// server does unless ServerConfig.DisableShaping is set; against one that
+	// doesn't, the connection fails.
+	DisableShaping bool
 
 	// Connection management
 	// MaxStreamsPerConn is the most H2 streams the client opens per TCP
@@ -143,10 +144,12 @@ type ServerConfig struct {
 	// HTTP/2 server.
 	LeanH2 bool
 
-	// ShapeTraffic accepts clients that shape their connections' first TLS
-	// records (ClientConfig.ShapeTraffic; see shaping.go). Clients that don't
-	// shape keep working. It has no effect when SessionHandler is set.
-	ShapeTraffic bool
+	// DisableShaping stops the server accepting clients that shape their
+	// connections' first TLS records (see shaping.go), which it does by
+	// default; clients that don't shape work either way. Shaping clients
+	// fail against a server with it set. It has no effect when SessionHandler
+	// is set.
+	DisableShaping bool
 
 	// Handler: called for each authenticated proxied connection
 	Handler ConnHandler
