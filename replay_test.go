@@ -296,6 +296,9 @@ func testReplayedSessionID(t *testing.T, legacyAuth bool, replayWindow time.Dura
 
 	// The real client's connection, recording what it sends.
 	rec := &recordingDialer{}
+	legacy := testLegacyClients
+	testLegacyClients = false
+	defer func() { testLegacyClients = legacy }()
 	client, err := NewClient(ClientConfig{
 		ServerAddr: serverAddr,
 		ServerName: "cover.example.com",
