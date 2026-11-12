@@ -74,6 +74,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if config.Handler == nil && config.SessionHandler == nil {
 		return nil, fmt.Errorf("Handler or SessionHandler is required")
 	}
+	if config.ReplayCapacity < 0 {
+		return nil, fmt.Errorf("ReplayCapacity must not be negative, got %d", config.ReplayCapacity)
+	}
 
 	// Derive server public key from private key
 	_, serverPubKey, err := derivePublicKey(config.PrivateKey)
@@ -326,8 +329,10 @@ func (s *Server) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// A SessionID copied from a ClientHello someone observed is valid too;
-	// only the first connection to use it is the client's.
+	// A SessionID copied from a ClientHello someone observed is valid too,
+	// so only its first use is let through. That stops a copy made by
+	// watching the client, not one sent by a censor who holds back the
+	// client's ClientHello and gets the copy here first.
 	if s.replay != nil && s.replay.seen(sessionID[:shortIDLen+nonceLen]) {
 		s.doMasquerade(conn, clientHelloRecord)
 		return
