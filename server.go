@@ -47,9 +47,12 @@ type Server struct {
 	listenerMu sync.Mutex
 	listener   net.Listener
 	masquerade *Masquerade
-	ctx        context.Context
-	cancel     context.CancelCauseFunc
-	wg         sync.WaitGroup
+	// replay refuses SessionIDs that have already authenticated; nil when
+	// config.ReplayWindow is negative.
+	replay *replayFilter
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	wg     sync.WaitGroup
 
 	// tlsConfig parses the certificate on first use and returns the one
 	// config every session shares. Parsing it per connection cost about 1.5%
@@ -90,6 +93,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	}
 	ids := append([][8]byte(nil), config.ShortIDs...)
 	s.shortIDs.Store(&ids)
+	if config.ReplayWindow > 0 {
+		s.replay = newReplayFilter(config.ReplayWindow, config.ReplayCapacity)
+	}
 	s.tlsConfig = sync.OnceValues(func() (*tls.Config, error) {
 		cert, err := tls.X509KeyPair(config.CertPEM, config.KeyPEM)
 		if err != nil {
@@ -316,6 +322,13 @@ func (s *Server) handleConnection(conn net.Conn) {
 	shortID, authenticated, err := VerifySessionID(sessionID, s.serverPubKey, *s.shortIDs.Load())
 	if err != nil || !authenticated {
 		// Auth failed — enter masquerade mode
+		s.doMasquerade(conn, clientHelloRecord)
+		return
+	}
+
+	// A SessionID copied from a ClientHello someone observed is valid too;
+	// only the first connection to use it is the client's.
+	if s.replay != nil && s.replay.seen(sessionID[:shortIDLen+nonceLen]) {
 		s.doMasquerade(conn, clientHelloRecord)
 		return
 	}
