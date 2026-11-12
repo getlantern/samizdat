@@ -165,12 +165,20 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 		return nil, err
 	}
 
+	var conn net.Conn = uConn
+	if state := uConn.ConnectionState(); c.config.ShapeTraffic && state.Version == utls.VersionTLS13 {
+		sched, marker, err := shapingSchedule(state.ExportKeyingMaterial)
+		if err != nil {
+			uConn.Close()
+			return nil, fmt.Errorf("shaping: %w", err)
+		}
+		conn = newShapedConn(uConn, sched, true, marker, false)
+	}
+
 	// Create H2 transport over the TLS connection
-	// We need to wrap uConn as a standard net.Conn for the http2 transport.
-	// The utls.UConn already implements net.Conn.
-	transport, err := newH2Transport(uConn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper)
+	transport, err := newH2Transport(conn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper)
 	if err != nil {
-		uConn.Close()
+		conn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)
 	}
 
@@ -261,6 +269,14 @@ func (c *Client) dialConn(ctx context.Context) (*utls.UConn, error) {
 	if state.NegotiatedProtocol != "h2" {
 		uConn.Close()
 		return nil, fmt.Errorf("expected h2, got %q", state.NegotiatedProtocol)
+	}
+
+	// The Chrome fingerprint's renegotiation_info extension sets
+	// Renegotiation on tlsConfig, and while it's set uTLS refuses to export
+	// keying material, which shaping needs. TLS 1.3 has no renegotiation, and
+	// tlsConfig is this connection's alone.
+	if state.Version == utls.VersionTLS13 {
+		tlsConfig.Renegotiation = utls.RenegotiateNever
 	}
 
 	return uConn, nil

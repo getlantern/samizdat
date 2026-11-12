@@ -411,12 +411,22 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 		return
 	}
 
+	var h2Conn net.Conn = tlsConn
+	if s.config.ShapeTraffic {
+		c, err := acceptShaping(tlsConn)
+		if err != nil {
+			tlsConn.Close()
+			return
+		}
+		h2Conn = c
+	}
+
 	// Serve HTTP/2 with CONNECT handler
 	if bc != nil {
-		s.serveLeanH2(tlsConn, bc, conn, shortID)
+		s.serveLeanH2(h2Conn, bc, conn, shortID)
 		return
 	}
-	s.serveH2(tlsConn, conn, shortID)
+	s.serveH2(h2Conn, conn, shortID)
 }
 
 // sessionConn is the connection a SessionHandler receives. Its first failed
