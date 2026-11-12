@@ -169,6 +169,7 @@ func testTLSRecordsNotCapped(t *testing.T, lean bool) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := conn.Write(make([]byte, size)); err != nil {
 		t.Fatal(err)
 	}
