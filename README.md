@@ -1,6 +1,6 @@
 # Samizdat
 
-Samizdat is a censorship-circumvention protocol. It carries proxy traffic over TLS 1.3 connections that, from outside, are a browser talking HTTP/2 to a real website. The server authenticates its own clients inside the TLS handshake; with a cover site configured (`MasqueradeDomain`), it passes every other connection that opens with a TLS handshake record, including active probes, to that real website. By default, the first records of each authenticated connection are shaped to match a model of real TLS traffic.
+Samizdat is a censorship-circumvention protocol. It carries proxy traffic over TLS 1.3 connections that, from outside, are a browser talking HTTP/2 to a real website. The server authenticates its own clients inside the TLS handshake; with a cover site configured (`MasqueradeDomain`), it passes every other connection that opens with a valid TLS handshake record (up to 16 KB), including active probes, to that real website. By default, the first records of each authenticated connection are shaped to match a model of real TLS traffic.
 
 The name comes from the Russian *самиздат*: banned writing, copied by hand and passed on.
 
