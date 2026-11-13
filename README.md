@@ -1,101 +1,102 @@
 # Samizdat
 
-Samizdat is a censorship circumvention protocol that makes proxy traffic **indistinguishable from a browser visiting a real website over HTTP/2**. It is designed to defeat the full spectrum of modern DPI techniques deployed by nation-state censors, grounded in the latest academic research from FOCI, USENIX Security, ACM CCS, NDSS, and PETS.
+Samizdat is a censorship-circumvention protocol. It carries proxy traffic inside a single TLS 1.3 connection that, from outside, is a browser talking HTTP/2 to a real website. The server authenticates its own clients inside the TLS handshake and passes everyone else, including active probes, to the real website. The first records of every connection are shaped to match a model of real TLS traffic.
 
-The name comes from the Russian word *самиздат* — the clandestine copying and distribution of literature banned by the state.
+The name comes from the Russian *самиздат*: banned writing, copied by hand and passed on.
 
-## Why Samizdat?
+**Website:** [samizdat.lantern.io](https://samizdat.lantern.io), with a sourced comparison to VLESS, XTLS Vision, REALITY, Trojan and NaïveProxy.
 
-Russian DPI infrastructure (TSPU) has evolved to block nearly every existing circumvention protocol. Live testing reveals the following active blocking techniques:
+## What it's built against
 
-- **First-packet entropy detection** fingerprinting Shadowsocks and other encrypted protocols
-- **All UDP blocked** at the network level
-- **TLS-over-TLS detection** catching nested TLS tunnels with >70% accuracy
-- **15-20KB data thresholds** triggering inspection and blocking
-- **TLS connection count policing** on port 443
-- **Active probing** of suspected proxy servers
-- **Post-handshake fingerprinting** of distinctive client info exchanges
-- **SNI extraction via TCP DPI** to enforce domain blocklists
+| Technique | Source | Samizdat's answer |
+|---|---|---|
+| Fingerprinting the start of a connection by packet sizes and directions | CenKL, IEEE S&P 2027 | The first 10 TLS records after the handshake follow sizes and directions drawn from the authors' model of 326.5M real TLS flows; Go's dynamic record sizing is off |
+| Active probing, including replaying a captured handshake | Alice et al., IMC 2020; REALITY replay PoC, net4people #576 | Unauthenticated or repeated handshakes are forwarded byte for byte to the real cover site; accepted SessionIDs are remembered and refused again |
+| Copying an authentication tag into another handshake | — | Version 2 tags are bound to the whole ClientHello and the client's key share |
+| First-packet entropy and length (Shadowsocks) | Alice et al., IMC 2020 | A standard TLS 1.3 ClientHello from uTLS with Chrome's fingerprint |
+| TLS-in-TLS fingerprinting | Xue et al., USENIX Security 2024 | Partial: HTTP/2 multiplexing, which that paper found lowers the attack's TPR by over 70% with two or more concurrent streams (far less with one) |
+| SNI extraction from a single packet | Russia's TSPU | Optional: the ClientHello is split across TCP segments at the SNI, in the style of Geneva (Bock et al., CCS 2019) |
+| Policing the number of TLS connections to an address on port 443 | net4people #546 | One TLS connection carries every stream |
+| UDP blocking | Russia | TCP only |
 
-Samizdat defeats all of these simultaneously.
+Not covered: **timing.** Samizdat adds 1–30 ms of random jitter to DATA frames, but Xue et al. (NDSS 2025) found that random delays don't defeat cross-layer RTT fingerprinting and can make it easier, and CenKL's timing-aware classifier still reaches about 0.9 recall against shaped traffic. See [Limits](#limits).
 
 ## Protocol Design
 
-### Single TLS Layer with HTTP/2 CONNECT
-
-Samizdat uses a single standard TLS 1.3 connection with HTTP/2 multiplexed CONNECT tunnels — exactly what a browser does when using an HTTPS proxy. There is no TLS-over-TLS nesting.
+### One TLS 1.3 connection, HTTP/2 CONNECT inside
 
 ```
-Client                                    Server
-  |                                         |
-  |  TCP SYN (Geneva frag on ClientHello)   |
-  |  TLS 1.3 ClientHello (uTLS Chrome) -->  |  SNI = cover site (e.g. ok.ru)
-  |    auth embedded in SessionID           |  Server verifies auth tag
-  |  <-- ServerHello + real cover cert       |  If auth fails: serve real website
-  |                                         |
-  |  HTTP/2 SETTINGS exchange ----------->  |  Standard h2 negotiation
-  |                                         |
-  |  H2 CONNECT target:port (stream N) -->  |  Proxy tunnel per stream
-  |  <-- 200 OK (stream N)                  |  Multiple tunnels multiplexed
-  |  DATA frames <-------> DATA frames      |  With padding + timing jitter
+Client                                       Server
+  |  TCP; ClientHello optionally split at SNI  |
+  |  TLS 1.3 ClientHello (uTLS, Chrome)  ----> |  SNI = cover site
+  |    auth tag in the SessionID               |  verify tag; if it fails or repeats,
+  |  <---- ServerHello, server's certificate   |  forward everything to the cover site
+  |                                            |
+  |  first 10 TLS records: shaped schedule     |  same schedule, from the same TLS secret
+  |    (HTTP/2 preface, SETTINGS, CONNECT      |
+  |     carried inside, padded to size)        |
+  |                                            |
+  |  HTTP/2 CONNECT host:port (stream N) ----> |  one tunnel per stream, all on
+  |  <---- 200, DATA <----> DATA               |  this one connection
 ```
 
 ### Authentication
 
-Authentication is embedded in the TLS SessionID field. Clients send version 2; servers accept version 2 and version 1, for older clients.
+The tag is the 32-byte SessionID every TLS 1.3 ClientHello carries. Clients send version 2; servers accept version 2 and version 1, for older clients.
 
-- **Pre-shared**: server X25519 public key + 8-byte short ID
+- **Pre-shared:** the server's X25519 public key and an 8-byte short ID per client.
 - **Version 2** (`authv2.go`): the SessionID is `AES-256-GCM(key, nonce = random[20:32], version || time || shortID)`, with `key = HKDF-SHA256(X25519(client key share, server key), salt = random[:20], "SAMIZDAT-v2")` and the whole ClientHello (SessionID zeroed) as additional data. It is bound to its ClientHello, as in REALITY, and nothing in it repeats between connections. The same ClientHello sent again unchanged still authenticates until its time is more than `MaxClockSkew` (12 hours by default) from the server's, so the server refuses repeats of it too, as for version 1. A client whose clock is further off than that is refused; set `ServerCertSPKISHA256` so it fails instead of completing the cover site's handshake.
 - **Version 1** (`auth.go`): `shortID(8) || nonce(8) || HMAC-SHA256(PSK, nonce)[:16]`, with `PSK = HKDF-SHA256(serverPubKey, shortID, "SAMIZDAT")`. It works in any ClientHello, so the server also refuses a SessionID it has already accepted, for 24 to 48 hours by default (`ReplayWindow`; negative turns it off). `RequireAuthV2` makes a server refuse version 1 once its clients have moved. The record is in memory, so a restarted server has forgotten it.
-- **If auth fails**: server enters masquerade mode (see below)
+- **If auth fails, or the SessionID repeats:** the server enters masquerade mode (below).
 
-The client's TLS ClientHello is generated by [uTLS](https://github.com/refraction-networking/utls) with a Chrome fingerprint, making it byte-identical to a real Chrome browser at the wire level.
+The ClientHello comes from [uTLS](https://github.com/refraction-networking/utls) with Chrome's fingerprint (Firefox and Safari are also available).
 
-### Masquerade (Active Probe Resistance)
+### Masquerade (active-probe resistance)
 
-When a non-Samizdat client connects — including active probes — the server operates as a **transparent TCP proxy** to the real masquerade domain:
+When a connection doesn't authenticate, including an active probe, the server becomes a **transparent TCP proxy** to the real cover site:
 
 ```
-Active Probe                  Samizdat Server              Real Domain (ok.ru)
+Active probe                  Samizdat server              Cover site
   |                               |                              |
-  |-- ClientHello (SNI=ok.ru) -->  |                              |
-  |   (no valid auth tag)         |                              |
-  |                               |-- forward raw ClientHello -->  |
-  |                               |<-- ServerHello + real cert --- |
-  |<-- ServerHello + real cert -- |                              |
-  |                               |                              |
-  |   (bidirectional TCP proxy until either side closes)         |
+  |-- ClientHello (no valid tag) ->|                              |
+  |                               |-- the same raw ClientHello -->|
+  |                               |<-- ServerHello, real cert ----|
+  |<-- ServerHello, real cert ----|                              |
+  |        (bytes copied both ways until either side closes)     |
 ```
 
-The server does NOT parse or modify any TLS/HTTP content. It forwards raw bytes bidirectionally. This makes the server indistinguishable from the real domain at every protocol layer — same certificate, same TLS behavior, same HTTP responses, same timing. Inspired by [tlsmasq](https://github.com/getlantern/tlsmasq).
+The server doesn't parse or modify any of it, so the prober sees the cover site's certificate, TLS stack and HTTP responses. Inspired by [tlsmasq](https://github.com/getlantern/tlsmasq).
 
-### Geneva-Inspired TCP Fragmentation
+### Connection-start shaping
 
-The ClientHello is split across multiple TCP segments at the SNI field boundary with randomized delays between fragments. This forces the DPI to reassemble TCP segments to extract the SNI, defeating stateless SNI inspection deployed by TSPU.
+CenKL (Ortwein et al., IEEE S&P 2027) found that every proxy it tested could be told from real TLS within the first few packets after the handshake, and that HTTP/2 tunnels in particular open with a distinctive preface, SETTINGS and CONNECT. Following the authors' ProxyShaper (`shaping.go`, `shapingmodel.go`):
 
-### Traffic Shaping
+- Both ends export 40 bytes of keying material from the TLS session. 32 bytes seed a ChaCha8 sampler; 8 bytes become a marker.
+- The sampler draws 10 records' sizes and directions from the authors' released order-1 Markov model (`shaping_model.bin.gz`), each conditioned on the previous one. Sizes above 1,448 bytes, which a Linux sender with TCP timestamps splits into two packets, are left out.
+- During the schedule each side sends exactly its scheduled records: a 2-byte length, queued HTTP/2 bytes, then padding. After the 10th record, data passes straight through.
+- The server reads the client's first 8 bytes: the marker means a shaping client; an HTTP/2 preface means an older client, served as before. `DisableShaping` turns it off at either end.
+- Go's dynamic TLS record sizing is off on both ends, and the server issues no session tickets: both added tells of their own.
 
-- **Timing jitter**: 1-30ms random delay on outgoing frames defeats cross-layer RTT fingerprinting (NDSS 2025)
+Measured against CenKL's model (first 10 packets, 800 flows, loopback): unshaped samizdat scored 63.0 nats of KL divergence, shaped samizdat 12.4, and real TLS sampled from the model itself 11.3 (the floor for that sample size). See [#29](https://github.com/getlantern/samizdat/pull/29).
 
-### H2 Multiplexing
+### HTTP/2 multiplexing
 
-All tunneled connections are multiplexed over a single TLS+H2 connection. This reduces the number of TLS connections to one, defeating connection count policing on port 443. Per USENIX Security 2024, multiplexing reduces fingerprinting accuracy by 70%.
+Every tunnelled connection is an HTTP/2 CONNECT stream on one TLS connection, so a censor counting TLS connections to the address sees one. `ServerConfig.LeanH2` serves those streams with samizdat's own HTTP/2 server (`leanh2.go`), which sends the same frames as Go's x/net server but batches them into fewer TLS records and system calls: 66–90% less server CPU per GB downloaded in benchmarks ([#25](https://github.com/getlantern/samizdat/pull/25)).
 
-## Threat Model
+### Fragmentation and jitter
 
-| Threat | Paper/Source | Countermeasure |
-|---|---|---|
-| First-packet entropy (Shadowsocks) | IMC 2020 | Standard TLS 1.3 ClientHello via uTLS Chrome |
-| Active probing (7 types) | IMC 2020 | TCP-level masquerade to real domain |
-| TLS-over-TLS detection (>70%) | USENIX Sec 2024 | Single TLS layer; inner TLS records fragmented across H2 DATA frames |
-| Cross-layer RTT fingerprinting | NDSS 2025 | 1-30ms timing jitter on DATA frames |
-| TCP DPI / SNI extraction | TSPU, IMC 2022 | Geneva TCP fragmentation at SNI boundary |
-| UDP blocking | Russia | TCP-only design |
-| 15-20KB data threshold | net4people #490 | Adaptive chunking + noise frame interleaving |
-| TLS conn-count policing on 443 | net4people #546 | H2 multiplexing (one connection) |
-| Post-handshake CLIENTINFO fingerprint | Lantern logs | Client info encrypted in standard H2 headers |
-| NaiveProxy MTU / RST_STREAM leaks | — | Standard Go H2; no custom framing |
-| Trojan active probing (90% detection) | — | PSK auth in TLS handshake + TCP masquerade |
+- **ClientHello fragmentation** (`TCPFragmentation`): the ClientHello is split across TCP segments at the SNI field, with a short random delay, so a middlebox that reads the SNI from one packet doesn't find it there.
+- **Record fragmentation** (`RecordFragmentation`): not implemented. The option exists in `ClientConfig` but nothing uses it yet.
+- **Jitter** (`Jitter`, `MaxJitterMs`, default 30): a 1–30 ms random delay on outgoing frames. As noted above, research suggests this doesn't help against RTT fingerprinting.
+
+## Limits
+
+- **Timing isn't shaped**, beyond the jitter above.
+- **Tunnelled TLS is still inside.** Applications using samizdat bring their own TLS. Multiplexing helps most with several concurrent streams.
+- **Shaping covers 10 records.** After that, traffic is whatever the tunnelled applications send. The schedule fixes TLS record sizes; TCP can still split or merge them into packets.
+- **The model is one network's view:** one regional ISP, late 2025. Its data license is still being settled with the authors.
+- **The replay record is in memory.** A restarted server has forgotten the SessionIDs it accepted.
+- **Not independently reviewed.** Version 2 auth hasn't had an outside cryptographic review.
 
 ## Installation
 
@@ -175,18 +176,23 @@ The standalone protocol library. Zero sing-box dependencies. Can be integrated i
 ```
 samizdat/
 ├── samizdat.go          # Config types and defaults
-├── auth.go              # PSK-based HMAC authentication
-├── client.go            # Client dialer (uTLS + H2 CONNECT)
-├── server.go            # Server listener (auth check + H2 proxy)
-├── h2transport.go       # HTTP/2 multiplexed CONNECT transport
-├── streamconn.go        # net.Conn wrapper over H2 stream
-├── connpool.go          # H2 connection pooling
-├── fragmenter.go        # Geneva-inspired TCP fragmentation
-├── shaper.go            # Traffic shaping (padding + jitter)
-├── masquerade.go        # TCP-level transparent proxy for active probes
-├── samizdat_test.go     # Unit tests
-├── integration_test.go  # Client-server integration tests
-└── cmd/samizdat-server/ # Standalone server binary
+├── auth.go              # Version 1 SessionID (HMAC)
+├── authv2.go            # Version 2 SessionID (X25519 + AES-GCM, bound to the ClientHello)
+├── replay.go            # Refusing SessionIDs already accepted
+├── client.go            # Client dialer (uTLS + HTTP/2 CONNECT)
+├── server.go            # Server: auth, masquerade, shaping, HTTP/2
+├── h2transport.go       # Client HTTP/2 transport
+├── leanh2.go            # Lean HTTP/2 server (ServerConfig.LeanH2)
+├── streamconn.go        # net.Conn over an HTTP/2 stream
+├── connpool.go          # Client connection pool
+├── shaping.go           # Connection-start shaping
+├── shapingmodel.go      # The shaping model and sampler
+├── shaping_model.bin.gz # CenKL's size-and-direction model, pruned
+├── fragmenter.go        # ClientHello fragmentation
+├── shaper.go            # Jitter (and an unused record fragmenter)
+├── masquerade.go        # Transparent proxy to the cover site
+├── cmd/samizdat-server/ # Standalone server
+└── cmd/shapingmodel/    # Builds shaping_model.bin.gz from CenKL's released model
 ```
 
 ### [`getlantern/lantern-box`](https://github.com/getlantern/lantern-box)
@@ -204,13 +210,13 @@ github.com/refraction-networking/utls    # Chrome TLS fingerprint
 
 ## References
 
-- Wang et al., "How China Detects and Blocks Shadowsocks," IMC 2020
-- Wu et al., "Detecting TLS-over-TLS with Cross-Layer Analysis," USENIX Security 2024
-- Xue et al., "Cross-Layer RTT Fingerprinting of Encrypted Tunnels," NDSS 2025
-- Bock et al., "Geneva: Evolving Censorship Evasion Strategies," ACM CCS 2019
-- Hoang et al., "Measuring I2P Censorship at a Global Scale," FOCI 2019
-- net4people/bbs #490 — Russia DPI data threshold analysis
-- net4people/bbs #546 — TLS connection count policing
+- Aaron Ortwein, Armin Huremagic, Shabbir Hussain, Holly Bergen, Joshua J. Daymude, Diwen Xue, Jedidiah R. Crandall, Roya Ensafi. "[CenKL: Information-Theoretic Visibility into Censorship Circumvention Traffic Patterns](https://aaron-ortwein.github.io/papers/cenkl.pdf)." IEEE S&P 2027. Model: [censoredplanet/obfuscation](https://github.com/censoredplanet/obfuscation).
+- Diwen Xue, Michalis Kallitsis, Amir Houmansadr, Roya Ensafi. "[Fingerprinting Obfuscated Proxy Traffic with Encapsulated TLS Handshakes](https://www.usenix.org/conference/usenixsecurity24/presentation/xue-fingerprinting)." USENIX Security 2024.
+- Diwen Xue, Robert Stanley, Piyush Kumar, Roya Ensafi. "[The Discriminative Power of Cross-layer RTTs in Fingerprinting Proxy Traffic](https://www.ndss-symposium.org/ndss-paper/the-discriminative-power-of-cross-layer-rtts-in-fingerprinting-proxy-traffic/)." NDSS 2025.
+- Alice, Bob, Carol, Jan Beznazwy, Amir Houmansadr. "[How China Detects and Blocks Shadowsocks](https://gfw.report/publications/imc20/en/)." IMC 2020.
+- Kevin Bock, George Hughey, Xiao Qiang, Dave Levin. "[Geneva: Evolving Censorship Evasion Strategies](https://geneva.cs.umd.edu/papers/geneva_ccs19.pdf)." ACM CCS 2019.
+- XTLS, [REALITY](https://github.com/XTLS/REALITY).
+- net4people/bbs [#490](https://github.com/net4people/bbs/issues/490) (Russia freezing TLS connections after about 16 KB), [#546](https://github.com/net4people/bbs/issues/546) (Russia policing TLS connection counts on port 443), [#576](https://github.com/net4people/bbs/issues/576) (REALITY detected by handshake replay).
 
 ## Minimal End-to-End Example
 
