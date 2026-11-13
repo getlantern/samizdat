@@ -1049,6 +1049,7 @@ func TestLeanH2MatchesXNetOnBadPeers(t *testing.T) {
 				})
 				go c.script(t, p)
 				var out []string
+				skipped := false
 				for {
 					f, err := p.fr.ReadFrame()
 					if err != nil {
@@ -1056,8 +1057,11 @@ func TestLeanH2MatchesXNetOnBadPeers(t *testing.T) {
 					}
 					// Both servers queue a connection WINDOW_UPDATE with their
 					// SETTINGS, but x/net's writes it from another goroutine and
-					// can close a misbehaving connection before it goes out.
-					if d := describe(f); d != initialConnWindowUpdate {
+					// can close a misbehaving connection before it goes out. The
+					// first is dropped from both; a second still counts.
+					if d := describe(f); d == initialConnWindowUpdate && !skipped {
+						skipped = true
+					} else {
 						out = append(out, d)
 					}
 				}
