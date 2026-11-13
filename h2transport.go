@@ -28,7 +28,6 @@ type h2Transport struct {
 	serverAddr  string
 	localAddr   net.Addr
 	remoteAddr  net.Addr
-	shaper      *Shaper
 
 	mu            sync.Mutex
 	activeStreams atomic.Int32
@@ -44,7 +43,7 @@ type h2Transport struct {
 }
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
-func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper *Shaper) (*h2Transport, error) {
+func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int) (*h2Transport, error) {
 	// Create HTTP/2 client transport over the existing TLS connection.
 	// The transport must never dial a second connection: it would get this
 	// same one back and write a new preface into the middle of the first
@@ -72,7 +71,6 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, shaper 
 		localAddr:   tlsConn.LocalAddr(),
 		remoteAddr:  tlsConn.RemoteAddr(),
 		maxStreams:  maxStreams,
-		shaper:      shaper,
 	}
 	t.idleSince.Store(time.Now().UnixNano())
 
@@ -174,7 +172,6 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		t.localAddr,
 		&streamAddr{network: "tcp", address: destination},
 		destination,
-		t.shaper,
 	)
 
 	return conn, nil

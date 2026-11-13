@@ -328,16 +328,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	// Set initial read deadline for the ClientHello
-	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(clientHelloTimeout))
 
 	// Read and buffer the TLS record containing the ClientHello
 	clientHelloRecord, handshakeMsg, err := readClientHelloRecord(conn)
-	if err != nil {
-		return
-	}
 
 	// Reset deadline
 	conn.SetReadDeadline(time.Time{})
+
+	if err != nil {
+		// Not a ClientHello this server can check: a scanner, a probe sending
+		// something other than TLS, an oversized or cut-off record, or a peer
+		// that sent nothing in time. The cover site gets exactly the bytes that
+		// arrived and everything after, so it, not this server, decides how to
+		// answer.
+		s.doMasquerade(conn, clientHelloRecord)
+		return
+	}
 
 	// Extract the session ID from the ClientHello
 	sessionID, err := ExtractSessionID(handshakeMsg)
@@ -614,37 +621,38 @@ func (s *Server) serveH2(tlsConn, rawConn net.Conn, shortID [8]byte) {
 	})
 }
 
-// readClientHelloRecord reads a complete TLS record from the connection.
-// Returns the full TLS record (header + payload) and the handshake message within it.
-// Reads directly from the connection (no buffering) to avoid losing data.
-func readClientHelloRecord(conn net.Conn) ([]byte, []byte, error) {
+// clientHelloTimeout is how long the server waits for a complete first TLS
+// record before handing what it has to the masquerade. A variable for tests.
+var clientHelloTimeout = 10 * time.Second
+
+// readClientHelloRecord reads a complete TLS handshake record from the
+// connection. It returns the full record (header + payload) and the handshake
+// message within it. On error, raw still holds every byte read, so a caller can
+// pass them on. Reads directly from the connection (no buffering) to avoid
+// losing data.
+func readClientHelloRecord(conn net.Conn) (raw, payload []byte, err error) {
 	// TLS record header: content_type(1) + version(2) + length(2)
 	header := make([]byte, 5)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return nil, nil, fmt.Errorf("reading TLS record header: %w", err)
+	if n, err := io.ReadFull(conn, header); err != nil {
+		return header[:n], nil, fmt.Errorf("reading TLS record header: %w", err)
 	}
 
 	// Verify it's a handshake record (type 22)
 	if header[0] != 22 {
-		return nil, nil, fmt.Errorf("expected handshake record (type 22), got type %d", header[0])
+		return header, nil, fmt.Errorf("expected handshake record (type 22), got type %d", header[0])
 	}
 
 	recordLen := int(header[3])<<8 | int(header[4])
 	if recordLen > 16384 {
-		return nil, nil, fmt.Errorf("TLS record too large: %d", recordLen)
+		return header, nil, fmt.Errorf("TLS record too large: %d", recordLen)
 	}
 
-	payload := make([]byte, recordLen)
-	if _, err := io.ReadFull(conn, payload); err != nil {
-		return nil, nil, fmt.Errorf("reading TLS record payload: %w", err)
-	}
-
-	// Full record = header + payload
 	record := make([]byte, 5+recordLen)
-	copy(record[:5], header)
-	copy(record[5:], payload)
-
-	return record, payload, nil
+	copy(record, header)
+	if n, err := io.ReadFull(conn, record[5:]); err != nil {
+		return record[:5+n], nil, fmt.Errorf("reading TLS record payload: %w", err)
+	}
+	return record, record[5:], nil
 }
 
 // replayConn wraps a net.Conn and prepends buffered data before reading

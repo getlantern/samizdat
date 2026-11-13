@@ -199,7 +199,6 @@ func startBenchServer(b *testing.B, env ...string) *benchServerProc {
 		ServerName:          "test.example.com",
 		PublicKey:           pub,
 		ShortID:             sid,
-		Jitter:              false,
 		TCPFragmentation:    false,
 		RecordFragmentation: false,
 		MaxStreamsPerConn:   1000,
