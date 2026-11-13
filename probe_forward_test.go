@@ -101,9 +101,9 @@ func TestUncheckableFirstRecordGoesToCoverSite(t *testing.T) {
 // ClientHello timeout is passed to the cover site, not closed, and what it
 // sends afterwards reaches the cover site.
 func TestSilentPeerGoesToCoverSite(t *testing.T) {
-	old := clientHelloTimeout
-	clientHelloTimeout = 200 * time.Millisecond
-	defer func() { clientHelloTimeout = old }()
+	const timeout = 200 * time.Millisecond
+	old := clientHelloTimeout.Swap(int64(timeout))
+	defer clientHelloTimeout.Store(old)
 
 	origin, got := recordingOrigin(t)
 	_, addr, _, _ := newCloseTestServer(t, ServerConfig{
@@ -115,7 +115,7 @@ func TestSilentPeerGoesToCoverSite(t *testing.T) {
 		t.Fatalf("probe dial: %v", err)
 	}
 	defer probe.Close()
-	time.Sleep(3 * clientHelloTimeout)
+	time.Sleep(3 * timeout)
 
 	late := []byte("late bytes")
 	if _, err := probe.Write(late); err != nil {
