@@ -394,4 +394,15 @@ func TestReplayWindowCoversClockSkew(t *testing.T) {
 	if _, err := NewServer(c); err != nil {
 		t.Fatalf("replay protection off: %v", err)
 	}
+	// Twice this skew overflows time.Duration, which mustn't let it past a
+	// 24h window.
+	c.ReplayWindow = 24 * time.Hour
+	c.MaxClockSkew = time.Duration(1<<62 + 1)
+	if _, err := NewServer(c); err == nil {
+		t.Fatal("a MaxClockSkew whose double overflows was accepted")
+	}
+	c.MaxClockSkew = 12 * time.Hour
+	if _, err := NewServer(c); err != nil {
+		t.Fatalf("a ReplayWindow of exactly twice MaxClockSkew: %v", err)
+	}
 }
