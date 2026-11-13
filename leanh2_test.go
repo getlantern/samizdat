@@ -1306,3 +1306,74 @@ func TestLeanH2CountsResetsBehindUnsentData(t *testing.T) {
 		t.Errorf("queuedControl = %d with a reset still queued, want 1", n)
 	}
 }
+
+// TestLeanRecvBuf: bytes come out of a receive buffer in the order they
+// went in, across chunk boundaries and whatever sizes they are written and
+// read in, and everything queued can be dropped.
+func TestLeanRecvBuf(t *testing.T) {
+	var b leanRecvBuf
+	var want, got []byte
+	next := byte(0)
+	fill := func(n int) []byte {
+		p := make([]byte, n)
+		for i := range p {
+			p[i] = next
+			next++
+		}
+		return p
+	}
+	sizes := []int{1, 700, 1024, 1025, 5000, 16384, 16385, 40000, 3, 0, 9000}
+	for i, n := range sizes {
+		p := fill(n)
+		want = append(want, p...)
+		b.write(p)
+		// Read some back between writes, in sizes unrelated to the writes'.
+		buf := make([]byte, []int{1, 300, 20000, 4096}[i%4])
+		got = append(got, buf[:b.read(buf)]...)
+	}
+	if b.n != len(want)-len(got) {
+		t.Fatalf("n = %d, want %d", b.n, len(want)-len(got))
+	}
+	for b.n > 0 {
+		buf := make([]byte, 7000)
+		got = append(got, buf[:b.read(buf)]...)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("bytes read differ from bytes written")
+	}
+	if len(b.chunks) != 0 || b.read(make([]byte, 10)) != 0 {
+		t.Fatalf("an emptied buffer holds %d chunks", len(b.chunks))
+	}
+
+	b.write(fill(50000))
+	b.read(make([]byte, 100))
+	b.drop()
+	if b.n != 0 || len(b.chunks) != 0 || b.off != 0 {
+		t.Fatalf("after drop: n=%d, %d chunks, off=%d", b.n, len(b.chunks), b.off)
+	}
+	b.write([]byte("after"))
+	buf := make([]byte, 10)
+	if n := b.read(buf); string(buf[:n]) != "after" {
+		t.Fatalf("after drop, read %q", buf[:n])
+	}
+}
+
+// TestLeanChunkSizes: a chunk is the smallest size that holds what's asked
+// for, and goes back to the pool it came from.
+func TestLeanChunkSizes(t *testing.T) {
+	for _, tc := range []struct{ want, size int }{
+		{1, 1 << 10}, {1 << 10, 1 << 10}, {1<<10 + 1, 2 << 10}, {3000, 4 << 10},
+		{8 << 10, 8 << 10}, {8<<10 + 1, 16 << 10}, {1 << 20, 16 << 10},
+	} {
+		c := getLeanChunk(tc.want)
+		if len(c) != 0 || cap(c) != tc.size {
+			t.Errorf("chunk for %d bytes: len %d, cap %d, want cap %d", tc.want, len(c), cap(c), tc.size)
+		}
+		putLeanChunk(c)
+	}
+	for i, size := range leanChunkSizes {
+		if c := getLeanChunk(size); cap(c) != size {
+			t.Errorf("pool %d gives chunks of %d, want %d", i, cap(c), size)
+		}
+	}
+}
