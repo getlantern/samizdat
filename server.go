@@ -328,7 +328,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	// Set initial read deadline for the ClientHello
-	conn.SetReadDeadline(time.Now().Add(clientHelloTimeout))
+	conn.SetReadDeadline(time.Now().Add(time.Duration(clientHelloTimeout.Load())))
 
 	// Read and buffer the TLS record containing the ClientHello
 	clientHelloRecord, handshakeMsg, err := readClientHelloRecord(conn)
@@ -622,8 +622,11 @@ func (s *Server) serveH2(tlsConn, rawConn net.Conn, shortID [8]byte) {
 }
 
 // clientHelloTimeout is how long the server waits for a complete first TLS
-// record before handing what it has to the masquerade. A variable for tests.
-var clientHelloTimeout = 10 * time.Second
+// record before handing what it has to the masquerade, in nanoseconds. Atomic
+// so tests can change it while other tests' servers are still running.
+var clientHelloTimeout atomic.Int64
+
+func init() { clientHelloTimeout.Store(int64(10 * time.Second)) }
 
 // readClientHelloRecord reads a complete TLS handshake record from the
 // connection. It returns the full record (header + payload) and the handshake
