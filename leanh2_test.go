@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -337,6 +338,11 @@ func TestLeanH2ResetEndsOnlyThatStream(t *testing.T) {
 	case err := <-handlerErr:
 		if !errors.Is(err, errLeanStreamReset) {
 			t.Errorf("handler write error = %v, want a stream reset", err)
+		}
+		// Relays such as sing-box's treat this as the peer resetting the
+		// connection, a normal end, not a transport failure.
+		if !errors.Is(err, syscall.ECONNRESET) {
+			t.Errorf("handler write error = %v, want it to match ECONNRESET", err)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("handler kept writing after the client reset the stream")
@@ -1375,5 +1381,23 @@ func TestLeanChunkSizes(t *testing.T) {
 		if c := getLeanChunk(size); cap(c) != size {
 			t.Errorf("pool %d gives chunks of %d, want %d", i, cap(c), size)
 		}
+	}
+}
+
+// TestLeanCloseErrorsMatchStandardErrors: a stream's close and reset errors
+// match the standard errors relays check for a normal end, and keep their
+// own messages.
+func TestLeanCloseErrorsMatchStandardErrors(t *testing.T) {
+	if !errors.Is(errLeanConnClosed, net.ErrClosed) {
+		t.Error("errLeanConnClosed doesn't match net.ErrClosed")
+	}
+	if !errors.Is(errLeanStreamReset, syscall.ECONNRESET) {
+		t.Error("errLeanStreamReset doesn't match ECONNRESET")
+	}
+	if errors.Is(errLeanConnClosed, syscall.ECONNRESET) || errors.Is(errLeanStreamReset, net.ErrClosed) {
+		t.Error("the two errors match each other's standard error")
+	}
+	if got := errLeanStreamReset.Error(); got != "samizdat: stream reset by peer" {
+		t.Errorf("message = %q", got)
 	}
 }
