@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -95,15 +96,29 @@ const (
 var leanPrefaceTimeout = 10 * time.Second
 
 var (
-	errLeanBatchFull   = errors.New("samizdat: too many TLS records pending")
-	errLeanConnClosed  = errors.New("samizdat: connection closed")
-	errLeanStreamReset = errors.New("samizdat: stream reset by peer")
+	errLeanBatchFull = errors.New("samizdat: too many TLS records pending")
+	// A stream's Read or Write fails with these when its connection closes
+	// or the client resets it. They match net.ErrClosed and ECONNRESET under
+	// errors.Is, so a relay that ends this way counts as a normal close
+	// (sing-box's E.IsClosed, for one) rather than as a transport failure.
+	errLeanConnClosed  = &leanCloseError{"samizdat: connection closed", net.ErrClosed}
+	errLeanStreamReset = &leanCloseError{"samizdat: stream reset by peer", syscall.ECONNRESET}
 	errLeanProtocol    = errors.New("samizdat: HTTP/2 protocol error")
 	errLeanFlow        = errors.New("samizdat: HTTP/2 flow control error")
 	// errLeanCalm ends a connection whose peer exceeded a cap (queued
 	// control frames, running handlers) with ENHANCE_YOUR_CALM, as x/net does.
 	errLeanCalm = errors.New("samizdat: peer exceeded a limit")
 )
+
+// leanCloseError is an error with its own message that also matches the
+// standard error it stands for.
+type leanCloseError struct {
+	msg string
+	is  error
+}
+
+func (e *leanCloseError) Error() string { return e.msg }
+func (e *leanCloseError) Unwrap() error { return e.is }
 
 // serveLeanH2 serves HTTP/2 CONNECT tunnels on tlsConn until the peer goes
 // away or the connection fails. bc is the batching layer beneath tlsConn.
