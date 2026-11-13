@@ -1,8 +1,8 @@
-// Package samizdat implements a censorship circumvention protocol that makes
-// proxy traffic indistinguishable from a browser visiting a real website over
-// HTTP/2. It uses a single TLS layer with Reality-style authentication,
+// Package samizdat implements a censorship circumvention protocol that carries
+// proxy traffic in what looks like a browser visiting a real website over
+// HTTP/2. It uses a single TLS layer with REALITY-style authentication,
 // HTTP/2 CONNECT tunneling, multiplexed streams, Geneva-inspired TCP
-// fragmentation, and traffic shaping with padding and timing jitter.
+// fragmentation, and connection-start shaping drawn from a model of real TLS.
 //
 // The server acts as a real web server to unauthorized connections by
 // transparently proxying them to the masquerade domain at the TCP level.
