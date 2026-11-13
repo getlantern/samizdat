@@ -184,25 +184,6 @@ func TestFragmenterFragments(t *testing.T) {
 	}
 }
 
-// --- Shaper tests ---
-
-func TestShaperNoOp(t *testing.T) {
-	shaper := NewShaper(false, 30)
-	var buf bytes.Buffer
-	data := []byte("test data")
-
-	n, err := shaper.Write(&buf, data)
-	if err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-	if n != len(data) {
-		t.Errorf("wrote %d bytes, want %d", n, len(data))
-	}
-	if !bytes.Equal(buf.Bytes(), data) {
-		t.Error("data should pass through unchanged when shaping is disabled")
-	}
-}
-
 func TestRecordFragmenter(t *testing.T) {
 	rf := NewRecordFragmenter(true)
 
@@ -248,7 +229,6 @@ func TestStreamConn(t *testing.T) {
 		&streamAddr{"tcp", "127.0.0.1:1234"},
 		&streamAddr{"tcp", "example.com:443"},
 		"example.com:443",
-		nil,
 	)
 	defer sc.Close()
 
@@ -297,7 +277,6 @@ func TestStreamConnDeadline(t *testing.T) {
 		&streamAddr{"tcp", "local"},
 		&streamAddr{"tcp", "remote"},
 		"remote",
-		nil,
 	)
 	defer sc.Close()
 
@@ -325,7 +304,6 @@ func TestStreamConnDeadlineInterruptsBlockedRead(t *testing.T) {
 		&streamAddr{"tcp", "local"},
 		&streamAddr{"tcp", "remote"},
 		"remote",
-		nil,
 	)
 	defer sc.Close()
 
@@ -364,7 +342,6 @@ func TestStreamConnReadDeliversDataSplitAcrossBuffers(t *testing.T) {
 		&streamAddr{"tcp", "local"},
 		&streamAddr{"tcp", "remote"},
 		"remote",
-		nil,
 	)
 	defer sc.Close()
 
@@ -394,7 +371,6 @@ func TestStreamConnReadDeliversFinalDataThenError(t *testing.T) {
 		&streamAddr{"tcp", "local"},
 		&streamAddr{"tcp", "remote"},
 		"remote",
-		nil,
 	)
 	defer sc.Close()
 
@@ -462,7 +438,7 @@ func TestStreamConnZeroLengthReadReturnsImmediately(t *testing.T) {
 	// A silent stream: nothing is ever written. A zero-length read must return
 	// (0, nil) at once rather than blocking on the pump.
 	_, client := net.Pipe()
-	sc := newStreamConn(client, &streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil)
+	sc := newStreamConn(client, &streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r")
 	defer sc.Close()
 
 	done := make(chan struct{})
@@ -485,7 +461,7 @@ func TestStreamConnZeroLengthReadReturnsImmediately(t *testing.T) {
 func TestStreamConnReadAfterCloseFails(t *testing.T) {
 	sc := newStreamConn(
 		&blockingReadCloser{closeCh: make(chan struct{})},
-		&streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil,
+		&streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r",
 	)
 	sc.Close()
 
@@ -508,7 +484,7 @@ func TestStreamConnReadAfterCloseFails(t *testing.T) {
 func TestStreamConnWriteAfterCloseFails(t *testing.T) {
 	sc := newStreamConn(
 		&blockingReadCloser{closeCh: make(chan struct{})},
-		&streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil,
+		&streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r",
 	)
 	sc.Close()
 	if _, err := sc.Write([]byte("data")); err == nil {
@@ -520,7 +496,7 @@ func TestStreamConnCloseWithoutHalfCloseClosesImmediately(t *testing.T) {
 	// An rwc with no CloseWrite can't elicit a clean remote EOF, so Close must
 	// close it right away instead of waiting out drainForceTimeout.
 	b := &blockingReadCloser{closeCh: make(chan struct{})}
-	sc := newStreamConn(b, &streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r", nil)
+	sc := newStreamConn(b, &streamAddr{"tcp", "l"}, &streamAddr{"tcp", "r"}, "r")
 
 	start := time.Now()
 	sc.Close()
@@ -564,7 +540,6 @@ func TestStreamConnCloseWrite(t *testing.T) {
 		&streamAddr{"tcp", "127.0.0.1:1234"},
 		&streamAddr{"tcp", "example.com:443"},
 		"example.com:443",
-		nil,
 	)
 	defer sc.Close()
 
@@ -625,7 +600,6 @@ func TestStreamConnCloseWriteNoSupport(t *testing.T) {
 		&streamAddr{"tcp", "local"},
 		&streamAddr{"tcp", "remote"},
 		"remote",
-		nil,
 	)
 	defer sc.Close()
 
@@ -901,9 +875,6 @@ func TestClientConfigDefaults(t *testing.T) {
 
 	if config.Fingerprint != "chrome" {
 		t.Errorf("Fingerprint = %s, want chrome", config.Fingerprint)
-	}
-	if config.MaxJitterMs != 30 {
-		t.Errorf("MaxJitterMs = %d, want 30", config.MaxJitterMs)
 	}
 	if config.MaxStreamsPerConn != 100 {
 		t.Errorf("MaxStreamsPerConn = %d, want 100", config.MaxStreamsPerConn)

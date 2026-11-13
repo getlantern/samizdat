@@ -164,7 +164,6 @@ func TestIntegrationClientServer(t *testing.T) {
 		PublicKey:        serverPub,
 		ShortID:          shortID,
 		Fingerprint:      "chrome",
-		Jitter:           false,
 		TCPFragmentation: false,
 	})
 	if err != nil {
@@ -389,7 +388,6 @@ func TestIntegrationMultipleStreams(t *testing.T) {
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
-		Jitter:           false,
 		TCPFragmentation: false,
 	})
 	defer client.Close()
@@ -527,7 +525,6 @@ func TestIntegrationHTTPS(t *testing.T) {
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
-		Jitter:           false,
 		TCPFragmentation: false,
 	})
 	if err != nil {
@@ -647,7 +644,6 @@ func TestIntegrationUpstreamCloseBeforeClientEND(t *testing.T) {
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
-		Jitter:           false,
 		TCPFragmentation: false,
 	})
 	if err != nil {
@@ -773,7 +769,6 @@ func TestIntegrationSequentialHTTPThenHTTPS(t *testing.T) {
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
-		Jitter:           false,
 		TCPFragmentation: false,
 	})
 	if err != nil {
@@ -900,7 +895,6 @@ func TestIntegrationFireAndForgetHandler(t *testing.T) {
 		ServerName:       "test.example.com",
 		PublicKey:        serverPub,
 		ShortID:          shortID,
-		Jitter:           false,
 		TCPFragmentation: false,
 	})
 	if err != nil {

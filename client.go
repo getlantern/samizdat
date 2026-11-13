@@ -21,7 +21,6 @@ import (
 type Client struct {
 	config ClientConfig
 	pool   *connPool
-	shaper *Shaper
 	mu     sync.Mutex
 	closed bool
 }
@@ -55,12 +54,6 @@ func NewClient(config ClientConfig) (*Client, error) {
 	c := &Client{
 		config: config,
 	}
-
-	// Create shaper based on config
-	c.shaper = NewShaper(
-		config.Jitter,
-		config.MaxJitterMs,
-	)
 
 	// Create connection pool
 	c.pool = newConnPool(config.MaxStreamsPerConn, config.IdleTimeout, c.createTransport)
@@ -131,7 +124,7 @@ func SPKISHA256(certDER []byte) ([32]byte, error) {
 // "h2" has been negotiated on it. The caller owns the connection. When ctx
 // has no deadline, ConnectTimeout bounds the dial and handshake. Of the
 // ClientConfig options that shape traffic, only TCPFragmentation applies;
-// RecordFragmentation, Jitter, MaxJitterMs and MaxStreamsPerConn belong to the
+// RecordFragmentation and MaxStreamsPerConn belong to the
 // pooled HTTP/2 layer DialSession does not use.
 func (c *Client) DialSession(ctx context.Context) (net.Conn, error) {
 	if c.isClosed() {
@@ -187,7 +180,7 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	}
 
 	// Create H2 transport over the TLS connection
-	transport, err := newH2Transport(conn, c.config.ServerAddr, c.config.MaxStreamsPerConn, c.shaper)
+	transport, err := newH2Transport(conn, c.config.ServerAddr, c.config.MaxStreamsPerConn)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)

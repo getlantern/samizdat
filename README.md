@@ -1,6 +1,6 @@
 # Samizdat
 
-Samizdat is a censorship-circumvention protocol. It carries proxy traffic over TLS 1.3 connections that, from outside, are a browser talking HTTP/2 to a real website. The server authenticates its own clients inside the TLS handshake; with a cover site configured (`MasqueradeDomain`), it passes every other connection that opens with a valid TLS handshake record (up to 16 KB), including active probes, to that real website. By default, the first records of each authenticated connection are shaped to match a model of real TLS traffic.
+Samizdat is a censorship-circumvention protocol. It carries proxy traffic over TLS 1.3 connections that, from outside, are a browser talking HTTP/2 to a real website. The server authenticates its own clients inside the TLS handshake; with a cover site configured (`MasqueradeDomain`), it passes every other connection, including active probes and anything that isn't TLS at all, to that real website. By default, the first records of each authenticated connection are shaped to match a model of real TLS traffic.
 
 The name comes from the Russian *самиздат*: banned writing, copied by hand and passed on.
 
@@ -11,7 +11,7 @@ The name comes from the Russian *самиздат*: banned writing, copied by ha
 | Technique | Source | Samizdat's answer |
 |---|---|---|
 | Fingerprinting the start of a connection by packet sizes and directions | CenKL, IEEE S&P 2027 | The first 10 TLS records after the handshake follow sizes and directions drawn from the authors' model of 326.5M real TLS flows; Go's dynamic record sizing is off |
-| Active probing, including replaying a captured handshake | Alice et al., IMC 2020; REALITY replay PoC, net4people #576 | Unauthenticated or repeated ClientHellos are forwarded byte for byte to the real cover site; accepted SessionIDs are remembered and refused again. Probes that don't open with a TLS handshake record are closed (see Limits) |
+| Active probing, including replaying a captured handshake | Alice et al., IMC 2020; REALITY replay PoC, net4people #576 | Every connection that doesn't authenticate, or repeats a SessionID, is forwarded byte for byte to the real cover site, including probes that aren't TLS; accepted SessionIDs are remembered and refused again |
 | Copying an authentication tag into another handshake | — | Version 2 tags are bound to the whole ClientHello and the client's key share |
 | First-packet entropy and length (Shadowsocks) | Alice et al., IMC 2020 | A standard TLS 1.3 ClientHello from uTLS with Chrome's fingerprint |
 | TLS-in-TLS fingerprinting | Xue et al., USENIX Security 2024 | Partial: HTTP/2 multiplexing, which that paper found lowers the attack's TPR by over 70% with two or more concurrent streams (far less with one) |
@@ -19,7 +19,7 @@ The name comes from the Russian *самиздат*: banned writing, copied by ha
 | Policing the number of TLS connections to an address on port 443 | net4people #546 | Streams share pooled TLS connections, up to 100 each (`MaxStreamsPerConn`) |
 | UDP blocking | Russia | TCP only |
 
-Not covered: **timing.** With `Jitter` on, the client delays each tunnel write by 1 to `MaxJitterMs` ms (30 by default), but Xue et al. (NDSS 2025) found that random delays don't defeat cross-layer RTT fingerprinting and can make it easier, and CenKL's timing-aware classifier still reaches about 0.9 recall against shaped traffic. See [Limits](#limits).
+Not covered: **timing.** CenKL's timing-aware classifier still reaches about 0.9 recall against shaped traffic. Samizdat used to add a random 1–30 ms delay before each write; it was removed because Xue et al. (NDSS 2025) found that random delays don't defeat cross-layer RTT fingerprinting and can make it easier. See [Limits](#limits).
 
 ## Protocol Design
 
@@ -65,7 +65,7 @@ Active probe                  Samizdat server              Cover site
   |   (bytes copied both ways until both close, or 10 minutes)   |
 ```
 
-After reading the ClientHello to check its tag, the server forwards it and everything after without rewriting anything or terminating TLS, so the prober sees the cover site's certificate, TLS stack and HTTP responses. `MasqueradeMaxDuration` (10 minutes by default) bounds the copy. Inspired by [tlsmasq](https://github.com/getlantern/tlsmasq).
+After reading the ClientHello to check its tag, the server forwards it and everything after without rewriting anything or terminating TLS. A connection whose first record the server can't check (not TLS at all, over 16 KB, cut off, or nothing within 10 seconds) is forwarded the same way, with whatever bytes arrived, so the prober sees the cover site's certificate, TLS stack and HTTP responses. `MasqueradeMaxDuration` (10 minutes by default) bounds the copy. Inspired by [tlsmasq](https://github.com/getlantern/tlsmasq).
 
 ### Connection-start shaping
 
@@ -84,20 +84,18 @@ Measured against CenKL's model (first 10 packets, 800 flows, loopback): unshaped
 
 Every tunnelled connection is an HTTP/2 CONNECT stream on a pooled TLS connection carrying up to `MaxStreamsPerConn` (100) at once. The client reuses pooled connections where it can, so a censor counting TLS connections to the address sees few, though concurrent dials can open more than one. `ServerConfig.LeanH2` serves those streams with samizdat's own HTTP/2 server (`leanh2.go`), which sends the same frames as Go's x/net server but batches them into fewer TLS records and system calls: 66–90% less server CPU per GB downloaded in benchmarks ([#25](https://github.com/getlantern/samizdat/pull/25)).
 
-### Fragmentation and jitter
+### Fragmentation
 
 - **ClientHello fragmentation** (`TCPFragmentation`): the ClientHello is written in pieces split around the SNI field, with a short random delay between them. It's best effort: a split can fall just outside the hostname, and separate writes don't guarantee separate TCP segments.
 - **Record fragmentation** (`RecordFragmentation`): not implemented. The option exists in `ClientConfig` but nothing uses it yet.
-- **Jitter** (`Jitter`, `MaxJitterMs`, default 30): when on, the client waits 1 to `MaxJitterMs` ms before each tunnel write. As noted above, research suggests this doesn't help against RTT fingerprinting.
 
 ## Limits
 
-- **Timing isn't shaped**, beyond the jitter above.
+- **Timing isn't shaped.**
 - **Tunnelled TLS is still inside.** Applications using samizdat bring their own TLS. Multiplexing helps most with several concurrent streams.
 - **Shaping covers 10 records.** After that, traffic is whatever the tunnelled applications send. The schedule fixes TLS record sizes; TCP can still split or merge them into packets.
 - **The model is one network's view:** one regional ISP, late 2025. Its data license is still being settled with the authors.
 - **The replay record is in memory and bounded.** A restarted server has forgotten the SessionIDs it accepted, and more than `ReplayCapacity` in one window shortens how long they're remembered.
-- **Probes that aren't TLS are closed.** A connection whose first record isn't a TLS handshake record, or is larger than 16 KB, is closed rather than forwarded, so it doesn't see how the cover site would react.
 - **Not independently reviewed.** Version 2 auth hasn't had an outside cryptographic review.
 
 ## Installation
@@ -119,7 +117,6 @@ client, err := samizdat.NewClient(samizdat.ClientConfig{
     PublicKey:   serverPublicKey,             // 32-byte X25519 public key
     ShortID:     shortID,                    // 8-byte pre-shared identifier
     Fingerprint: "chrome",                   // uTLS fingerprint
-    Jitter:      true,                       // timing jitter
     TCPFragmentation: true,                  // Geneva-style fragmentation
 })
 
@@ -191,7 +188,7 @@ samizdat/
 ├── shapingmodel.go      # The shaping model and sampler
 ├── shaping_model.bin.gz # CenKL's size-and-direction model, pruned
 ├── fragmenter.go        # ClientHello fragmentation
-├── shaper.go            # Jitter (and an unused record fragmenter)
+├── shaper.go            # An unused record fragmenter
 ├── masquerade.go        # Transparent proxy to the cover site
 ├── cmd/samizdat-server/ # Standalone server
 └── cmd/shapingmodel/    # Builds shaping_model.bin.gz from CenKL's released model
@@ -318,7 +315,6 @@ func main() {
 		PublicKey:        serverPub,
 		ShortID:          shortID,
 		Fingerprint:      "chrome",
-		Jitter:           true,
 		TCPFragmentation: false, // disabled for localhost test
 	})
 	if err != nil {

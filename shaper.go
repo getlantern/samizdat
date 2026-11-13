@@ -1,42 +1,5 @@
 package samizdat
 
-import (
-	"io"
-	"time"
-)
-
-// Shaper implements traffic shaping for H2 streams. It introduces timing
-// jitter to defeat cross-layer RTT fingerprinting.
-type Shaper struct {
-	jitter      bool
-	maxJitterMs int
-}
-
-// NewShaper creates a traffic shaper with the given configuration.
-func NewShaper(jitter bool, maxJitterMs int) *Shaper {
-	if maxJitterMs <= 0 {
-		maxJitterMs = 30
-	}
-	return &Shaper{
-		jitter:      jitter,
-		maxJitterMs: maxJitterMs,
-	}
-}
-
-// Write shapes the outgoing data by introducing timing jitter, then
-// writes to the underlying writer. This is called from streamConn.Write.
-func (s *Shaper) Write(w io.Writer, data []byte) (int, error) {
-	if !s.jitter {
-		return w.Write(data)
-	}
-
-	// Apply timing jitter (1-maxJitterMs random delay)
-	jitterMs := randomInt(1, s.maxJitterMs+1)
-	time.Sleep(time.Duration(jitterMs) * time.Millisecond)
-
-	return w.Write(data)
-}
-
 // RecordFragmenter splits inner TLS records across multiple H2 DATA frames
 // to defeat encapsulated TLS detection (USENIX Sec 2024).
 type RecordFragmenter struct {

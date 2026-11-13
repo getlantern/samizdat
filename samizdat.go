@@ -52,10 +52,6 @@ type ClientConfig struct {
 	// TLS fingerprint
 	Fingerprint string // "chrome" (default), "firefox", "safari"
 
-	// Traffic shaping
-	Jitter      bool // enable timing jitter (default: true)
-	MaxJitterMs int  // max jitter in ms (default: 30)
-
 	// TCP fragmentation (Geneva-inspired)
 	TCPFragmentation    bool // fragment ClientHello across TCP segments (default: true)
 	RecordFragmentation bool // fragment inner TLS records across H2 DATA frames (default: true)
@@ -89,8 +85,8 @@ type ClientConfig struct {
 	// MaxConcurrentStreams (default: 250): a tunnel past the server's limit
 	// waits for a stream to end rather than opening on a new connection.
 	MaxStreamsPerConn int
-	IdleTimeout      time.Duration // close idle connections after (default: 5m)
-	ConnectTimeout   time.Duration // TCP+TLS connect timeout (default: 15s)
+	IdleTimeout       time.Duration // close idle connections after (default: 5m)
+	ConnectTimeout    time.Duration // TCP+TLS connect timeout (default: 15s)
 
 	// Optional: custom dialer for the underlying TCP connection
 	Dialer DialFunc
@@ -100,9 +96,6 @@ type ClientConfig struct {
 func (c *ClientConfig) applyDefaults() {
 	if c.Fingerprint == "" {
 		c.Fingerprint = "chrome"
-	}
-	if c.MaxJitterMs == 0 {
-		c.MaxJitterMs = 30
 	}
 	if c.MaxStreamsPerConn == 0 {
 		c.MaxStreamsPerConn = 100

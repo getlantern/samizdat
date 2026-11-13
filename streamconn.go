@@ -29,7 +29,6 @@ type streamConn struct {
 	rwc         io.ReadWriteCloser
 	localAddr   net.Addr
 	remoteAddr  net.Addr
-	shaper      *Shaper
 	destination string
 
 	readDeadline  *pipeDeadline
@@ -67,13 +66,12 @@ type readResult struct {
 }
 
 // newStreamConn creates a net.Conn backed by the given ReadWriteCloser.
-func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, destination string, shaper *Shaper) *streamConn {
+func newStreamConn(rwc io.ReadWriteCloser, localAddr, remoteAddr net.Addr, destination string) *streamConn {
 	sc := &streamConn{
 		rwc:           rwc,
 		localAddr:     localAddr,
 		remoteAddr:    remoteAddr,
 		destination:   destination,
-		shaper:        shaper,
 		readDeadline:  newPipeDeadline(),
 		writeDeadline: newPipeDeadline(),
 		readResults:   make(chan readResult),
@@ -180,9 +178,6 @@ func (sc *streamConn) Write(b []byte) (int, error) {
 	case <-sc.writeDeadline.wait():
 		return 0, &timeoutError{}
 	default:
-	}
-	if sc.shaper != nil {
-		return sc.shaper.Write(sc.rwc, b)
 	}
 	return sc.rwc.Write(b)
 }
