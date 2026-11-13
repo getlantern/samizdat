@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,8 +81,18 @@ func runBenchServer() {
 	for in.Scan() {
 		if in.Text() == "mark" {
 			mark = cpuTime()
+			// SAMIZDAT_BENCH_PROFILE names a file for a CPU profile of the
+			// server from the mark on, to see where a workload's time goes.
+			if p := os.Getenv("SAMIZDAT_BENCH_PROFILE"); p != "" {
+				f, err := os.Create(p)
+				if err != nil {
+					fatalf("profile: %v", err)
+				}
+				pprof.StartCPUProfile(f)
+			}
 		}
 	}
+	pprof.StopCPUProfile()
 	fmt.Printf("cpu_ns=%d\n", (cpuTime() - mark).Nanoseconds())
 	os.Exit(0)
 }

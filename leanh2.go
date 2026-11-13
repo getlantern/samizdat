@@ -577,7 +577,7 @@ func (c *leanConn) handleData(f *http2.DataFrame) error {
 	if st.closed || st.draining {
 		unread = n
 	} else {
-		st.rbuf = append(st.rbuf, data...)
+		st.recv.write(data)
 	}
 	if unread > 0 {
 		c.creditConn(unread)
@@ -870,8 +870,8 @@ type leanStream struct {
 	sendWin     int64
 	recvAvail   int64 // what the client may still send on the stream
 	recvUnacked int64
-	rbuf        []byte
-	remoteDone  bool // the client sent END_STREAM
+	recv        leanRecvBuf // what the client sent and the handler hasn't read
+	remoteDone  bool        // the client sent END_STREAM
 	reset       bool
 	// draining is set when the handler returns: what the client still sends
 	// is dropped, as serveH2's drain does, but lingering writes go through
@@ -892,13 +892,119 @@ type leanStream struct {
 	wmu sync.Mutex
 }
 
+// leanRecvBuf queues the bytes a stream has received for its handler to
+// read, in chunks from shared pools, as x/net's server does. One slice that
+// grew with the backlog was copied each time it grew and thrown away each
+// time the handler caught up, which made a bulk upload cost more CPU here
+// than on x/net's server, most of it allocation and garbage collection.
+type leanRecvBuf struct {
+	chunks [][]byte // the first is read from off; the last may have room
+	off    int
+	n      int // unread bytes in all
+}
+
+// leanChunkSizes are the sizes chunks come in. A chunk is sized for the
+// data that needs it, so a small request doesn't hold a large one.
+var leanChunkSizes = [...]int{1 << 10, 2 << 10, 4 << 10, 8 << 10, 16 << 10}
+
+var leanChunkPools = [...]sync.Pool{
+	{New: func() any { return new([1 << 10]byte) }},
+	{New: func() any { return new([2 << 10]byte) }},
+	{New: func() any { return new([4 << 10]byte) }},
+	{New: func() any { return new([8 << 10]byte) }},
+	{New: func() any { return new([16 << 10]byte) }},
+}
+
+// getLeanChunk returns an empty chunk for up to want bytes, or the largest
+// there is.
+func getLeanChunk(want int) []byte {
+	switch {
+	case want <= 1<<10:
+		return leanChunkPools[0].Get().(*[1 << 10]byte)[:0]
+	case want <= 2<<10:
+		return leanChunkPools[1].Get().(*[2 << 10]byte)[:0]
+	case want <= 4<<10:
+		return leanChunkPools[2].Get().(*[4 << 10]byte)[:0]
+	case want <= 8<<10:
+		return leanChunkPools[3].Get().(*[8 << 10]byte)[:0]
+	}
+	return leanChunkPools[4].Get().(*[16 << 10]byte)[:0]
+}
+
+func putLeanChunk(c []byte) {
+	switch cap(c) {
+	case 1 << 10:
+		leanChunkPools[0].Put((*[1 << 10]byte)(c[:cap(c)]))
+	case 2 << 10:
+		leanChunkPools[1].Put((*[2 << 10]byte)(c[:cap(c)]))
+	case 4 << 10:
+		leanChunkPools[2].Put((*[4 << 10]byte)(c[:cap(c)]))
+	case 8 << 10:
+		leanChunkPools[3].Put((*[8 << 10]byte)(c[:cap(c)]))
+	case 16 << 10:
+		leanChunkPools[4].Put((*[16 << 10]byte)(c[:cap(c)]))
+	}
+}
+
+// write queues a copy of data.
+func (b *leanRecvBuf) write(data []byte) {
+	b.n += len(data)
+	for len(data) > 0 {
+		last := len(b.chunks) - 1
+		if last < 0 || len(b.chunks[last]) == cap(b.chunks[last]) {
+			b.chunks = append(b.chunks, getLeanChunk(len(data)))
+			last++
+		}
+		c := b.chunks[last]
+		n := copy(c[len(c):cap(c)], data)
+		b.chunks[last] = c[:len(c)+n]
+		data = data[n:]
+	}
+}
+
+// read moves queued bytes into p and returns how many.
+func (b *leanRecvBuf) read(p []byte) int {
+	total := 0
+	for len(p) > 0 && b.n > 0 {
+		c := b.chunks[0]
+		n := copy(p, c[b.off:])
+		p = p[n:]
+		b.off += n
+		b.n -= n
+		total += n
+		if b.off == len(c) {
+			b.pop()
+		}
+	}
+	return total
+}
+
+// pop returns the first chunk to its pool.
+func (b *leanRecvBuf) pop() {
+	putLeanChunk(b.chunks[0])
+	b.chunks[0] = nil
+	b.chunks = b.chunks[1:]
+	b.off = 0
+	if len(b.chunks) == 0 {
+		b.chunks = nil
+	}
+}
+
+// drop discards everything queued.
+func (b *leanRecvBuf) drop() {
+	for _, c := range b.chunks {
+		putLeanChunk(c)
+	}
+	*b = leanRecvBuf{}
+}
+
 // dropUnreadLocked discards data the handler will never read and returns it
 // to the client's windows, so it doesn't hold up the stream or, through the
 // shared connection window, the connection's other streams. c.mu must be
 // held.
 func (st *leanStream) dropUnreadLocked() {
-	if n := int64(len(st.rbuf)); n > 0 {
-		st.rbuf = nil
+	if n := int64(st.recv.n); n > 0 {
+		st.recv.drop()
 		st.c.creditConn(n)
 		st.creditStream(n)
 	}
@@ -1172,7 +1278,7 @@ func (sc *leanStreamConn) Read(b []byte) (int, error) {
 	c := st.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for len(st.rbuf) == 0 {
+	for st.recv.n == 0 {
 		switch {
 		case st.closed, st.draining:
 			return 0, net.ErrClosed
@@ -1187,11 +1293,7 @@ func (sc *leanStreamConn) Read(b []byte) (int, error) {
 		}
 		st.cond.Wait()
 	}
-	n := copy(b, st.rbuf)
-	st.rbuf = st.rbuf[n:]
-	if len(st.rbuf) == 0 {
-		st.rbuf = nil
-	}
+	n := st.recv.read(b)
 	c.creditConn(int64(n))
 	st.creditStream(int64(n))
 	return n, nil
