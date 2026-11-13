@@ -957,6 +957,7 @@ func TestLeanH2EndsStreamWithNegativeWindow(t *testing.T) {
 // servers and compares the frames each sends back before ending the
 // connection.
 func TestLeanH2MatchesXNetOnBadPeers(t *testing.T) {
+	initialConnWindowUpdate := fmt.Sprintf("WINDOW_UPDATE flags=0 stream=0 incr=%d", leanConnRecvWindow-leanInitialPeerWindow)
 	// settle lets a stream's response HEADERS go out first: x/net's server
 	// writes them from another goroutine, so they could otherwise follow the
 	// frames under test.
@@ -1053,7 +1054,12 @@ func TestLeanH2MatchesXNetOnBadPeers(t *testing.T) {
 					if err != nil {
 						return canonical(out)
 					}
-					out = append(out, describe(f))
+					// Both servers queue a connection WINDOW_UPDATE with their
+					// SETTINGS, but x/net's writes it from another goroutine and
+					// can close a misbehaving connection before it goes out.
+					if d := describe(f); d != initialConnWindowUpdate {
+						out = append(out, d)
+					}
 				}
 			}
 			if want, got := run(false), run(true); got != want {

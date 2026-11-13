@@ -77,7 +77,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	if config.MaxClockSkew < 0 {
 		return nil, fmt.Errorf("MaxClockSkew must not be negative, got %v", config.MaxClockSkew)
 	}
-	if config.ReplayWindow > 0 && config.ReplayWindow < 2*config.MaxClockSkew {
+	// Compared as MaxClockSkew > ReplayWindow/2: 2*MaxClockSkew overflows for
+	// a huge skew and would let it through.
+	if config.ReplayWindow > 0 && config.MaxClockSkew > config.ReplayWindow/2 {
 		// A version 2 ClientHello sent again unchanged authenticates for up
 		// to twice MaxClockSkew after its first use (a client whose clock
 		// runs ahead by MaxClockSkew), and only the replay filter refuses it.
