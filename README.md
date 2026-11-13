@@ -1,6 +1,6 @@
 # Samizdat
 
-Samizdat is a censorship-circumvention protocol. It carries proxy traffic inside a single TLS 1.3 connection that, from outside, is a browser talking HTTP/2 to a real website. The server authenticates its own clients inside the TLS handshake and passes everyone else, including active probes, to the real website. The first records of every connection are shaped to match a model of real TLS traffic.
+Samizdat is a censorship-circumvention protocol. It carries proxy traffic over TLS 1.3 connections that, from outside, are a browser talking HTTP/2 to a real website. The server authenticates its own clients inside the TLS handshake; with a cover site configured (`MasqueradeDomain`), it passes every other connection, including active probes, to that real website. By default, the first records of each authenticated connection are shaped to match a model of real TLS traffic.
 
 The name comes from the Russian *самиздат*: banned writing, copied by hand and passed on.
 
@@ -16,10 +16,10 @@ The name comes from the Russian *самиздат*: banned writing, copied by ha
 | First-packet entropy and length (Shadowsocks) | Alice et al., IMC 2020 | A standard TLS 1.3 ClientHello from uTLS with Chrome's fingerprint |
 | TLS-in-TLS fingerprinting | Xue et al., USENIX Security 2024 | Partial: HTTP/2 multiplexing, which that paper found lowers the attack's TPR by over 70% with two or more concurrent streams (far less with one) |
 | SNI extraction from a single packet | Russia's TSPU | Optional: the ClientHello is split across TCP segments at the SNI, in the style of Geneva (Bock et al., CCS 2019) |
-| Policing the number of TLS connections to an address on port 443 | net4people #546 | One TLS connection carries every stream |
+| Policing the number of TLS connections to an address on port 443 | net4people #546 | One TLS connection carries up to 100 streams (`MaxStreamsPerConn`) |
 | UDP blocking | Russia | TCP only |
 
-Not covered: **timing.** Samizdat adds 1–30 ms of random jitter to DATA frames, but Xue et al. (NDSS 2025) found that random delays don't defeat cross-layer RTT fingerprinting and can make it easier, and CenKL's timing-aware classifier still reaches about 0.9 recall against shaped traffic. See [Limits](#limits).
+Not covered: **timing.** With `Jitter` on, the client delays each tunnel write by 1 to `MaxJitterMs` ms (30 by default), but Xue et al. (NDSS 2025) found that random delays don't defeat cross-layer RTT fingerprinting and can make it easier, and CenKL's timing-aware classifier still reaches about 0.9 recall against shaped traffic. See [Limits](#limits).
 
 ## Protocol Design
 
@@ -45,15 +45,15 @@ Client                                       Server
 The tag is the 32-byte SessionID every TLS 1.3 ClientHello carries. Clients send version 2; servers accept version 2 and version 1, for older clients.
 
 - **Pre-shared:** the server's X25519 public key and an 8-byte short ID per client.
-- **Version 2** (`authv2.go`): the SessionID is `AES-256-GCM(key, nonce = random[20:32], version || time || shortID)`, with `key = HKDF-SHA256(X25519(client key share, server key), salt = random[:20], "SAMIZDAT-v2")` and the whole ClientHello (SessionID zeroed) as additional data. It is bound to its ClientHello, as in REALITY, and nothing in it repeats between connections. The same ClientHello sent again unchanged still authenticates until its time is more than `MaxClockSkew` (12 hours by default) from the server's, so the server refuses repeats of it too, as for version 1. A client whose clock is further off than that is refused; set `ServerCertSPKISHA256` so it fails instead of completing the cover site's handshake.
-- **Version 1** (`auth.go`): `shortID(8) || nonce(8) || HMAC-SHA256(PSK, nonce)[:16]`, with `PSK = HKDF-SHA256(serverPubKey, shortID, "SAMIZDAT")`. It works in any ClientHello, so the server also refuses a SessionID it has already accepted, for 24 to 48 hours by default (`ReplayWindow`; negative turns it off). `RequireAuthV2` makes a server refuse version 1 once its clients have moved. The record is in memory, so a restarted server has forgotten it.
+- **Version 2** (`authv2.go`): the SessionID is `AES-256-GCM(key, nonce = random[20:32], version(1) || zero(3) || unix time, big-endian(4) || shortID(8))`, with `key = HKDF-SHA256(X25519(client key share, server key), salt = random[:20], "SAMIZDAT-v2")` and the whole ClientHello (SessionID zeroed) as additional data. It is bound to its ClientHello, as in REALITY, and nothing in it repeats between connections. The same ClientHello sent again unchanged still authenticates until its time is more than `MaxClockSkew` (12 hours by default) from the server's, so the server refuses repeats of it too, as for version 1. A client whose clock is further off than that is refused; set `ServerCertSPKISHA256` so it fails instead of completing the cover site's handshake.
+- **Version 1** (`auth.go`): `shortID(8) || nonce(8) || HMAC-SHA256(PSK, nonce)[:16]`, with `PSK = HKDF-SHA256(serverPubKey, shortID, "SAMIZDAT")`. It works in any ClientHello, so the server also refuses a SessionID it has already accepted, for 24 to 48 hours by default (`ReplayWindow`; negative turns it off), or less if more than `ReplayCapacity` (1,000,000) SessionIDs authenticate within one window. `RequireAuthV2` makes a server refuse version 1 once its clients have moved. The record is in memory, so a restarted server has forgotten it.
 - **If auth fails, or the SessionID repeats:** the server enters masquerade mode (below).
 
 The ClientHello comes from [uTLS](https://github.com/refraction-networking/utls) with Chrome's fingerprint (Firefox and Safari are also available).
 
 ### Masquerade (active-probe resistance)
 
-When a connection doesn't authenticate, including an active probe, the server becomes a **transparent TCP proxy** to the real cover site:
+When a connection doesn't authenticate, including an active probe, a server with `MasqueradeDomain` set becomes a **transparent TCP proxy** to the real cover site (without it, the server closes the connection):
 
 ```
 Active probe                  Samizdat server              Cover site
@@ -62,32 +62,33 @@ Active probe                  Samizdat server              Cover site
   |                               |-- the same raw ClientHello -->|
   |                               |<-- ServerHello, real cert ----|
   |<-- ServerHello, real cert ----|                              |
-  |        (bytes copied both ways until either side closes)     |
+  |   (bytes copied both ways until both close, or 10 minutes)   |
 ```
 
-The server doesn't parse or modify any of it, so the prober sees the cover site's certificate, TLS stack and HTTP responses. Inspired by [tlsmasq](https://github.com/getlantern/tlsmasq).
+After reading the ClientHello to check its tag, the server forwards it and everything after without rewriting anything or terminating TLS, so the prober sees the cover site's certificate, TLS stack and HTTP responses. `MasqueradeMaxDuration` (10 minutes by default) bounds the copy. Inspired by [tlsmasq](https://github.com/getlantern/tlsmasq).
 
 ### Connection-start shaping
 
 CenKL (Ortwein et al., IEEE S&P 2027) found that every proxy it tested could be told from real TLS within the first few packets after the handshake, and that HTTP/2 tunnels in particular open with a distinctive preface, SETTINGS and CONNECT. Following the authors' ProxyShaper (`shaping.go`, `shapingmodel.go`):
 
-- Both ends export 40 bytes of keying material from the TLS session. 32 bytes seed a ChaCha8 sampler; 8 bytes become a marker.
+- Both ends export 40 bytes of keying material from the TLS session. 32 bytes seed a ChaCha8 sampler; 8 bytes key an HMAC over the schedule, whose first 8 bytes are the marker.
 - The sampler draws 10 records' sizes and directions from the authors' released order-1 Markov model (`shaping_model.bin.gz`), each conditioned on the previous one. Sizes above 1,448 bytes, which a Linux sender with TCP timestamps splits into two packets, are left out.
 - During the schedule each side sends exactly its scheduled records: a 2-byte length, queued HTTP/2 bytes, then padding. After the 10th record, data passes straight through.
-- The server reads the client's first 8 bytes: the marker means a shaping client; an HTTP/2 preface means an older client, served as before. `DisableShaping` turns it off at either end.
+- The server reads the client's first 8 bytes: the marker means a shaping client; an HTTP/2 preface means an older client, served as before. `ClientConfig.DisableShaping` stops a client shaping, which works with any server; `ServerConfig.DisableShaping` stops a server accepting shaping clients, so its clients must disable it too.
+- Shaping applies to authenticated HTTP/2 connections; the masquerade path and `SessionHandler` connections aren't shaped.
 - Go's dynamic TLS record sizing is off on both ends, and the server issues no session tickets: both added tells of their own.
 
 Measured against CenKL's model (first 10 packets, 800 flows, loopback): unshaped samizdat scored 63.0 nats of KL divergence, shaped samizdat 12.4, and real TLS sampled from the model itself 11.3 (the floor for that sample size). See [#29](https://github.com/getlantern/samizdat/pull/29).
 
 ### HTTP/2 multiplexing
 
-Every tunnelled connection is an HTTP/2 CONNECT stream on one TLS connection, so a censor counting TLS connections to the address sees one. `ServerConfig.LeanH2` serves those streams with samizdat's own HTTP/2 server (`leanh2.go`), which sends the same frames as Go's x/net server but batches them into fewer TLS records and system calls: 66–90% less server CPU per GB downloaded in benchmarks ([#25](https://github.com/getlantern/samizdat/pull/25)).
+Every tunnelled connection is an HTTP/2 CONNECT stream on a pooled TLS connection, which carries up to `MaxStreamsPerConn` (100) streams before the client opens another, so a censor counting TLS connections to the address sees few. `ServerConfig.LeanH2` serves those streams with samizdat's own HTTP/2 server (`leanh2.go`), which sends the same frames as Go's x/net server but batches them into fewer TLS records and system calls: 66–90% less server CPU per GB downloaded in benchmarks ([#25](https://github.com/getlantern/samizdat/pull/25)).
 
 ### Fragmentation and jitter
 
 - **ClientHello fragmentation** (`TCPFragmentation`): the ClientHello is split across TCP segments at the SNI field, with a short random delay, so a middlebox that reads the SNI from one packet doesn't find it there.
 - **Record fragmentation** (`RecordFragmentation`): not implemented. The option exists in `ClientConfig` but nothing uses it yet.
-- **Jitter** (`Jitter`, `MaxJitterMs`, default 30): a 1–30 ms random delay on outgoing frames. As noted above, research suggests this doesn't help against RTT fingerprinting.
+- **Jitter** (`Jitter`, `MaxJitterMs`, default 30): when on, the client waits 1 to `MaxJitterMs` ms before each tunnel write. As noted above, research suggests this doesn't help against RTT fingerprinting.
 
 ## Limits
 
@@ -95,7 +96,7 @@ Every tunnelled connection is an HTTP/2 CONNECT stream on one TLS connection, so
 - **Tunnelled TLS is still inside.** Applications using samizdat bring their own TLS. Multiplexing helps most with several concurrent streams.
 - **Shaping covers 10 records.** After that, traffic is whatever the tunnelled applications send. The schedule fixes TLS record sizes; TCP can still split or merge them into packets.
 - **The model is one network's view:** one regional ISP, late 2025. Its data license is still being settled with the authors.
-- **The replay record is in memory.** A restarted server has forgotten the SessionIDs it accepted.
+- **The replay record is in memory and bounded.** A restarted server has forgotten the SessionIDs it accepted, and more than `ReplayCapacity` in one window shortens how long they're remembered.
 - **Not independently reviewed.** Version 2 auth hasn't had an outside cryptographic review.
 
 ## Installation
