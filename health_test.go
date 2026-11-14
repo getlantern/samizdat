@@ -119,35 +119,68 @@ func TestShortCancelKeepsTransport(t *testing.T) {
 	}
 }
 
-// TestUnansweredPingClosesConnection: a connection that receives nothing is
-// pinged, and closed when the ping goes unanswered, so a transport whose
-// connection died without a word doesn't keep taking CONNECTs.
+// TestUnansweredPingClosesConnection: a CONNECT that waits pingIfSilent with
+// its connection reading nothing pings it, and closes it when the ping goes
+// unanswered, so the CONNECT fails in time for its caller to redial rather
+// than waiting out its own deadline.
 func TestUnansweredPingClosesConnection(t *testing.T) {
-	setVar(t, &h2ReadIdleTimeout, 50*time.Millisecond)
-	setVar(t, &h2PingTimeout, 50*time.Millisecond)
+	setVar(t, &pingIfSilent, 50*time.Millisecond)
+	setVar(t, &pingTimeout, 50*time.Millisecond)
 	setVar(t, &silentConnectRetire, time.Hour)
 	tr, logs := startQuietServer(t, 0)
-
-	// The first CONNECT makes x/net take the connection; it then pings it
-	// and closes it when the ping goes unanswered.
 	tr.activeStreams.Store(1)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := tr.openReserved(ctx, "example.com:443"); err == nil {
-		t.Fatal("CONNECT to a server that never answers succeeded")
+	_, err := tr.openReserved(ctx, "example.com:443")
+	if !connFatal(err) {
+		t.Fatalf("CONNECT on a connection whose ping went unanswered returned %v, which DialContext won't redial", err)
 	}
-	if !tr.conn.closed.Load() {
-		t.Fatal("x/net didn't close a connection whose ping went unanswered")
+	if ctx.Err() != nil {
+		t.Fatal("CONNECT waited out its caller's deadline")
 	}
-
-	tr.activeStreams.Store(1)
-	if _, err := tr.openReserved(context.Background(), "example.com:443"); err == nil {
-		t.Fatal("CONNECT on a closed connection succeeded")
+	if !tr.isClosed() {
+		t.Fatal("transport stayed open after its ping went unanswered")
 	}
-	if !tr.retired.Load() {
-		t.Fatal("transport wasn't retired after x/net closed its connection")
-	}
-	if !strings.Contains(logs.String(), "connection closed under the transport") {
+	if !strings.Contains(logs.String(), "unanswered ping") {
 		t.Errorf("logs lack the close reason:\n%s", logs)
+	}
+}
+
+// TestIdleReusePings: a CONNECT on a connection that has read nothing for
+// pingIfIdle pings it at once, without waiting for pingIfSilent.
+func TestIdleReusePings(t *testing.T) {
+	setVar(t, &pingIfIdle, 0)
+	setVar(t, &pingIfSilent, time.Hour)
+	setVar(t, &pingTimeout, 50*time.Millisecond)
+	setVar(t, &silentConnectRetire, time.Hour)
+	tr, _ := startQuietServer(t, 0)
+	tr.activeStreams.Store(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := tr.openReserved(ctx, "example.com:443"); !connFatal(err) {
+		t.Fatalf("CONNECT returned %v, want a conn-fatal error", err)
+	}
+	if ctx.Err() != nil || !tr.isClosed() {
+		t.Fatal("reusing an idle connection didn't ping it")
+	}
+}
+
+// TestReadingConnectionSurvivesUnansweredPing: a connection that keeps
+// reading is alive, so it isn't closed even though its server never answers
+// the ping or the CONNECT.
+func TestReadingConnectionSurvivesUnansweredPing(t *testing.T) {
+	setVar(t, &pingIfSilent, 50*time.Millisecond)
+	setVar(t, &pingTimeout, 50*time.Millisecond)
+	setVar(t, &silentConnectRetire, time.Hour)
+	tr, _ := startQuietServer(t, 10*time.Millisecond)
+	tr.activeStreams.Store(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	tr.openReserved(ctx, "example.com:443")
+	if tr.isClosed() || tr.retired.Load() {
+		t.Fatal("a connection that kept reading was closed")
 	}
 }

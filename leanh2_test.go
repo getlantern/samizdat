@@ -597,8 +597,8 @@ func TestLeanH2UnreadUploadDoesNotStallTheConnection(t *testing.T) {
 // TestConnFatalSecondDial: a refused second dial means x/net's pool has given
 // up on the connection, so the transport must be retired.
 func TestConnFatalSecondDial(t *testing.T) {
-	if !connFatal(fmt.Errorf("CONNECT: %w", errSecondDial)) {
-		t.Error("connFatal(errSecondDial) = false")
+	if !connFatal(fmt.Errorf("CONNECT: %w", errConnUnusable)) {
+		t.Error("connFatal(errConnUnusable) = false")
 	}
 }
 
@@ -638,17 +638,18 @@ func TestLeanH2ClosesOnRapidReset(t *testing.T) {
 }
 
 // TestRetiredTransportKeepsItsStreams: when x/net's Transport stops using the
-// connection for new streams (errSecondDial), the transport must stop taking
+// connection for new streams (errConnUnusable), the transport must stop taking
 // new tunnels but keep the ones it carries, and close once the last ends.
 func TestRetiredTransportKeepsItsStreams(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
+	go io.Copy(io.Discard, c2)
 	tr, err := newH2Transport(c1, "example.com:443", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tr.activeStreams.Store(1)
-	tr.retire()
+	tr.retireWithReason("test")
 	if tr.isClosed() {
 		t.Fatal("retiring closed a transport that still carries a stream")
 	}
@@ -804,12 +805,13 @@ func TestLeanH2ResetReleasesUnreadUpload(t *testing.T) {
 func TestRetiredTransportWaitsForOpeningStream(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
+	go io.Copy(io.Discard, c2)
 	tr, err := newH2Transport(c1, "example.com:443", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tr.activeStreams.Add(1) // the slot reserved before RoundTrip
-	tr.retire()
+	tr.retireWithReason("test")
 	if tr.isClosed() {
 		t.Fatal("retiring closed a transport with a CONNECT in flight")
 	}
@@ -1082,6 +1084,7 @@ func TestPoolClosedWhileDialing(t *testing.T) {
 		pool.close()
 		c1, c2 := net.Pipe()
 		t.Cleanup(func() { c2.Close() })
+		go io.Copy(io.Discard, c2)
 		tr, err := newH2Transport(c1, "example.com:443", 10)
 		created = tr
 		return tr, err
@@ -1212,6 +1215,7 @@ func TestLeanH2ConnWindowUpdateWakesOnlyWaiters(t *testing.T) {
 func TestFailedOpenLeavesIdleSince(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
+	go io.Copy(io.Discard, c2)
 	tr, err := newH2Transport(c1, "example.com:443", 10)
 	if err != nil {
 		t.Fatal(err)
