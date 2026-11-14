@@ -107,7 +107,7 @@ func (p *connPool) cleanup() {
 			continue
 		}
 		if t.streamCount() == 0 && t.idleFor(now) >= p.idleTimeout {
-			t.close()
+			t.closeWithReason("idle")
 			continue
 		}
 		alive = append(alive, t)

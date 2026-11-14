@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -20,10 +21,27 @@ import (
 // a second connection; see newH2Transport.
 var errSecondDial = errors.New("samizdat: HTTP/2 transport has only one connection")
 
+// Health checks. x/net pings a connection that has received nothing for
+// h2ReadIdleTimeout and closes it if the ping goes unanswered for
+// h2PingTimeout. Without them a connection that goes silent, such as one whose
+// NAT mapping a router dropped, is never noticed: writes still succeed, and
+// every CONNECT on it waits until its caller gives up.
+var (
+	h2ReadIdleTimeout = 30 * time.Second
+	h2PingTimeout     = 10 * time.Second
+)
+
+// transportIDs numbers transports for logs.
+var transportIDs atomic.Uint64
+
+// discardLogger is the logger of a transport whose client has none.
+var discardLogger = slog.New(slog.DiscardHandler)
+
 // h2Transport manages a single TLS+HTTP/2 connection to the server and
 // multiplexes CONNECT tunnels over it as separate H2 streams.
 type h2Transport struct {
-	tlsConn     net.Conn
+	// conn is the TLS connection, counting what it reads.
+	conn        *readTrackingConn
 	h2Roundtrip http.RoundTripper
 	serverAddr  string
 	localAddr   net.Addr
@@ -40,10 +58,60 @@ type h2Transport struct {
 	idleSince  atomic.Int64
 	maxStreams int
 	closed     bool
+
+	id     uint64
+	logger *slog.Logger
+	// created is when the transport was created.
+	created time.Time
+}
+
+// readTrackingConn records when its connection last read anything, so a
+// CONNECT that times out can tell a connection that went silent from one that
+// is merely slow to answer.
+type readTrackingConn struct {
+	net.Conn
+	// lastRead is when a read last returned data, in Unix nanoseconds, or
+	// zero if none has.
+	lastRead  atomic.Int64
+	bytesRead atomic.Int64
+	// readErr is the first error a read returned.
+	readErr atomic.Pointer[error]
+	// closed is set once anything closes the connection, x/net included,
+	// which it does when a ping goes unanswered.
+	closed atomic.Bool
+}
+
+func (c *readTrackingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.bytesRead.Add(int64(n))
+		c.lastRead.Store(time.Now().UnixNano())
+	}
+	if err != nil {
+		c.readErr.CompareAndSwap(nil, &err)
+	}
+	return n, err
+}
+
+func (c *readTrackingConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+// sinceRead returns how long ago the connection last read anything as of now,
+// or since created if it never has.
+func (t *h2Transport) sinceRead(now time.Time) time.Duration {
+	last := t.conn.lastRead.Load()
+	if last == 0 {
+		return now.Sub(t.created)
+	}
+	return now.Sub(time.Unix(0, last))
 }
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
 func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int) (*h2Transport, error) {
+	conn := &readTrackingConn{Conn: tlsConn}
+
 	// Create HTTP/2 client transport over the existing TLS connection.
 	// The transport must never dial a second connection: it would get this
 	// same one back and write a new preface into the middle of the first
@@ -57,20 +125,24 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int) (*h2Tra
 			if dialed.Swap(true) {
 				return nil, errSecondDial
 			}
-			return tlsConn, nil
+			return conn, nil
 		},
 		AllowHTTP:                  false,
 		DisableCompression:         true,
 		StrictMaxConcurrentStreams: true,
+		ReadIdleTimeout:            h2ReadIdleTimeout,
+		PingTimeout:                h2PingTimeout,
 	}
 
 	t := &h2Transport{
-		tlsConn:     tlsConn,
+		conn:        conn,
 		h2Roundtrip: h2t,
 		serverAddr:  serverAddr,
 		localAddr:   tlsConn.LocalAddr(),
 		remoteAddr:  tlsConn.RemoteAddr(),
 		maxStreams:  maxStreams,
+		id:          transportIDs.Add(1),
+		created:     time.Now(),
 	}
 	t.idleSince.Store(time.Now().UnixNano())
 
@@ -126,11 +198,25 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	req.Host = destination
 	// Standard HTTP/2 CONNECT uses the :authority pseudo-header which is set from Host
 
+	start := time.Now()
+	readBefore := t.conn.bytesRead.Load()
 	resp, err := t.h2Roundtrip.RoundTrip(req)
 	if err != nil {
 		stop()
 		tunnelCancel()
 		pw.Close()
+		now := time.Now()
+		// Nothing read while the CONNECT waited means the connection, not
+		// the destination, is what failed to answer.
+		silent := t.conn.bytesRead.Load() == readBefore
+		t.log().Warn("samizdat CONNECT failed",
+			"transport", t.id,
+			"error", err,
+			"waited", now.Sub(start),
+			"since_read", t.sinceRead(now),
+			"read_while_waiting", !silent,
+			"streams", t.streamCount(),
+			"age", now.Sub(t.created))
 		// This transport wraps a single, non-redialable conn (see
 		// newH2Transport's DialTLSContext). A conn-fatal error poisons every
 		// subsequent RoundTrip, so retire the transport here; otherwise the
@@ -140,9 +226,20 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		case errors.Is(err, errSecondDial):
 			// The connection can't take new streams (a GOAWAY, or stream
 			// IDs used up) but may still carry live tunnels; keep them.
-			t.retire()
+			reason := "connection takes no new streams"
+			if t.conn.closed.Load() {
+				// x/net closed it: a read failed or a ping went unanswered.
+				reason = "connection closed under the transport"
+			}
+			t.retireWithReason(reason)
 		case connFatal(err):
-			t.close()
+			t.closeWithReason("CONNECT failed: " + err.Error())
+		case silent && now.Sub(start) >= silentConnectRetire:
+			// A caller gave up on a connection that stayed silent the whole
+			// time. Stop opening streams on it, so the next CONNECT gets a
+			// new connection rather than waiting on this one as well; if
+			// it's alive, the streams it carries finish on it.
+			t.retireWithReason(fmt.Sprintf("silent for %v during a CONNECT", now.Sub(start).Round(time.Millisecond)))
 		}
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
 	}
@@ -150,6 +247,13 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	// Detach: stop propagating caller's context cancellation into the
 	// H2 stream now that the tunnel is established.
 	stop()
+
+	if waited := time.Since(start); waited >= slowConnect {
+		t.log().Info("samizdat CONNECT slow",
+			"transport", t.id,
+			"waited", waited,
+			"streams", t.streamCount())
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
@@ -194,6 +298,15 @@ func connFatal(err error) bool {
 		errors.Is(err, syscall.EPIPE)
 }
 
+// silentConnectRetire is how long a failed CONNECT must have waited, with its
+// connection reading nothing, for the transport to be retired. A CONNECT
+// cancelled sooner says little about the connection: its caller may simply
+// have moved on.
+var silentConnectRetire = 5 * time.Second
+
+// slowConnect is how long a CONNECT that succeeds can take before it's logged.
+const slowConnect = 3 * time.Second
+
 // tryReserve takes a stream slot if the transport has one, atomically, so
 // callers choosing a transport at once can't overbook it.
 func (t *h2Transport) tryReserve() bool {
@@ -236,6 +349,49 @@ func (t *h2Transport) retire() {
 	}
 }
 
+// retireWithReason retires the transport, logging why.
+func (t *h2Transport) retireWithReason(reason string) {
+	if !t.retired.Swap(true) {
+		t.log().Info("samizdat transport retired", t.logAttrs(reason)...)
+	}
+	if t.streamCount() == 0 {
+		t.close()
+	}
+}
+
+// closeWithReason closes the transport, logging why.
+func (t *h2Transport) closeWithReason(reason string) {
+	if !t.isClosed() {
+		t.log().Info("samizdat transport closed", t.logAttrs(reason)...)
+	}
+	t.close()
+}
+
+// log returns the transport's logger, which discards everything if it has
+// none.
+func (t *h2Transport) log() *slog.Logger {
+	if t.logger == nil {
+		return discardLogger
+	}
+	return t.logger
+}
+
+func (t *h2Transport) logAttrs(reason string) []any {
+	now := time.Now()
+	attrs := []any{
+		"transport", t.id,
+		"reason", reason,
+		"streams", t.streamCount(),
+		"since_read", t.sinceRead(now),
+		"read", t.conn.bytesRead.Load(),
+		"age", now.Sub(t.created),
+	}
+	if err := t.conn.readErr.Load(); err != nil {
+		attrs = append(attrs, "read_error", *err)
+	}
+	return attrs
+}
+
 // streamCount returns the number of active streams.
 func (t *h2Transport) streamCount() int {
 	return int(t.activeStreams.Load())
@@ -262,7 +418,7 @@ func (t *h2Transport) close() error {
 	if closer, ok := t.h2Roundtrip.(io.Closer); ok {
 		closer.Close()
 	}
-	return t.tlsConn.Close()
+	return t.conn.Close()
 }
 
 // isClosed returns true if the transport has been closed.

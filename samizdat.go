@@ -10,6 +10,7 @@ package samizdat
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"time"
 )
@@ -90,6 +91,10 @@ type ClientConfig struct {
 
 	// Optional: custom dialer for the underlying TCP connection
 	Dialer DialFunc
+
+	// Logger, if set, logs each connection's lifecycle and CONNECTs that
+	// fail or are slow. Destinations are never logged.
+	Logger *slog.Logger
 }
 
 // applyDefaults fills in zero-value fields with sensible defaults.

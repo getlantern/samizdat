@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -164,8 +165,12 @@ func (c *Client) Close() error {
 // createTransport creates a new TLS+H2 connection to the server with
 // Reality-style auth embedded in the ClientHello.
 func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
+	start := time.Now()
 	uConn, err := c.dialConn(ctx)
 	if err != nil {
+		if c.config.Logger != nil {
+			c.config.Logger.Warn("samizdat dial failed", "error", err, "took", time.Since(start))
+		}
 		return nil, err
 	}
 
@@ -184,6 +189,13 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)
+	}
+	if c.config.Logger != nil {
+		transport.logger = c.config.Logger
+		transport.log().Info("samizdat transport created",
+			"transport", transport.id,
+			"local", transport.localAddr,
+			"took", time.Since(start))
 	}
 
 	return transport, nil
