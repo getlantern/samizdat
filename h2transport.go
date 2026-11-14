@@ -27,13 +27,18 @@ var errConnUnusable = errors.New("samizdat: connection takes no new streams")
 // connection when it has read nothing for pingIfIdle, as Chrome does before
 // reusing an idle session, or when the CONNECT itself has waited
 // pingIfSilent without the connection reading anything. A connection that
-// answers nothing, its ping included, for pingTimeout is closed. Pinging only
-// then, rather than on a timer, keeps idle connections from sending PINGs in
-// a regular rhythm that Chrome's don't.
+// answers nothing, its ping included, for pingTimeout is retired, and the
+// CONNECTs waiting on it are abandoned for a new connection; it is closed,
+// with the tunnels it carries, if it stays silent for closeIfSilent more,
+// since a lossy link backing off its retransmissions can be silent that long
+// and recover. Pinging only when a CONNECT has reason to doubt the
+// connection, rather than on a timer, keeps idle connections from sending
+// PINGs in a regular rhythm that Chrome's don't.
 var (
-	pingIfIdle   = 10 * time.Second
-	pingIfSilent = 2 * time.Second
-	pingTimeout  = 5 * time.Second
+	pingIfIdle    = 10 * time.Second
+	pingIfSilent  = 2 * time.Second
+	pingTimeout   = 5 * time.Second
+	closeIfSilent = 15 * time.Second
 )
 
 // transportIDs numbers transports for logs.
@@ -63,6 +68,11 @@ type h2Transport struct {
 	retired atomic.Bool
 	// pinging is set while a health check's ping is outstanding.
 	pinging atomic.Bool
+	// waiting is cancelled, abandoning the CONNECTs waiting for an answer,
+	// when the connection fails a health check; nil in tests that build a
+	// transport by hand.
+	waiting        context.Context
+	abandonWaiting context.CancelFunc
 	// idleSince is when a stream last closed, in Unix nanoseconds, or when
 	// the transport was created if no stream has.
 	idleSince  atomic.Int64
@@ -149,6 +159,7 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int) (*h2Tra
 		id:          transportIDs.Add(1),
 		created:     time.Now(),
 	}
+	t.waiting, t.abandonWaiting = context.WithCancel(context.Background())
 	t.idleSince.Store(time.Now().UnixNano())
 
 	return t, nil
@@ -192,10 +203,15 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	// would send RST_STREAM and disrupt other multiplexed streams.
 	tunnelCtx, tunnelCancel := context.WithCancel(context.Background())
 	stop := context.AfterFunc(ctx, func() { tunnelCancel() })
+	stopAbandon := func() bool { return false }
+	if t.waiting != nil {
+		stopAbandon = context.AfterFunc(t.waiting, func() { tunnelCancel() })
+	}
 
 	req, err := http.NewRequestWithContext(tunnelCtx, http.MethodConnect, "https://"+t.serverAddr, pr)
 	if err != nil {
 		stop()
+		stopAbandon()
 		tunnelCancel()
 		pw.Close()
 		return nil, fmt.Errorf("creating CONNECT request: %w", err)
@@ -217,6 +233,7 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	silentCheck.Stop()
 	if err != nil {
 		stop()
+		stopAbandon()
 		tunnelCancel()
 		pw.Close()
 		now := time.Now()
@@ -237,7 +254,15 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		// each getTransport until a later cleanup tick, producing sustained
 		// error bursts.
 		switch {
-		case t.cc != nil && !t.cc.CanTakeNewRequest():
+		case t.waiting != nil && t.waiting.Err() != nil:
+			// A health check abandoned this CONNECT, and retired the
+			// transport; the caller can have a new connection.
+			if ctx.Err() == nil {
+				err = fmt.Errorf("%w: %v", errConnUnusable, err)
+			}
+		case t.cc != nil && (t.conn.closed.Load() || !t.cc.CanTakeNewRequest()):
+			// x/net still reports a connection that closed before its first
+			// stream as able to take one, so that request can see why.
 			// The connection can't take new streams (a GOAWAY, stream IDs
 			// used up, or closed) but may still carry live tunnels; keep
 			// them. A caller still waiting can have a new connection.
@@ -260,6 +285,7 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	// Detach: stop propagating caller's context cancellation into the
 	// H2 stream now that the tunnel is established.
 	stop()
+	stopAbandon()
 
 	if waited := time.Since(start); waited >= slowConnect {
 		t.log().Info("samizdat CONNECT slow",
@@ -353,23 +379,32 @@ func (t *h2Transport) releaseReserved() {
 	}
 }
 
-// checkAlive pings the connection, unless a ping is already outstanding, and
-// closes it if neither the ping's answer nor anything else arrives within
-// pingTimeout. A connection still reading is alive, if slow to answer.
+// checkAlive pings the connection, unless a ping is already outstanding. If
+// neither the ping's answer nor anything else arrives within pingTimeout, it
+// retires the transport and abandons the CONNECTs waiting on it, and closes
+// the connection if it then stays silent for closeIfSilent. A connection
+// still reading is alive, if slow to answer.
 func (t *h2Transport) checkAlive(why string) {
 	if t.cc == nil || t.pinging.Swap(true) {
 		return
 	}
 	readBefore := t.conn.bytesRead.Load()
+	silent := func() bool { return t.conn.bytesRead.Load() == readBefore && !t.isClosed() }
+	answerWithin, closeAfter := pingTimeout, closeIfSilent
 	go func() {
 		defer t.pinging.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), answerWithin)
 		defer cancel()
 		err := t.cc.Ping(ctx)
-		if err == nil || t.conn.bytesRead.Load() != readBefore || t.isClosed() {
+		if err == nil || !silent() {
 			return
 		}
-		t.closeWithReason(fmt.Sprintf("unanswered ping (%s): %v", why, err))
+		t.retireWithReason(fmt.Sprintf("unanswered ping (%s): %v", why, err))
+		t.abandonWaiting()
+		time.Sleep(closeAfter)
+		if silent() {
+			t.closeWithReason(fmt.Sprintf("silent for %v after an unanswered ping", answerWithin+closeAfter))
+		}
 	}()
 }
 
@@ -377,7 +412,7 @@ func (t *h2Transport) checkAlive(why string) {
 // closes it once the ones it carries, including any still opening, have
 // ended.
 func (t *h2Transport) retireWithReason(reason string) {
-	if !t.retired.Swap(true) {
+	if !t.retired.Swap(true) && !t.isClosed() {
 		t.log().Info("samizdat transport retired", t.logAttrs(reason)...)
 	}
 	if t.streamCount() == 0 {
@@ -440,6 +475,9 @@ func (t *h2Transport) close() error {
 		return nil
 	}
 	t.closed = true
+	if t.abandonWaiting != nil {
+		t.abandonWaiting()
+	}
 
 	if closer, ok := t.h2Roundtrip.(io.Closer); ok {
 		closer.Close()

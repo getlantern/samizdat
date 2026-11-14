@@ -184,3 +184,59 @@ func TestReadingConnectionSurvivesUnansweredPing(t *testing.T) {
 		t.Fatal("a connection that kept reading was closed")
 	}
 }
+
+// TestUnansweredPingSparesTunnelsAWhile: a connection whose ping goes
+// unanswered is retired at once, but the tunnels it carries keep it open
+// until it has been silent for closeIfSilent too.
+func TestUnansweredPingSparesTunnelsAWhile(t *testing.T) {
+	setVar(t, &pingIfSilent, 20*time.Millisecond)
+	setVar(t, &pingTimeout, 20*time.Millisecond)
+	setVar(t, &closeIfSilent, 300*time.Millisecond)
+	setVar(t, &silentConnectRetire, time.Hour)
+	tr, _ := startQuietServer(t, 0)
+	tr.activeStreams.Store(2) // a tunnel, and the CONNECT's slot
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := tr.openReserved(ctx, "example.com:443"); !connFatal(err) {
+		t.Fatalf("CONNECT returned %v, want a conn-fatal error", err)
+	}
+	if !tr.retired.Load() {
+		t.Fatal("transport wasn't retired after its ping went unanswered")
+	}
+	if tr.isClosed() {
+		t.Fatal("transport closed under its tunnel before closeIfSilent")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !tr.isClosed() {
+		if time.Now().After(deadline) {
+			t.Fatal("transport stayed open after closeIfSilent more of silence")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestClosedBeforeFirstStream: a connection that closes before its first
+// CONNECT gets a stream fails that CONNECT in a way DialContext redials, and
+// leaves the transport unused, rather than failing every later CONNECT too.
+func TestClosedBeforeFirstStream(t *testing.T) {
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() { c1.Close() })
+	go io.Copy(io.Discard, c2)
+	tr, err := newH2Transport(c1, "example.com:443", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	http2.NewFramer(c2, nil).WriteSettings()
+	c2.Close()
+	for !tr.conn.closed.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	tr.activeStreams.Store(1)
+	if _, err := tr.openReserved(context.Background(), "example.com:443"); !connFatal(err) {
+		t.Fatalf("CONNECT returned %v, want a conn-fatal error", err)
+	}
+	if !tr.isClosed() {
+		t.Fatal("a transport whose connection closed is still open")
+	}
+}
