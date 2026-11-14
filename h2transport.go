@@ -203,7 +203,7 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	// would send RST_STREAM and disrupt other multiplexed streams.
 	tunnelCtx, tunnelCancel := context.WithCancel(context.Background())
 	stop := context.AfterFunc(ctx, func() { tunnelCancel() })
-	stopAbandon := func() bool { return false }
+	stopAbandon := func() bool { return true }
 	if t.waiting != nil {
 		stopAbandon = context.AfterFunc(t.waiting, func() { tunnelCancel() })
 	}
@@ -283,9 +283,16 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	}
 
 	// Detach: stop propagating caller's context cancellation into the
-	// H2 stream now that the tunnel is established.
-	stop()
-	stopAbandon()
+	// H2 stream now that the tunnel is established. If either already
+	// cancelled it, the stream is being reset, and is no tunnel.
+	if callerLive, waiting := stop(), stopAbandon(); !callerLive || !waiting {
+		resp.Body.Close()
+		pw.Close()
+		if callerLive {
+			return nil, fmt.Errorf("CONNECT to %s: %w", destination, errConnUnusable)
+		}
+		return nil, fmt.Errorf("CONNECT to %s: %w", destination, ctx.Err())
+	}
 
 	if waited := time.Since(start); waited >= slowConnect {
 		t.log().Info("samizdat CONNECT slow",
