@@ -180,3 +180,25 @@ func TestTransportSetupBoundedByConnectTimeout(t *testing.T) {
 		t.Fatalf("setup took %v, want about ConnectTimeout", took)
 	}
 }
+
+// TestPoolCloseEndsDial: closing the pool cancels a creation in progress
+// rather than leaving it to handshake with the server after the client is
+// gone.
+func TestPoolCloseEndsDial(t *testing.T) {
+	ended := make(chan struct{})
+	started := make(chan struct{})
+	pool := newConnPool(100, time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		close(started)
+		<-ctx.Done()
+		close(ended)
+		return nil, ctx.Err()
+	})
+	go pool.getTransport(context.Background())
+	<-started
+	pool.close()
+	select {
+	case <-ended:
+	case <-time.After(time.Second):
+		t.Fatal("the dial went on after the pool closed")
+	}
+}

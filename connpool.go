@@ -95,6 +95,16 @@ type dialAttempt struct {
 
 // dial creates a transport for a and adds it to the pool.
 func (p *connPool) dial(ctx context.Context, a *dialAttempt) {
+	// Closing the pool ends the dial: nothing will use what it makes.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-p.closeCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	var t *h2Transport
 	defer func() {
 		if r := recover(); r != nil {
