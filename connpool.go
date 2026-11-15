@@ -66,6 +66,8 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 		p.mu.Unlock()
 		select {
 		case <-dialing:
+		case <-p.closeCh:
+			return nil, context.Canceled
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -76,11 +78,9 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 	p.mu.Unlock()
 
 	// Create a new transport
-	t, err := p.createFunc(ctx)
+	t, err := p.create(ctx, dialing)
 
 	p.mu.Lock()
-	p.dialing = nil
-	close(dialing)
 	if err != nil {
 		p.mu.Unlock()
 		return nil, err
@@ -96,6 +96,18 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 	p.mu.Unlock()
 
 	return t, nil
+}
+
+// create runs createFunc, and lets the callers waiting on dialing look again
+// once it's done, however it ends.
+func (p *connPool) create(ctx context.Context, dialing chan struct{}) (*h2Transport, error) {
+	defer func() {
+		p.mu.Lock()
+		p.dialing = nil
+		close(dialing)
+		p.mu.Unlock()
+	}()
+	return p.createFunc(ctx)
 }
 
 // cleanupLoop periodically removes closed and idle transports.

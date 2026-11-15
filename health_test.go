@@ -538,3 +538,75 @@ func TestPoolCreatesOneTransportAtATime(t *testing.T) {
 		t.Fatalf("20 CONNECTs at once created %d transports, want 1", n)
 	}
 }
+
+// TestPoolFailedCreateHandsOff: when the transport being created fails, a
+// CONNECT that was waiting for it creates the next one itself.
+func TestPoolFailedCreateHandsOff(t *testing.T) {
+	var creates atomic.Int32
+	first := make(chan struct{})
+	pool := newConnPool(100, time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		if creates.Add(1) == 1 {
+			<-first
+			return nil, errors.New("dial failed")
+		}
+		return newTestTransport(okRoundTripper()), nil
+	})
+	defer pool.close()
+
+	failed := make(chan error, 1)
+	go func() {
+		_, err := pool.getTransport(context.Background())
+		failed <- err
+	}()
+	for creates.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	waited := make(chan error, 1)
+	go func() {
+		_, err := pool.getTransport(context.Background())
+		waited <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	close(first)
+	if err := <-failed; err == nil {
+		t.Fatal("the failed create reported no error")
+	}
+	if err := <-waited; err != nil {
+		t.Fatalf("the waiting CONNECT got %v, want a transport of its own", err)
+	}
+	if n := creates.Load(); n != 2 {
+		t.Fatalf("%d creates, want 2", n)
+	}
+}
+
+// TestPoolCloseWakesWaiters: closing the pool releases CONNECTs waiting for a
+// transport being created, without waiting for that create to end.
+func TestPoolCloseWakesWaiters(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	var creates atomic.Int32
+	pool := newConnPool(100, time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		creates.Add(1)
+		<-release
+		return nil, errors.New("closed")
+	})
+	go pool.getTransport(context.Background())
+	for creates.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	waited := make(chan error, 1)
+	go func() {
+		_, err := pool.getTransport(context.Background())
+		waited <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	pool.close()
+	select {
+	case err := <-waited:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiter got %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("closing the pool left a waiter blocked")
+	}
+}
