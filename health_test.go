@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -292,5 +294,151 @@ func TestUnencodableDestinationNotLogged(t *testing.T) {
 	}
 	if tr.retired.Load() || tr.isClosed() {
 		t.Fatal("a bad destination retired the transport")
+	}
+}
+
+// fakeH2Server is the server end of a transport's connection: it sends
+// SETTINGS and reads the client's frames, refusing each request if refuse is
+// set, sending a PING every pingEvery if set, and counting the client's
+// PINGs, which it never answers.
+type fakeH2Server struct {
+	pings atomic.Int32
+}
+
+func startFakeH2Server(t *testing.T, refuse bool, pingEvery time.Duration) (*h2Transport, *fakeH2Server, *bytes.Buffer) {
+	t.Helper()
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() { c1.Close(); c2.Close() })
+	srv := &fakeH2Server{}
+	var wmu sync.Mutex
+	fr := http2.NewFramer(c2, c2)
+	go func() {
+		preface := make([]byte, len(http2.ClientPreface))
+		if _, err := io.ReadFull(c2, preface); err != nil {
+			return
+		}
+		// The client reads only once its own preface is written.
+		go func() {
+			wmu.Lock()
+			fr.WriteSettings()
+			wmu.Unlock()
+		}()
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.PingFrame:
+				if !f.IsAck() {
+					srv.pings.Add(1)
+				}
+			case *http2.HeadersFrame:
+				if refuse {
+					// Not from this goroutine: the client may be blocked
+					// writing to it.
+					go func(id uint32) {
+						wmu.Lock()
+						fr.WriteRSTStream(id, http2.ErrCodeRefusedStream)
+						wmu.Unlock()
+					}(f.StreamID)
+				}
+			}
+		}
+	}()
+	if pingEvery > 0 {
+		go func() {
+			for {
+				time.Sleep(pingEvery)
+				wmu.Lock()
+				err := fr.WritePing(false, [8]byte{})
+				wmu.Unlock()
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+	tr, err := newH2Transport(c1, "example.com:443", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	tr.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	return tr, srv, &logs
+}
+
+// TestStalledConnectOnLiveConnection: a CONNECT unanswered for connectStall
+// on a connection that keeps reading, as one whose server takes no new
+// streams does, is abandoned in time for its caller to redial, and the
+// transport is retired while the tunnels it carries go on.
+func TestStalledConnectOnLiveConnection(t *testing.T) {
+	setVar(t, &connectStall, 100*time.Millisecond)
+	setVar(t, &pingTimeout, 50*time.Millisecond)
+	tr, _, logs := startFakeH2Server(t, false, 10*time.Millisecond)
+	tr.activeStreams.Store(2) // a tunnel, and the CONNECT's slot
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := tr.openReserved(ctx, "example.com:443"); !connFatal(err) {
+		t.Fatalf("CONNECT returned %v, want a conn-fatal error", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("CONNECT waited out its caller's deadline")
+	}
+	if !tr.retired.Load() || tr.isClosed() {
+		t.Fatalf("retired=%v closed=%v, want a retired transport still carrying its tunnel", tr.retired.Load(), tr.isClosed())
+	}
+	if !strings.Contains(logs.String(), "CONNECT unanswered") {
+		t.Errorf("logs lack the retire reason:\n%s", logs)
+	}
+}
+
+// TestRefusedStreamRedials: a server refusing a stream retires the transport
+// and fails the CONNECT in a way DialContext redials.
+func TestRefusedStreamRedials(t *testing.T) {
+	tr, _, _ := startFakeH2Server(t, true, 0)
+	tr.activeStreams.Store(1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := tr.openReserved(ctx, "example.com:443"); !connFatal(err) {
+		t.Fatalf("CONNECT returned %v, want a conn-fatal error", err)
+	}
+	if !tr.retired.Load() {
+		t.Fatal("a transport whose server refused a stream wasn't retired")
+	}
+}
+
+// TestSlowConnectPingsLiveConnection: a CONNECT unanswered for pingIfSilent
+// pings its connection even though it keeps reading, since the answer frees
+// the slots x/net holds for cancelled streams.
+func TestSlowConnectPingsLiveConnection(t *testing.T) {
+	setVar(t, &pingIfSilent, 50*time.Millisecond)
+	setVar(t, &pingTimeout, 50*time.Millisecond)
+	tr, srv, _ := startFakeH2Server(t, false, 10*time.Millisecond)
+	tr.activeStreams.Store(1)
+
+	// Count PINGs while the CONNECT still waits: x/net sends one of its own
+	// with the RST_STREAM once the CONNECT is cancelled.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tr.openReserved(ctx, "example.com:443")
+	}()
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for srv.pings.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	pinged := srv.pings.Load() > 0
+	time.Sleep(100 * time.Millisecond) // let the unanswered ping time out
+	cancel()
+	<-done
+	if !pinged {
+		t.Fatal("a slow CONNECT on a connection still reading sent no PING")
+	}
+	if tr.retired.Load() || tr.isClosed() {
+		t.Fatal("a connection still reading was retired over its unanswered ping")
 	}
 }

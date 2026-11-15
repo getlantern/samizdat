@@ -46,6 +46,15 @@ var (
 	closeIfSilent = 15 * time.Second
 )
 
+// connectStall is how long a CONNECT can wait for its response before it is
+// abandoned for a new connection, and its own retired. Both servers answer a
+// CONNECT before dialing its destination, so a wait this long means the
+// connection takes no new streams in practice, alive or not: a server that
+// thinks it's full, or x/net counting cancelled streams against the server's
+// limit until a PING is answered, leaves the tunnels already open flowing
+// while every new CONNECT waits out its caller.
+var connectStall = 5 * time.Second
+
 // transportIDs numbers transports for logs.
 var transportIDs atomic.Uint64
 
@@ -236,7 +245,13 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		t.checkAlive(fmt.Sprintf("reused after %v without a read", since.Round(time.Second)))
 	}
 	silentCheck := t.watchSilence()
+	var stalled atomic.Bool
+	stall := time.AfterFunc(connectStall, func() {
+		stalled.Store(true)
+		tunnelCancel()
+	})
 	resp, err := t.h2Roundtrip.RoundTrip(req)
+	stallArmed := stall.Stop()
 	silentCheck()
 	if err != nil {
 		stop()
@@ -261,6 +276,14 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		// each getTransport until a later cleanup tick, producing sustained
 		// error bursts.
 		switch {
+		case stalled.Load() && ctx.Err() == nil:
+			t.retireWithReason("CONNECT unanswered for " + connectStall.String())
+			err = fmt.Errorf("%w: %v", errConnUnusable, err)
+		case isRefusedStream(err):
+			// The server takes no more streams on this connection; a new
+			// one can carry the CONNECT.
+			t.retireWithReason("server refused a stream")
+			err = fmt.Errorf("%w: %v", errConnUnusable, err)
 		case t.waiting != nil && t.waiting.Err() != nil:
 			// A health check abandoned this CONNECT, and retired the
 			// transport; the caller can have a new connection.
@@ -295,7 +318,7 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	// Detach: stop propagating caller's context cancellation into the
 	// H2 stream now that the tunnel is established. If either already
 	// cancelled it, the stream is being reset, and is no tunnel.
-	if callerLive, waiting := stop(), stopAbandon(); !callerLive || !waiting {
+	if callerLive, waiting := stop(), stopAbandon(); !callerLive || !waiting || !stallArmed {
 		resp.Body.Close()
 		pw.Close()
 		if callerLive {
@@ -354,13 +377,16 @@ func connFatal(err error) bool {
 		errors.Is(err, syscall.EPIPE)
 }
 
-// watchSilence checks the connection's health once it has read nothing for
-// pingIfSilent, and again whenever it falls silent that long, until the
-// returned stop is called. A read only postpones the check: a connection
-// that answers once and then dies must still be caught.
+// watchSilence checks the connection's health once the CONNECT has waited
+// pingIfSilent, and again whenever the connection falls silent that long,
+// until the returned stop is called. A read only postpones the later checks:
+// a connection that answers once and then dies must still be caught. The
+// first check pings even a connection still reading, since its answer also
+// frees the stream slots x/net holds for cancelled streams until a PING is
+// answered.
 func (t *h2Transport) watchSilence() (stop func()) {
 	var mu sync.Mutex
-	stopped := false
+	stopped, first := false, true
 	var timer *time.Timer
 	after := pingIfSilent
 	check := func() {
@@ -369,10 +395,11 @@ func (t *h2Transport) watchSilence() (stop func()) {
 		if stopped {
 			return
 		}
-		if since := t.sinceRead(time.Now()); since < after {
+		if since := t.sinceRead(time.Now()); since < after && !first {
 			timer.Reset(after - since)
 			return
 		}
+		first = false
 		t.checkAlive("CONNECT unanswered for " + after.String())
 		timer.Reset(after)
 	}
@@ -385,6 +412,12 @@ func (t *h2Transport) watchSilence() (stop func()) {
 		stopped = true
 		timer.Stop()
 	}
+}
+
+// isRefusedStream reports whether err is the server refusing a stream.
+func isRefusedStream(err error) bool {
+	var se http2.StreamError
+	return errors.As(err, &se) && se.Code == http2.ErrCodeRefusedStream
 }
 
 // silentConnectRetire is how long a failed CONNECT must have waited, and its
