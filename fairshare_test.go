@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 // TestLeanStreamShareCapped: a stream can queue no more than its share of
@@ -353,5 +354,125 @@ func TestLeanIdleDownloadWaitsAsSmall(t *testing.T) {
 	c.wakeRoomLocked(false)
 	if w.waitingRoom {
 		t.Fatalf("an idle former download wanting %d with room %d is still waiting", w.wantRoom, w.roomLocked())
+	}
+}
+
+// TestLeanHeadersBoundedByWbuf: HEADERS wait while the frames ahead of the
+// streams' data fill wbuf, so a client that never reads can't make them pile
+// up, and go out once the writer takes it.
+func TestLeanHeadersBoundedByWbuf(t *testing.T) {
+	c := newTestLeanConn()
+	c.hpackBuf = new(bytes.Buffer)
+	c.hpackEnc = hpack.NewEncoder(c.hpackBuf)
+	st := newTestLeanStream(c, 1)
+	c.wbuf = make([]byte, leanMaxWriteBuffer)
+	done := make(chan error, 1)
+	go func() { done <- st.writeHeaders(200, nil, false) }()
+	for {
+		c.mu.Lock()
+		n := len(c.hdrWaiters)
+		c.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-done:
+		t.Fatal("HEADERS queued into a full wbuf")
+	default:
+	}
+	// What the writer does when it takes wbuf.
+	c.mu.Lock()
+	c.wbuf = c.wbuf[:0]
+	for _, w := range c.hdrWaiters {
+		w.roomCond.Broadcast()
+	}
+	c.hdrWaiters = c.hdrWaiters[:0]
+	c.mu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HEADERS stayed waiting after wbuf was taken")
+	}
+}
+
+// TestLeanFlushedDataStillTakesRoom: data flushed into wbuf ahead of a
+// SETTINGS acknowledgement still counts against the write buffer.
+func TestLeanFlushedDataStillTakesRoom(t *testing.T) {
+	c := newTestLeanConn()
+	a, b, other := newTestLeanStream(c, 1), newTestLeanStream(c, 3), newTestLeanStream(c, 5)
+	for _, st := range []*leanStream{a, b} {
+		for st.roomLocked() > 0 {
+			st.queueDataLocked(0, make([]byte, min(st.roomLocked(), 16<<10)))
+		}
+	}
+	c.flushDataLocked()
+	if c.dataQueued != 0 || len(c.wbuf) < leanMaxWriteBuffer/2 {
+		t.Fatalf("flush left %d queued, %d in wbuf", c.dataQueued, len(c.wbuf))
+	}
+	if room, want := other.roomLocked(), leanMaxWriteBuffer-len(c.wbuf)-leanFrameHeaderLen; room > want {
+		t.Fatalf("room %d with %d flushed into wbuf; want at most %d", room, len(c.wbuf), want)
+	}
+}
+
+// TestLeanClientResetDropsFinishedStream: a client reset of a stream that
+// finished with frames still queued drops them, and a dropped stream leaves
+// the writer's line.
+func TestLeanClientResetDropsFinishedStream(t *testing.T) {
+	c := newTestLeanConn()
+	c.lastStreamID = 1
+	st := newTestLeanStream(c, 1)
+	st.queueDataLocked(http2.FlagDataEndStream, make([]byte, 1000))
+	st.markResetLocked()
+	st.removed = true
+	delete(c.streams, 1)
+	c.closedOut = map[uint32]*leanStream{1: st}
+	f, err := http2.NewFramer(nil, bytes.NewReader(appendRSTStream(nil, 1, http2.ErrCodeCancel))).ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.handleFrame(f); err != nil {
+		t.Fatal(err)
+	}
+	if st.outLen() != 0 || c.dataQueued != 0 {
+		t.Fatalf("a finished stream's frames survived the client's reset: %d queued", c.dataQueued)
+	}
+	if len(c.sched) != 0 {
+		t.Fatal("the dropped stream stayed in the writer's line")
+	}
+}
+
+// TestLeanSettingsSmallerWindowFlushes: data queued under a larger initial
+// window goes out ahead of the acknowledgement of a smaller one.
+func TestLeanSettingsSmallerWindowFlushes(t *testing.T) {
+	c := newTestLeanConn()
+	st := newTestLeanStream(c, 1)
+	c.peerInitWin = 1 << 20
+	c.peerMaxFrame = 16384
+	st.queueDataLocked(0, []byte("old"))
+	f, err := http2.NewFramer(nil, bytes.NewReader(appendSettings(nil, []http2.Setting{{ID: http2.SettingInitialWindowSize, Val: 0}}))).ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.handleSettings(f.(*http2.SettingsFrame)); err != nil {
+		t.Fatal(err)
+	}
+	if c.dataQueued != 0 {
+		t.Fatal("data queued under a larger window stayed behind the acknowledgement of a smaller one")
+	}
+}
+
+// TestLeanStreamBufHeldSchedulesTrim: a stream's queue buffer growing past
+// leanIdleStreamBufKeep makes an idle connection trim.
+func TestLeanStreamBufHeldSchedulesTrim(t *testing.T) {
+	c := newTestLeanConn()
+	st := newTestLeanStream(c, 1)
+	st.queueDataLocked(0, make([]byte, 2*leanIdleStreamBufKeep))
+	if !c.streamBufHeld {
+		t.Fatal("a stream's large queue buffer didn't mark the connection for trimming")
 	}
 }

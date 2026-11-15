@@ -162,8 +162,10 @@ type ServerConfig struct {
 	// default). A tunnel's response goes out behind whatever the server has
 	// handed the kernel for the connection, so on a slow link a download
 	// left seconds of data there, ahead of every new tunnel; kept in the
-	// server instead, its queue lets each tunnel take its turn. It applies
-	// on Linux and macOS (TCP_NOTSENT_LOWAT).
+	// server instead, its queue lets each tunnel take its turn. It's set as
+	// TCP_NOTSENT_LOWAT on Linux and macOS, but only Linux stops writes at
+	// the bound: macOS applies it to readiness alone, so there the kernel
+	// can still hold a send buffer's worth.
 	NotSentLowat int
 
 	// ReplayWindow is how long the server remembers an authenticated
