@@ -302,3 +302,32 @@ func TestLeanDownloadClassResets(t *testing.T) {
 		t.Fatalf("queuedTotal %d after the stream sat idle, want it reset", st.queuedTotal)
 	}
 }
+
+// TestLeanSmallWritersAllWoken: every stream waiting to write a little is
+// woken once it fits, not one per write the writer makes, so a new tunnel's
+// response isn't left behind a line of trickling streams.
+func TestLeanSmallWritersAllWoken(t *testing.T) {
+	c := newTestLeanConn()
+	bulk := newTestLeanStream(c, 1)
+	other := newTestLeanStream(c, 3)
+	for _, st := range []*leanStream{bulk, other} {
+		for st.roomLocked() > 0 {
+			st.queueDataLocked(0, make([]byte, min(st.roomLocked(), 16<<10)))
+		}
+	}
+	var small []*leanStream
+	for i := range 20 {
+		st := newTestLeanStream(c, uint32(5+2*i))
+		st.wantRoom = 100 + leanFrameHeaderLen
+		st.waitingRoom = true
+		c.roomWaiters = append(c.roomWaiters, st)
+		small = append(small, st)
+	}
+	c.takeDataLocked()
+	c.wakeRoomLocked(false)
+	for _, st := range small {
+		if st.waitingRoom {
+			t.Fatalf("stream %d, wanting %d with room %d, is still waiting", st.id, st.wantRoom, st.roomLocked())
+		}
+	}
+}

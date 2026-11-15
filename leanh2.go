@@ -1081,9 +1081,9 @@ func (c *leanConn) takeDataLocked() []byte {
 }
 
 // wakeRoomLocked wakes the streams waiting for room that now have what they
-// need (see leanWakeRoom): those the writer just took frames from, whose
-// share it freed, and the first waiting on the buffer as a whole, in the
-// order they began waiting.
+// need (see leanWakeRoom): every one with a little to write, those the
+// writer just took frames from, whose share it freed, and the first download
+// waiting on the buffer as a whole, in the order they began waiting.
 // all wakes every one, when room was freed other than by the writer, or the
 // queue has drained. Waking only these keeps a busy connection from waking
 // every waiting stream on every write. c.mu must be held.
@@ -1102,9 +1102,10 @@ func (c *leanConn) wakeRoomLocked(all bool) {
 		if st.outLen() >= leanWriteChunk || st.queuedTotal >= leanBulk {
 			need = leanWakeRoom
 		}
+		bulk := need == leanWakeRoom
 		mine := room >= need && slices.Contains(c.tookFrom, st)
-		if all || mine || !woken && room >= need {
-			if !mine {
+		if all || mine || room >= need && (!bulk || !woken) {
+			if !mine && bulk {
 				woken = true
 			}
 			st.waitingRoom = false
