@@ -16,6 +16,12 @@ type connPool struct {
 	createFunc  func(ctx context.Context) (*h2Transport, error)
 	closed      bool
 	closeCh     chan struct{}
+	// dialing is closed when the transport being created, if any, is ready
+	// or has failed. One is created at a time: when many CONNECTs find no
+	// capacity at once, as they do when a connection stalls under all of
+	// them, a burst of TLS handshakes to one server is conspicuous, and the
+	// first new connection can usually carry them all.
+	dialing chan struct{}
 }
 
 // newConnPool creates a connection pool that creates new transports via createFunc.
@@ -38,29 +44,47 @@ func newConnPool(maxStreams int, idleTimeout time.Duration, createFunc func(ctx 
 // must open a tunnel on it with openReserved.
 func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 	p.mu.Lock()
-
-	if p.closed {
-		p.mu.Unlock()
-		return nil, context.Canceled
-	}
-
-	// Find an existing transport with capacity
-	for _, t := range p.transports {
-		if !t.isClosed() && t.tryReserve() {
+	for {
+		if p.closed {
 			p.mu.Unlock()
-			return t, nil
+			return nil, context.Canceled
 		}
-	}
 
+		// Find an existing transport with capacity
+		for _, t := range p.transports {
+			if !t.isClosed() && t.tryReserve() {
+				p.mu.Unlock()
+				return t, nil
+			}
+		}
+
+		if p.dialing == nil {
+			break
+		}
+		// Wait for the transport being created, and look again.
+		dialing := p.dialing
+		p.mu.Unlock()
+		select {
+		case <-dialing:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		p.mu.Lock()
+	}
+	dialing := make(chan struct{})
+	p.dialing = dialing
 	p.mu.Unlock()
 
 	// Create a new transport
 	t, err := p.createFunc(ctx)
-	if err != nil {
-		return nil, err
-	}
 
 	p.mu.Lock()
+	p.dialing = nil
+	close(dialing)
+	if err != nil {
+		p.mu.Unlock()
+		return nil, err
+	}
 	if p.closed {
 		// Closed while this one was dialing: close would never reach it.
 		p.mu.Unlock()

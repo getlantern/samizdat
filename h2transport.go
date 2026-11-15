@@ -276,9 +276,11 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		// each getTransport until a later cleanup tick, producing sustained
 		// error bursts.
 		switch {
-		case stalled.Load() && ctx.Err() == nil:
+		case stalled.Load():
 			t.retireWithReason("CONNECT unanswered for " + connectStall.String())
-			err = fmt.Errorf("%w: %v", errConnUnusable, err)
+			if ctx.Err() == nil {
+				err = fmt.Errorf("%w: %v", errConnUnusable, err)
+			}
 		case isRefusedStream(err):
 			// The server takes no more streams on this connection; a new
 			// one can carry the CONNECT.

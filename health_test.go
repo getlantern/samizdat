@@ -297,31 +297,57 @@ func TestUnencodableDestinationNotLogged(t *testing.T) {
 	}
 }
 
-// fakeH2Server is the server end of a transport's connection: it sends
-// SETTINGS and reads the client's frames, refusing each request if refuse is
-// set, sending a PING every pingEvery if set, and counting the client's
-// PINGs, which it never answers.
+// fakeH2Server is the server end of a transport's connection. It sends
+// SETTINGS and reads the client's frames, counting the client's PINGs, and
+// never answers a request.
 type fakeH2Server struct {
 	pings atomic.Int32
+	// headers receives the ID of each request's HEADERS, if anything is
+	// waiting for it.
+	headers chan uint32
 }
 
-func startFakeH2Server(t *testing.T, refuse bool, pingEvery time.Duration) (*h2Transport, *fakeH2Server, *bytes.Buffer) {
+type fakeH2Options struct {
+	refuse     bool          // refuse every request
+	pingEvery  time.Duration // send a PING this often, if set
+	maxStreams uint32        // advertise this MaxConcurrentStreams, if set
+	ackPings   *atomic.Bool  // answer the client's PINGs while it's true
+}
+
+func startFakeH2Server(t *testing.T, o fakeH2Options) (*h2Transport, *fakeH2Server, *bytes.Buffer) {
 	t.Helper()
 	c1, c2 := net.Pipe()
 	t.Cleanup(func() { c1.Close(); c2.Close() })
-	srv := &fakeH2Server{}
+	srv := &fakeH2Server{headers: make(chan uint32, 16)}
 	var wmu sync.Mutex
 	fr := http2.NewFramer(c2, c2)
+	// Writes go in goroutines of their own: the client may be blocked
+	// writing to the one reading its frames.
+	write := func(f func() error) error {
+		wmu.Lock()
+		defer wmu.Unlock()
+		return f()
+	}
 	go func() {
 		preface := make([]byte, len(http2.ClientPreface))
 		if _, err := io.ReadFull(c2, preface); err != nil {
 			return
 		}
-		// The client reads only once its own preface is written.
 		go func() {
-			wmu.Lock()
-			fr.WriteSettings()
-			wmu.Unlock()
+			var settings []http2.Setting
+			if o.maxStreams > 0 {
+				settings = append(settings, http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: o.maxStreams})
+			}
+			if write(func() error { return fr.WriteSettings(settings...) }) != nil || o.pingEvery == 0 {
+				return
+			}
+			// PINGs only after SETTINGS, which must come first.
+			for {
+				time.Sleep(o.pingEvery)
+				if write(func() error { return fr.WritePing(false, [8]byte{}) }) != nil {
+					return
+				}
+			}
 		}()
 		for {
 			f, err := fr.ReadFrame()
@@ -332,33 +358,23 @@ func startFakeH2Server(t *testing.T, refuse bool, pingEvery time.Duration) (*h2T
 			case *http2.PingFrame:
 				if !f.IsAck() {
 					srv.pings.Add(1)
+					if o.ackPings != nil && o.ackPings.Load() {
+						data := f.Data
+						go write(func() error { return fr.WritePing(true, data) })
+					}
 				}
 			case *http2.HeadersFrame:
-				if refuse {
-					// Not from this goroutine: the client may be blocked
-					// writing to it.
-					go func(id uint32) {
-						wmu.Lock()
-						fr.WriteRSTStream(id, http2.ErrCodeRefusedStream)
-						wmu.Unlock()
-					}(f.StreamID)
+				select {
+				case srv.headers <- f.StreamID:
+				default:
+				}
+				if o.refuse {
+					id := f.StreamID
+					go write(func() error { return fr.WriteRSTStream(id, http2.ErrCodeRefusedStream) })
 				}
 			}
 		}
 	}()
-	if pingEvery > 0 {
-		go func() {
-			for {
-				time.Sleep(pingEvery)
-				wmu.Lock()
-				err := fr.WritePing(false, [8]byte{})
-				wmu.Unlock()
-				if err != nil {
-					return
-				}
-			}
-		}()
-	}
 	tr, err := newH2Transport(c1, "example.com:443", 10)
 	if err != nil {
 		t.Fatal(err)
@@ -375,7 +391,7 @@ func startFakeH2Server(t *testing.T, refuse bool, pingEvery time.Duration) (*h2T
 func TestStalledConnectOnLiveConnection(t *testing.T) {
 	setVar(t, &connectStall, 100*time.Millisecond)
 	setVar(t, &pingTimeout, 50*time.Millisecond)
-	tr, _, logs := startFakeH2Server(t, false, 10*time.Millisecond)
+	tr, _, logs := startFakeH2Server(t, fakeH2Options{pingEvery: 10 * time.Millisecond})
 	tr.activeStreams.Store(2) // a tunnel, and the CONNECT's slot
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -397,7 +413,7 @@ func TestStalledConnectOnLiveConnection(t *testing.T) {
 // TestRefusedStreamRedials: a server refusing a stream retires the transport
 // and fails the CONNECT in a way DialContext redials.
 func TestRefusedStreamRedials(t *testing.T) {
-	tr, _, _ := startFakeH2Server(t, true, 0)
+	tr, _, _ := startFakeH2Server(t, fakeH2Options{refuse: true})
 	tr.activeStreams.Store(1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -416,7 +432,7 @@ func TestRefusedStreamRedials(t *testing.T) {
 func TestSlowConnectPingsLiveConnection(t *testing.T) {
 	setVar(t, &pingIfSilent, 50*time.Millisecond)
 	setVar(t, &pingTimeout, 50*time.Millisecond)
-	tr, srv, _ := startFakeH2Server(t, false, 10*time.Millisecond)
+	tr, srv, _ := startFakeH2Server(t, fakeH2Options{pingEvery: 10 * time.Millisecond})
 	tr.activeStreams.Store(1)
 
 	// Count PINGs while the CONNECT still waits: x/net sends one of its own
@@ -440,5 +456,85 @@ func TestSlowConnectPingsLiveConnection(t *testing.T) {
 	}
 	if tr.retired.Load() || tr.isClosed() {
 		t.Fatal("a connection still reading was retired over its unanswered ping")
+	}
+}
+
+// TestPingFreesResetSlots: x/net counts the streams it cancels against the
+// server's MaxConcurrentStreams until a PING is answered, so a server that
+// leaves x/net's own PING unanswered can leave every new CONNECT waiting for
+// a slot while the connection still reads. The ping a slow CONNECT sends
+// frees those slots once it's answered, and the CONNECT goes out.
+func TestPingFreesResetSlots(t *testing.T) {
+	setVar(t, &pingIfSilent, 100*time.Millisecond)
+	setVar(t, &pingIfIdle, time.Hour)
+	setVar(t, &pingTimeout, time.Second)
+	setVar(t, &connectStall, time.Hour)
+	setVar(t, &silentConnectRetire, time.Hour)
+	var ack atomic.Bool
+	tr, srv, _ := startFakeH2Server(t, fakeH2Options{maxStreams: 2, pingEvery: 10 * time.Millisecond, ackPings: &ack})
+	tr.activeStreams.Store(10)
+	time.Sleep(50 * time.Millisecond) // for the client to take the SETTINGS
+
+	// Fill both slots with CONNECTs cancelled after their HEADERS went out.
+	var wg sync.WaitGroup
+	for range 2 {
+		ctx, cancel := context.WithCancel(context.Background())
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tr.openReserved(ctx, "example.com:443")
+		}()
+		select {
+		case <-srv.headers:
+		case <-time.After(2 * time.Second):
+			t.Fatal("CONNECT never sent its HEADERS")
+		}
+		cancel()
+	}
+	wg.Wait()
+
+	ack.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tr.openReserved(ctx, "example.com:443")
+	}()
+	defer func() { cancel(); <-done }()
+	select {
+	case <-srv.headers:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a CONNECT waiting on slots held for cancelled streams never went out")
+	}
+}
+
+// TestPoolCreatesOneTransportAtATime: CONNECTs that find no capacity at once,
+// as they do when a connection stalls under all of them, share the one
+// transport being created rather than each dialing its own.
+func TestPoolCreatesOneTransportAtATime(t *testing.T) {
+	var creates atomic.Int32
+	release := make(chan struct{})
+	pool := newConnPool(100, time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		creates.Add(1)
+		<-release
+		return newTestTransport(okRoundTripper()), nil
+	})
+	defer pool.close()
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := pool.getTransport(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	if n := creates.Load(); n != 1 {
+		t.Fatalf("20 CONNECTs at once created %d transports, want 1", n)
 	}
 }
