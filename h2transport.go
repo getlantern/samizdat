@@ -22,6 +22,10 @@ import (
 // up, or once closed. A new connection can carry it.
 var errConnUnusable = errors.New("samizdat: connection takes no new streams")
 
+// errClientConnNotEstablished is the text of the error, unexported by x/net,
+// that a first CONNECT on a connection already closed returns.
+const errClientConnNotEstablished = "http2: client conn could not be established"
+
 // Health checks. A connection that goes silent, such as one whose NAT mapping
 // a router dropped, gives no sign of it: writes still succeed, and every
 // CONNECT on it waits until its caller gives up. So a CONNECT pings its
@@ -263,13 +267,15 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 			if ctx.Err() == nil {
 				err = fmt.Errorf("%w: %v", errConnUnusable, err)
 			}
-		case t.cc != nil && (t.conn.closed.Load() || t.cc.State().Closed || !t.cc.CanTakeNewRequest()):
+		case t.cc != nil && (t.conn.closed.Load() || err.Error() == errClientConnNotEstablished || !t.cc.CanTakeNewRequest()):
 			// The connection can't take new streams (a GOAWAY, stream IDs
 			// used up, or closed) but may still carry live tunnels; keep
 			// them. A caller still waiting can have a new connection. x/net
 			// reports a connection that closed before its first stream as
 			// able to take one, so that request can see why, hence the
-			// closed checks.
+			// closed checks. (ClientConn.State would say so, but it waits
+			// for any write in progress, which on a dead connection may
+			// never finish.)
 			t.retireWithReason("connection takes no new streams")
 			if ctx.Err() == nil {
 				err = fmt.Errorf("%w: %v", errConnUnusable, err)
