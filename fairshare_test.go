@@ -525,3 +525,52 @@ func TestLeanFinishedStreamOneRST(t *testing.T) {
 		t.Fatalf("queue grew from %d to %d bytes with repeated resets", n, st.outLen())
 	}
 }
+
+// TestLeanLargeWriteWaitsForAChunk: a Write the client's large frames would
+// let queue at once waits only for room for what it can queue at a time, so
+// smaller writes don't keep taking the room it's waiting for.
+func TestLeanLargeWriteWaitsForAChunk(t *testing.T) {
+	c := newTestLeanConn()
+	c.peerMaxFrame = 1 << 20
+	a, b, w := newTestLeanStream(c, 1), newTestLeanStream(c, 3), newTestLeanStream(c, 5)
+	for _, st := range []*leanStream{a, b} {
+		for st.roomLocked() > 0 {
+			st.queueDataLocked(0, make([]byte, min(st.roomLocked(), 16<<10)))
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		(&leanStreamConn{st: w}).Write(make([]byte, 1<<20))
+	}()
+	for {
+		c.mu.Lock()
+		waiting, want := w.waitingRoom, w.wantRoom
+		c.mu.Unlock()
+		if waiting {
+			if limit := leanWriteChunk + leanFrameHeaderLen; want > limit {
+				t.Errorf("a Write waits for %d bytes of room, more than the %d it can queue at once", want, limit)
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.mu.Lock()
+	c.closed = true
+	w.wakeLocked()
+	c.mu.Unlock()
+	<-done
+}
+
+// TestLeanRefundCapped: refunding a dropped stream's unsent data never
+// takes the connection's credit past the largest window.
+func TestLeanRefundCapped(t *testing.T) {
+	c := newTestLeanConn()
+	st := newTestLeanStream(c, 1)
+	st.queueDataLocked(0, make([]byte, 1000))
+	c.connSendWin = leanMaxWindow
+	c.dropOutLocked(st)
+	if c.connSendWin > leanMaxWindow {
+		t.Fatalf("credit %d after the refund, past the largest window", c.connSendWin)
+	}
+}

@@ -1039,7 +1039,10 @@ func (c *leanConn) dropOutLocked(st *leanStream) {
 	for b := st.out[st.outOff:]; len(b) >= leanFrameHeaderLen; {
 		n := int(b[0])<<16 | int(b[1])<<8 | int(b[2])
 		if http2.FrameType(b[3]) == http2.FrameData {
-			c.connSendWin += int64(n)
+			// Capped: a WINDOW_UPDATE is checked against the credit left
+			// after queued data, so the refund could pass the maximum the
+			// client may grant.
+			c.connSendWin = min(c.connSendWin+int64(n), leanMaxWindow)
 		}
 		b = b[leanFrameHeaderLen+n:]
 	}
@@ -1701,7 +1704,9 @@ func (sc *leanStreamConn) Write(b []byte) (int, error) {
 				return written, errLeanConnClosed
 			}
 			if st.roomLocked() <= 0 {
-				st.awaitRoomLocked(min(len(b)-written, c.peerMaxFrame) + leanFrameHeaderLen)
+				// No more than it can queue at once, or it waits for room
+				// it doesn't need while smaller writes take what's freed.
+				st.awaitRoomLocked(min(len(b)-written, c.peerMaxFrame, leanWriteChunk) + leanFrameHeaderLen)
 				continue
 			}
 			if st.sendWin <= 0 || c.connSendWin <= 0 {
