@@ -43,9 +43,10 @@ func TestPoolCreatesOneTransportAtATime(t *testing.T) {
 	}
 }
 
-// TestPoolFailedCreateHandsOff: when the transport being created fails, a
-// CONNECT that was waiting for it creates the next one itself.
-func TestPoolFailedCreateHandsOff(t *testing.T) {
+// TestPoolFailedCreateFailsWaiters: CONNECTs waiting on a creation that
+// fails all fail with it at once, rather than each trying in turn against a
+// server that isn't answering, and the next CONNECT tries again.
+func TestPoolFailedCreateFailsWaiters(t *testing.T) {
 	var creates atomic.Int32
 	first := make(chan struct{})
 	pool := newConnPool(100, time.Minute, func(ctx context.Context) (*h2Transport, error) {
@@ -57,29 +58,63 @@ func TestPoolFailedCreateHandsOff(t *testing.T) {
 	})
 	defer pool.close()
 
-	failed := make(chan error, 1)
-	go func() {
-		_, err := pool.getTransport(context.Background())
-		failed <- err
-	}()
-	for creates.Load() == 0 {
-		time.Sleep(time.Millisecond)
+	errs := make(chan error, 5)
+	for range 5 {
+		go func() {
+			_, err := pool.getTransport(context.Background())
+			errs <- err
+		}()
 	}
+	time.Sleep(20 * time.Millisecond)
+	close(first)
+	for range 5 {
+		if err := <-errs; err == nil || err.Error() != "dial failed" {
+			t.Fatalf("a waiter got %v, want the creation's error", err)
+		}
+	}
+	if n := creates.Load(); n != 1 {
+		t.Fatalf("%d creates for one failure, want 1", n)
+	}
+	if _, err := pool.getTransport(context.Background()); err != nil {
+		t.Fatalf("the next CONNECT got %v, want a new transport", err)
+	}
+}
+
+// TestPoolCreateOutlivesItsStarter: the CONNECT that starts a shared creation
+// giving up neither cancels it nor costs the others waiting on it.
+func TestPoolCreateOutlivesItsStarter(t *testing.T) {
+	release := make(chan struct{})
+	var cancelled atomic.Bool
+	pool := newConnPool(100, time.Minute, func(ctx context.Context) (*h2Transport, error) {
+		<-release
+		cancelled.Store(ctx.Err() != nil)
+		return newTestTransport(okRoundTripper()), nil
+	})
+	defer pool.close()
+
+	starter, cancel := context.WithCancel(context.Background())
+	started := make(chan error, 1)
+	go func() {
+		_, err := pool.getTransport(starter)
+		started <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
 	waited := make(chan error, 1)
 	go func() {
 		_, err := pool.getTransport(context.Background())
 		waited <- err
 	}()
 	time.Sleep(20 * time.Millisecond)
-	close(first)
-	if err := <-failed; err == nil {
-		t.Fatal("the failed create reported no error")
+	cancel()
+	if err := <-started; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the starter got %v, want its own cancellation", err)
 	}
+	close(release)
 	if err := <-waited; err != nil {
-		t.Fatalf("the waiting CONNECT got %v, want a transport of its own", err)
+		t.Fatalf("a waiter got %v once the starter gave up", err)
 	}
-	if n := creates.Load(); n != 2 {
-		t.Fatalf("%d creates, want 2", n)
+	if cancelled.Load() {
+		t.Fatal("the starter giving up cancelled the shared creation")
 	}
 }
 

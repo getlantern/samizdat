@@ -88,7 +88,9 @@ type ClientConfig struct {
 	IdleTimeout       time.Duration // close idle connections after (default: 5m)
 	ConnectTimeout    time.Duration // TCP+TLS connect timeout (default: 15s)
 
-	// Optional: custom dialer for the underlying TCP connection
+	// Optional: custom dialer for the underlying TCP connection. The context
+	// it gets ends once the connection is set up, so the connection mustn't
+	// depend on it.
 	Dialer DialFunc
 }
 
@@ -103,7 +105,7 @@ func (c *ClientConfig) applyDefaults() {
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = 5 * time.Minute
 	}
-	if c.ConnectTimeout == 0 {
+	if c.ConnectTimeout <= 0 {
 		c.ConnectTimeout = 15 * time.Second
 	}
 }

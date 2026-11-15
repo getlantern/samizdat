@@ -1077,20 +1077,27 @@ func TestLeanH2MatchesXNetOnBadPeers(t *testing.T) {
 // closed must be closed, not added to the closed pool and leaked.
 func TestPoolClosedWhileDialing(t *testing.T) {
 	var pool *connPool
-	var created *h2Transport
+	created := make(chan *h2Transport, 1)
 	pool = newConnPool(10, time.Minute, func(ctx context.Context) (*h2Transport, error) {
 		pool.close()
 		c1, c2 := net.Pipe()
 		t.Cleanup(func() { c2.Close() })
 		tr, err := newH2Transport(c1, "example.com:443", 10)
-		created = tr
+		created <- tr
 		return tr, err
 	})
 	if _, err := pool.getTransport(context.Background()); err == nil {
 		t.Fatal("getTransport succeeded on a pool closed during the dial")
 	}
-	if !created.isClosed() {
-		t.Fatal("the transport dialed for a closed pool was left open")
+	// The caller returns once the pool closes; the dial closes what it made
+	// once it finishes.
+	tr := <-created
+	deadline := time.Now().Add(time.Second)
+	for !tr.isClosed() {
+		if time.Now().After(deadline) {
+			t.Fatal("the transport dialed for a closed pool was left open")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
