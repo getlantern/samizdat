@@ -77,37 +77,41 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 	p.dialing = dialing
 	p.mu.Unlock()
 
-	// Create a new transport
-	t, err := p.create(ctx, dialing)
+	// Create a new transport. The callers waiting on dialing look again
+	// once it is in the pool, or once creating it has failed, however it
+	// failed.
+	finished := false
+	defer func() {
+		if !finished {
+			p.mu.Lock()
+			p.finishDialLocked(dialing)
+			p.mu.Unlock()
+		}
+	}()
+	t, err := p.createFunc(ctx)
 
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	finished = true
+	defer p.finishDialLocked(dialing)
 	if err != nil {
-		p.mu.Unlock()
 		return nil, err
 	}
 	if p.closed {
 		// Closed while this one was dialing: close would never reach it.
-		p.mu.Unlock()
 		t.close()
 		return nil, context.Canceled
 	}
 	t.activeStreams.Add(1)
 	p.transports = append(p.transports, t)
-	p.mu.Unlock()
-
 	return t, nil
 }
 
-// create runs createFunc, and lets the callers waiting on dialing look again
-// once it's done, however it ends.
-func (p *connPool) create(ctx context.Context, dialing chan struct{}) (*h2Transport, error) {
-	defer func() {
-		p.mu.Lock()
-		p.dialing = nil
-		close(dialing)
-		p.mu.Unlock()
-	}()
-	return p.createFunc(ctx)
+// finishDialLocked ends the creation dialing tracked, waking its waiters.
+// p.mu must be held.
+func (p *connPool) finishDialLocked(dialing chan struct{}) {
+	p.dialing = nil
+	close(dialing)
 }
 
 // cleanupLoop periodically removes closed and idle transports.

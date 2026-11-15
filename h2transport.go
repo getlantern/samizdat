@@ -323,6 +323,10 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	if callerLive, waiting := stop(), stopAbandon(); !callerLive || !waiting || !stallArmed {
 		resp.Body.Close()
 		pw.Close()
+		if !stallArmed {
+			// The answer came only as the stall gave up on it.
+			t.retireWithReason("CONNECT unanswered for " + connectStall.String())
+		}
 		if callerLive {
 			return nil, fmt.Errorf("CONNECT to %s: %w", destination, errConnUnusable)
 		}
