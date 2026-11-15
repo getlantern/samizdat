@@ -957,31 +957,34 @@ func (c *leanConn) flushDataLocked() {
 	c.dataQueued = 0
 }
 
-// takeDataLocked takes the next stream's next chunk of frames, and puts the
-// stream back at the end of the line if it has more. c.mu must be held.
+// takeDataLocked takes the streams' next frames for one socket write: a
+// frame from each in turn, so a stream that has just started waits behind
+// at most a frame from each of the others, up to leanWriteChunk in all. A
+// stream with more goes back to the end of the line. c.mu must be held.
 func (c *leanConn) takeDataLocked() []byte {
-	for len(c.sched) > 0 {
+	taken := c.dspare[:0]
+	c.dspare = nil
+	for len(c.sched) > 0 && len(taken) < leanWriteChunk {
 		st := c.sched[0]
 		c.sched[0] = nil
 		c.sched = c.sched[1:]
-		if len(st.out) == 0 {
+		if len(st.out) < leanFrameHeaderLen {
+			st.out = st.out[:0]
 			st.inSched = false
 			continue
 		}
-		chunk := leanChunk(st.out)
-		taken := append(c.dspare[:0], chunk...)
-		c.dspare = nil
-		st.out = st.out[len(chunk):]
-		c.dataQueued -= len(chunk)
+		n := leanFrameHeaderLen + (int(st.out[0])<<16 | int(st.out[1])<<8 | int(st.out[2]))
+		taken = append(taken, st.out[:n]...)
+		st.out = st.out[n:]
+		c.dataQueued -= n
 		if len(st.out) > 0 {
 			c.sched = append(c.sched, st)
 		} else {
 			st.out = st.out[:0]
 			st.inSched = false
 		}
-		return taken
 	}
-	return nil
+	return taken
 }
 
 // awaitCreditLocked waits for send credit on st or the connection, or for st
