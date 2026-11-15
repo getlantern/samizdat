@@ -921,6 +921,16 @@ func (st *leanStream) awaitRoomLocked(want int) {
 	st.roomCond.Wait()
 }
 
+// bulkLocked reports whether st counts as a download (see leanWakeRoom),
+// first forgetting what it queued if its queue has sat empty for
+// leanBulkIdle. c.mu must be held.
+func (st *leanStream) bulkLocked() bool {
+	if st.outLen() == 0 && st.queuedTotal > 0 && !st.drainedAt.IsZero() && time.Since(st.drainedAt) > leanBulkIdle {
+		st.queuedTotal = 0
+	}
+	return st.outLen() >= leanWriteChunk || st.queuedTotal >= leanBulk
+}
+
 // roomLocked returns how much DATA payload st may queue now: what's left of
 // both the write buffer and st's share of it, less a frame header. c.mu must
 // be held.
@@ -959,11 +969,7 @@ func (st *leanStream) endOutLocked(n int) {
 // queueDataLocked queues a DATA frame carrying payload for the writer, in
 // st's turn among the streams. c.mu must be held.
 func (st *leanStream) queueDataLocked(flags http2.Flags, payload []byte) {
-	if st.outLen() == 0 && st.queuedTotal > 0 && !st.drainedAt.IsZero() && time.Since(st.drainedAt) > leanBulkIdle {
-		// Idle a while: a download no longer, unless it queues as much
-		// again.
-		st.queuedTotal = 0
-	}
+	st.bulkLocked() // lapses an idle download's class before it queues
 	n := st.beginOutLocked()
 	st.out = appendFrameHeader(st.out, len(payload), http2.FrameData, flags, st.id)
 	st.out = append(st.out, payload...)
@@ -995,6 +1001,7 @@ func (c *leanConn) rstLocked(id uint32, code http2.ErrCode) {
 func (c *leanConn) clearOutLocked(st *leanStream) {
 	st.out = st.out[:0]
 	st.outOff = 0
+	st.drainedAt = time.Now()
 	if st.removed {
 		delete(c.closedOut, st.id)
 	}
@@ -1074,7 +1081,6 @@ func (c *leanConn) takeDataLocked() []byte {
 		} else {
 			c.clearOutLocked(st)
 			st.inSched = false
-			st.drainedAt = time.Now()
 		}
 	}
 	return taken
@@ -1099,7 +1105,7 @@ func (c *leanConn) wakeRoomLocked(all bool) {
 		// No more than a stream can ever have: a Write asks for room for
 		// a whole frame, which the client may allow to be far larger.
 		need := min(max(st.wantRoom, 1), leanWakeRoom)
-		if st.outLen() >= leanWriteChunk || st.queuedTotal >= leanBulk {
+		if st.bulkLocked() {
 			need = leanWakeRoom
 		}
 		bulk := need == leanWakeRoom

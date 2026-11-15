@@ -331,3 +331,27 @@ func TestLeanSmallWritersAllWoken(t *testing.T) {
 		}
 	}
 }
+
+// TestLeanIdleDownloadWaitsAsSmall: a former download idle past
+// leanBulkIdle, waiting to write a little into a full buffer, is woken once
+// that fits rather than held for a download's worth of room.
+func TestLeanIdleDownloadWaitsAsSmall(t *testing.T) {
+	c := newTestLeanConn()
+	for _, id := range []uint32{1, 3} {
+		st := newTestLeanStream(c, id)
+		for st.roomLocked() > 0 {
+			st.queueDataLocked(0, make([]byte, min(st.roomLocked(), 16<<10)))
+		}
+	}
+	w := newTestLeanStream(c, 5)
+	w.queuedTotal = 2 << 20
+	w.drainedAt = time.Now().Add(-2 * leanBulkIdle)
+	w.wantRoom = 1400 + leanFrameHeaderLen
+	w.waitingRoom = true
+	c.roomWaiters = append(c.roomWaiters, w)
+	c.takeDataLocked()
+	c.wakeRoomLocked(false)
+	if w.waitingRoom {
+		t.Fatalf("an idle former download wanting %d with room %d is still waiting", w.wantRoom, w.roomLocked())
+	}
+}
