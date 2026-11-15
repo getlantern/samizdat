@@ -70,14 +70,14 @@ func TestReceiveWindowsAdvertised(t *testing.T) {
 func TestReceiveWindowDefaults(t *testing.T) {
 	var cfg ClientConfig
 	cfg.applyDefaults()
-	if cfg.MaxReceiveBufferPerStream != 512<<10 || cfg.MaxReceiveBufferPerConn != 2<<20 {
+	if cfg.MaxReceiveBufferPerStream != 512<<10 || cfg.MaxReceiveBufferPerConn != 8<<20 {
 		t.Fatalf("defaults are %d and %d", cfg.MaxReceiveBufferPerStream, cfg.MaxReceiveBufferPerConn)
 	}
 	stream, conn := advertisedWindows(t, receiveWindows{
 		perStream: cfg.MaxReceiveBufferPerStream,
 		perConn:   cfg.MaxReceiveBufferPerConn,
 	})
-	if stream != 512<<10 || conn != 2<<20 {
+	if stream != 512<<10 || conn != 8<<20 {
 		t.Fatalf("advertised stream=%d conn=%d", stream, conn)
 	}
 }
@@ -115,6 +115,91 @@ func TestFailedConnectLogged(t *testing.T) {
 	for _, leak := range []string{"secret", "99999999999999", "ü"} {
 		if strings.Contains(out, leak) {
 			t.Errorf("logs name a destination (%q):\n%s", leak, out)
+		}
+	}
+}
+
+// TestStuckTunnelsLeaveOthersFlowing: tunnels whose readers have stopped
+// keep their windows full, and must not use up the connection's window
+// before the rest of its tunnels can get data.
+func TestStuckTunnelsLeaveOthersFlowing(t *testing.T) {
+	serverPriv, serverPub, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shortID, err := GenerateShortID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM, keyPEM := generateSelfSignedCert(t)
+	_, ln := startTestServer(t, ServerConfig{
+		ListenAddr: "127.0.0.1:0",
+		PrivateKey: serverPriv,
+		ShortIDs:   [][8]byte{shortID},
+		CertPEM:    certPEM,
+		KeyPEM:     keyPEM,
+		Handler: func(ctx context.Context, conn net.Conn, destination string) {
+			defer conn.Close()
+			if destination == "hello.example:443" {
+				conn.Write([]byte("hello"))
+				return
+			}
+			zeros := make([]byte, 32<<10)
+			for {
+				if _, err := conn.Write(zeros); err != nil {
+					return
+				}
+			}
+		},
+	})
+	client, err := NewClient(ClientConfig{
+		ServerAddr: ln.Addr().String(),
+		ServerName: "test.example.com",
+		PublicKey:  serverPub,
+		ShortID:    shortID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// Eight tunnels that never read: 4MiB of their windows at the defaults.
+	for range 8 {
+		c, err := client.DialContext(context.Background(), "tcp", "flood.example:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+	}
+	time.Sleep(500 * time.Millisecond) // for their windows to fill
+
+	c, err := client.DialContext(context.Background(), "tcp", "hello.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got := make([]byte, 5)
+	if _, err := io.ReadFull(c, got); err != nil || string(got) != "hello" {
+		t.Fatalf("a tunnel beside stuck ones read %q, %v", got, err)
+	}
+}
+
+// TestReceiveWindowRange: windows x/net would silently replace with its own
+// defaults are refused.
+func TestReceiveWindowRange(t *testing.T) {
+	_, pub, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range []ClientConfig{
+		{MaxReceiveBufferPerStream: -1},
+		{MaxReceiveBufferPerConn: 1000},
+		{MaxReceiveBufferPerConn: -5},
+	} {
+		cfg.ServerAddr, cfg.ServerName, cfg.PublicKey = "example.com:443", "example.com", pub
+		if _, err := NewClient(cfg); err == nil {
+			t.Errorf("NewClient accepted stream=%d conn=%d", cfg.MaxReceiveBufferPerStream, cfg.MaxReceiveBufferPerConn)
 		}
 	}
 }

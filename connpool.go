@@ -64,7 +64,7 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 	if p.closed {
 		// Closed while this one was dialing: close would never reach it.
 		p.mu.Unlock()
-		t.close()
+		t.closeWithReason("client closed")
 		return nil, context.Canceled
 	}
 	t.activeStreams.Add(1)

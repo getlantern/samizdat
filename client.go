@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -47,6 +48,14 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 	if config.ServerName == "" {
 		return nil, fmt.Errorf("ServerName is required")
+	}
+	// x/net silently replaces windows outside these ranges with its own
+	// defaults, which bring back the queueing the windows are set to avoid.
+	if w := config.MaxReceiveBufferPerStream; w < 1 || w > math.MaxInt32 {
+		return nil, fmt.Errorf("MaxReceiveBufferPerStream %d out of range [1, %d]", w, math.MaxInt32)
+	}
+	if w := config.MaxReceiveBufferPerConn; w < 65535 || w > math.MaxInt32 {
+		return nil, fmt.Errorf("MaxReceiveBufferPerConn %d out of range [65535, %d]", w, math.MaxInt32)
 	}
 	if n := len(config.ServerCertSPKISHA256); n != 0 && n != sha256.Size {
 		return nil, fmt.Errorf("ServerCertSPKISHA256 must be empty or %d bytes, got %d", sha256.Size, n)
