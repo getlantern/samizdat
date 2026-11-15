@@ -733,25 +733,17 @@ func (c *leanConn) writeLoop() {
 			c.queuedPriority = 0
 		}
 		if len(cur) == 0 && len(c.wbuf) > 0 {
-			taken = c.wbuf
+			taken = c.takeWbufLocked()
 			cur = taken
 			takenData = false
-			c.wbuf, c.spare = c.spare[:0], nil
-			// Only now: the control frames in wbuf stay queued, and counted,
-			// while the writer works through the buffer it took before.
-			c.queuedControl = 0
-			c.tookFrom = c.tookFrom[:0]
-			c.wakeRoomLocked(false)
-			for _, st := range c.hdrWaiters {
-				st.roomCond.Broadcast()
-			}
-			clear(c.hdrWaiters)
-			c.hdrWaiters = c.hdrWaiters[:0]
 		} else if len(cur) == 0 && c.dataQueued > 0 {
 			taken = c.takeDataLocked()
 			cur = taken
 			takenData = true
 			c.wakeRoomLocked(false)
+			// Not kept past the wake: it would hold finished streams.
+			clear(c.tookFrom)
+			c.tookFrom = c.tookFrom[:0]
 		}
 		c.mu.Unlock()
 
@@ -1005,6 +997,7 @@ func (st *leanStream) queueDataLocked(flags http2.Flags, payload []byte) {
 // appendRSTLocked queues RST_STREAM behind st's queued frames. c.mu must be
 // held.
 func (st *leanStream) appendRSTLocked(code http2.ErrCode) {
+	st.rstQueued = true
 	n := st.beginOutLocked()
 	st.out = appendRSTStream(st.out, st.id, code)
 	st.endOutLocked(n)
@@ -1015,7 +1008,11 @@ func (st *leanStream) appendRSTLocked(code http2.ErrCode) {
 // overtake. c.mu must be held.
 func (c *leanConn) rstLocked(id uint32, code http2.ErrCode) {
 	if st := c.closedOut[id]; st != nil && st.outLen() > 0 {
-		st.appendRSTLocked(code)
+		// One answers every frame the client sends it: more would pile up
+		// outside the buffer's bound for as long as its frames wait.
+		if !st.rstQueued {
+			st.appendRSTLocked(code)
+		}
 		return
 	}
 	c.wbuf = appendRSTStream(c.wbuf, id, code)
@@ -1075,6 +1072,25 @@ func (c *leanConn) flushDataLocked() {
 	c.sched = c.sched[:0]
 	c.dataQueued = 0
 	c.wakeRoomLocked(true)
+}
+
+// takeWbufLocked hands the writer wbuf, waking the streams waiting for room
+// in it.
+func (c *leanConn) takeWbufLocked() []byte {
+	taken := c.wbuf
+	c.wbuf, c.spare = c.spare[:0], nil
+	// Only now: the control frames in wbuf stay queued, and counted,
+	// while the writer works through the buffer it took before.
+	c.queuedControl = 0
+	clear(c.tookFrom)
+	c.tookFrom = c.tookFrom[:0]
+	c.wakeRoomLocked(false)
+	for _, st := range c.hdrWaiters {
+		st.roomCond.Broadcast()
+	}
+	clear(c.hdrWaiters)
+	c.hdrWaiters = c.hdrWaiters[:0]
+	return taken
 }
 
 // takeDataLocked takes the streams' next frames for one socket write: up to
@@ -1200,6 +1216,8 @@ type leanStream struct {
 	// room it's waiting for.
 	waitingRoom bool
 	wantRoom    int
+	// rstQueued is set once RST_STREAM is queued behind its frames.
+	rstQueued bool
 	// queuedTotal counts the DATA payload st has queued since its queue was
 	// last left empty for leanBulkIdle, to tell a download from a stream
 	// with a little to send; see leanWakeRoom. drainedAt is when the writer
@@ -1589,6 +1607,10 @@ func (st *leanStream) writeHeaders(status int, extra []hpack.HeaderField, end bo
 	for len(c.wbuf) >= leanMaxWriteBuffer && !c.closed && !st.reset {
 		c.hdrWaiters = append(c.hdrWaiters, st)
 		st.roomCond.Wait()
+		// Woken by a reset rather than the writer, it's still listed.
+		if i := slices.Index(c.hdrWaiters, st); i >= 0 {
+			c.hdrWaiters = slices.Delete(c.hdrWaiters, i, i+1)
+		}
 	}
 	if c.closed {
 		return errLeanConnClosed

@@ -382,13 +382,8 @@ func TestLeanHeadersBoundedByWbuf(t *testing.T) {
 		t.Fatal("HEADERS queued into a full wbuf")
 	default:
 	}
-	// What the writer does when it takes wbuf.
 	c.mu.Lock()
-	c.wbuf = c.wbuf[:0]
-	for _, w := range c.hdrWaiters {
-		w.roomCond.Broadcast()
-	}
-	c.hdrWaiters = c.hdrWaiters[:0]
+	c.takeWbufLocked()
 	c.mu.Unlock()
 	select {
 	case err := <-done:
@@ -474,5 +469,59 @@ func TestLeanStreamBufHeldSchedulesTrim(t *testing.T) {
 	st.queueDataLocked(0, make([]byte, 2*leanIdleStreamBufKeep))
 	if !c.streamBufHeld {
 		t.Fatal("a stream's large queue buffer didn't mark the connection for trimming")
+	}
+}
+
+// TestLeanResetHeadersWaiterLeavesList: a stream reset while its HEADERS
+// wait for wbuf leaves the waiters, so open-and-reset cycles against a
+// writer that's stuck can't keep finished streams listed.
+func TestLeanResetHeadersWaiterLeavesList(t *testing.T) {
+	c := newTestLeanConn()
+	c.hpackBuf = new(bytes.Buffer)
+	c.hpackEnc = hpack.NewEncoder(c.hpackBuf)
+	st := newTestLeanStream(c, 1)
+	c.wbuf = make([]byte, leanMaxWriteBuffer)
+	done := make(chan error, 1)
+	go func() { done <- st.writeHeaders(200, nil, false) }()
+	for {
+		c.mu.Lock()
+		n := len(c.hdrWaiters)
+		c.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.mu.Lock()
+	st.reset = true
+	st.roomCond.Broadcast()
+	c.mu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HEADERS stayed waiting after the stream was reset")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.hdrWaiters) != 0 {
+		t.Fatalf("%d streams still listed as waiting after a reset", len(c.hdrWaiters))
+	}
+}
+
+// TestLeanFinishedStreamOneRST: frames the client keeps sending a finished
+// stream whose own are still queued get one RST_STREAM behind them, not one
+// each.
+func TestLeanFinishedStreamOneRST(t *testing.T) {
+	c := newTestLeanConn()
+	st := newTestLeanStream(c, 1)
+	st.queueDataLocked(http2.FlagDataEndStream, make([]byte, 1000))
+	c.closedOut = map[uint32]*leanStream{1: st}
+	c.rstLocked(1, http2.ErrCodeStreamClosed)
+	n := st.outLen()
+	for range 100 {
+		c.rstLocked(1, http2.ErrCodeStreamClosed)
+	}
+	if st.outLen() != n {
+		t.Fatalf("queue grew from %d to %d bytes with repeated resets", n, st.outLen())
 	}
 }
