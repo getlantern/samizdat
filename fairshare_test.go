@@ -241,3 +241,53 @@ func TestLeanSettingsKeepTurns(t *testing.T) {
 		t.Fatal("a larger maximum frame size flushed the streams' data into the ordered frames")
 	}
 }
+
+// TestLeanLargeWriteWoken: a Write waiting to queue more than a stream can
+// ever hold, as one may when the client allows large frames, is woken once
+// the stream has room, while other streams keep data queued.
+func TestLeanLargeWriteWoken(t *testing.T) {
+	c := newTestLeanConn()
+	a, b, w := newTestLeanStream(c, 1), newTestLeanStream(c, 3), newTestLeanStream(c, 5)
+	for _, st := range []*leanStream{a, b} {
+		for st.roomLocked() > 0 {
+			st.queueDataLocked(0, make([]byte, min(st.roomLocked(), 16<<10)))
+		}
+	}
+	if w.roomLocked() > 0 {
+		t.Fatalf("a full buffer left room %d", w.roomLocked())
+	}
+	w.wantRoom = 1<<20 + leanFrameHeaderLen
+	w.waitingRoom = true
+	c.roomWaiters = append(c.roomWaiters, w)
+	for range 200 {
+		for c.dataQueued < 128<<10 {
+			a.queueDataLocked(0, make([]byte, 16<<10))
+		}
+		c.takeDataLocked()
+		c.wakeRoomLocked(false)
+		if !w.waitingRoom {
+			return
+		}
+	}
+	t.Fatalf("never woken, with room %d", w.roomLocked())
+}
+
+// TestLeanDownloadClassResets: a stream that drains its queue is no longer
+// treated as a download, so a small write after one isn't held back for a
+// download's worth of room.
+func TestLeanDownloadClassResets(t *testing.T) {
+	c := newTestLeanConn()
+	st := newTestLeanStream(c, 1)
+	for st.queuedTotal < leanBulk {
+		st.queueDataLocked(0, make([]byte, 16<<10))
+		for st.outLen() > leanMaxStreamQueue/2 {
+			c.takeDataLocked()
+		}
+	}
+	for st.outLen() > 0 {
+		c.takeDataLocked()
+	}
+	if st.queuedTotal != 0 {
+		t.Fatalf("queuedTotal %d after the queue drained, want 0", st.queuedTotal)
+	}
+}

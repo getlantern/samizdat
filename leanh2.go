@@ -65,8 +65,8 @@ const (
 	// leanWakeRoom is how much room a download must have to be woken, so it
 	// refills a good deal at a time rather than waking for every frame the
 	// writer takes; another stream is woken as soon as what it's writing
-	// fits. A stream counts as a download once it has queued leanBulk, or
-	// while it has leanWriteChunk queued.
+	// fits. A stream counts as a download once it has queued leanBulk since
+	// its queue last drained, or while it has leanWriteChunk queued.
 	leanWakeRoom       = 192 << 10
 	leanBulk           = 1 << 20
 	leanReadBuffer     = 32 << 10
@@ -1067,6 +1067,9 @@ func (c *leanConn) takeDataLocked() []byte {
 		} else {
 			c.clearOutLocked(st)
 			st.inSched = false
+			// Drained: it counts as a download again only if it queues
+			// that much again.
+			st.queuedTotal = 0
 		}
 	}
 	return taken
@@ -1088,9 +1091,11 @@ func (c *leanConn) wakeRoomLocked(all bool) {
 	keep := c.roomWaiters[:0]
 	for _, st := range c.roomWaiters {
 		room := st.roomLocked()
-		need := max(st.wantRoom, 1)
+		// No more than a stream can ever have: a Write asks for room for
+		// a whole frame, which the client may allow to be far larger.
+		need := min(max(st.wantRoom, 1), leanWakeRoom)
 		if st.outLen() >= leanWriteChunk || st.queuedTotal >= leanBulk {
-			need = max(need, leanWakeRoom)
+			need = leanWakeRoom
 		}
 		mine := room >= need && slices.Contains(c.tookFrom, st)
 		if all || mine || !woken && room >= need {
@@ -1152,8 +1157,9 @@ type leanStream struct {
 	// room it's waiting for.
 	waitingRoom bool
 	wantRoom    int
-	// queuedTotal counts the DATA payload st has queued, to tell a download
-	// from a stream with a little to send; see leanWakeRoom.
+	// queuedTotal counts the DATA payload st has queued since its queue last
+	// drained, to tell a download from a stream with a little to send; see
+	// leanWakeRoom.
 	queuedTotal int64
 	// waitingConn is set while st is in c.connWaiters.
 	waitingConn bool
