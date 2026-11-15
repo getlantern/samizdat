@@ -55,6 +55,9 @@ type h2Transport struct {
 
 	id     uint64
 	logger *slog.Logger
+	// closeLogged is set once a close has been logged, so two paths closing
+	// it at once log it once.
+	closeLogged atomic.Bool
 	// created is when the transport was created.
 	created time.Time
 }
@@ -105,7 +108,7 @@ func (t *h2Transport) sinceRead(now time.Time) time.Duration {
 
 // newH2Transport creates an HTTP/2 transport over an existing TLS connection.
 // receiveWindows are how much a transport lets the server send ahead of what
-// it has read, per stream and per connection; zero means x/net's default.
+// it has read, per stream and per connection.
 type receiveWindows struct {
 	perStream, perConn int
 }
@@ -353,7 +356,7 @@ func (t *h2Transport) retireWithReason(reason string) {
 
 // closeWithReason closes the transport, logging why.
 func (t *h2Transport) closeWithReason(reason string) {
-	if !t.isClosed() {
+	if !t.isClosed() && t.closeLogged.CompareAndSwap(false, true) {
 		t.log().Info("samizdat transport closed", t.logAttrs(reason)...)
 	}
 	t.close()
