@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -215,5 +216,26 @@ func TestReceiveWindowRange(t *testing.T) {
 			continue
 		}
 		c.Close()
+	}
+}
+
+// TestRefusedConnectLogged: a CONNECT the server answers with an error status
+// is logged with that status, and without its destination.
+func TestRefusedConnectLogged(t *testing.T) {
+	tr := newTestTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusForbidden, Body: io.NopCloser(strings.NewReader(""))}, nil
+	}))
+	var logs bytes.Buffer
+	tr.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	tr.activeStreams.Store(1)
+	if _, err := tr.openReserved(context.Background(), "secret.example:443"); err == nil {
+		t.Fatal("a refused CONNECT succeeded")
+	}
+	out := logs.String()
+	if !strings.Contains(out, "samizdat CONNECT refused") || !strings.Contains(out, "status=403") {
+		t.Errorf("logs lack the refusal:\n%s", out)
+	}
+	if strings.Contains(out, "secret") {
+		t.Errorf("logs name the destination:\n%s", out)
 	}
 }
