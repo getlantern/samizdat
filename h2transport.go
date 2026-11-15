@@ -257,7 +257,13 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	// H2 stream now that the tunnel is established.
 	stop()
 
-	if waited := time.Since(start); waited >= slowConnect {
+	if resp.StatusCode != http.StatusOK {
+		t.log().Warn("samizdat CONNECT refused",
+			"transport", t.id,
+			"status", resp.StatusCode,
+			"waited", time.Since(start),
+			"streams", t.streamCount())
+	} else if waited := time.Since(start); waited >= slowConnect {
 		t.log().Info("samizdat CONNECT slow",
 			"transport", t.id,
 			"waited", waited,
