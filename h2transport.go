@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
 )
 
@@ -191,6 +192,12 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	}
 	t.mu.Unlock()
 
+	// A destination with no valid encoding fails here, not in RoundTrip,
+	// whose error would quote it into the transport's logs.
+	if _, err := httpguts.PunycodeHostPort(destination); err != nil {
+		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
+	}
+
 	// Issue CONNECT request
 	pr, pw := io.Pipe()
 
@@ -224,28 +231,24 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	if since := t.sinceRead(start); since >= pingIfIdle {
 		t.checkAlive(fmt.Sprintf("reused after %v without a read", since.Round(time.Second)))
 	}
-	silentCheck := time.AfterFunc(pingIfSilent, func() {
-		if t.conn.bytesRead.Load() == readBefore {
-			t.checkAlive("CONNECT unanswered for " + pingIfSilent.String())
-		}
-	})
+	silentCheck := t.watchSilence()
 	resp, err := t.h2Roundtrip.RoundTrip(req)
-	silentCheck.Stop()
+	silentCheck()
 	if err != nil {
 		stop()
 		stopAbandon()
 		tunnelCancel()
 		pw.Close()
 		now := time.Now()
-		// Nothing read while the CONNECT waited means the connection, not
-		// the destination, is what failed to answer.
-		silent := t.conn.bytesRead.Load() == readBefore
+		// A connection that has read nothing for as long as the CONNECT
+		// has waited it out, not the destination, is what failed to answer.
+		silent := t.sinceRead(now) >= silentConnectRetire
 		t.log().Warn("samizdat CONNECT failed",
 			"transport", t.id,
 			"error", err,
 			"waited", now.Sub(start),
 			"since_read", t.sinceRead(now),
-			"read_while_waiting", !silent,
+			"read_while_waiting", t.conn.bytesRead.Load() != readBefore,
 			"streams", t.streamCount(),
 			"age", now.Sub(t.created))
 		// This transport wraps a single, non-redialable conn. A conn-fatal
@@ -260,12 +263,13 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 			if ctx.Err() == nil {
 				err = fmt.Errorf("%w: %v", errConnUnusable, err)
 			}
-		case t.cc != nil && (t.conn.closed.Load() || !t.cc.CanTakeNewRequest()):
-			// x/net still reports a connection that closed before its first
-			// stream as able to take one, so that request can see why.
+		case t.cc != nil && (t.conn.closed.Load() || t.cc.State().Closed || !t.cc.CanTakeNewRequest()):
 			// The connection can't take new streams (a GOAWAY, stream IDs
 			// used up, or closed) but may still carry live tunnels; keep
-			// them. A caller still waiting can have a new connection.
+			// them. A caller still waiting can have a new connection. x/net
+			// reports a connection that closed before its first stream as
+			// able to take one, so that request can see why, hence the
+			// closed checks.
 			t.retireWithReason("connection takes no new streams")
 			if ctx.Err() == nil {
 				err = fmt.Errorf("%w: %v", errConnUnusable, err)
@@ -273,11 +277,11 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		case connFatal(err):
 			t.closeWithReason("CONNECT failed: " + err.Error())
 		case silent && now.Sub(start) >= silentConnectRetire:
-			// A caller gave up on a connection that stayed silent the whole
-			// time. Stop opening streams on it, so the next CONNECT gets a
-			// new connection rather than waiting on this one as well; if
-			// it's alive, the streams it carries finish on it.
-			t.retireWithReason(fmt.Sprintf("silent for %v during a CONNECT", now.Sub(start).Round(time.Millisecond)))
+			// A caller gave up on a connection that had gone silent. Stop
+			// opening streams on it, so the next CONNECT gets a new
+			// connection rather than waiting on this one as well; if it's
+			// alive, the streams it carries finish on it.
+			t.retireWithReason(fmt.Sprintf("silent for %v when a CONNECT gave up", t.sinceRead(now).Round(time.Millisecond)))
 		}
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, err)
 	}
@@ -344,10 +348,43 @@ func connFatal(err error) bool {
 		errors.Is(err, syscall.EPIPE)
 }
 
-// silentConnectRetire is how long a failed CONNECT must have waited, with its
-// connection reading nothing, for the transport to be retired. A CONNECT
-// cancelled sooner says little about the connection: its caller may simply
-// have moved on.
+// watchSilence checks the connection's health once it has read nothing for
+// pingIfSilent, and again whenever it falls silent that long, until the
+// returned stop is called. A read only postpones the check: a connection
+// that answers once and then dies must still be caught.
+func (t *h2Transport) watchSilence() (stop func()) {
+	var mu sync.Mutex
+	stopped := false
+	var timer *time.Timer
+	after := pingIfSilent
+	check := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if stopped {
+			return
+		}
+		if since := t.sinceRead(time.Now()); since < after {
+			timer.Reset(after - since)
+			return
+		}
+		t.checkAlive("CONNECT unanswered for " + after.String())
+		timer.Reset(after)
+	}
+	mu.Lock()
+	timer = time.AfterFunc(after, check)
+	mu.Unlock()
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		stopped = true
+		timer.Stop()
+	}
+}
+
+// silentConnectRetire is how long a failed CONNECT must have waited, and its
+// connection gone without reading anything, for the transport to be retired.
+// A CONNECT cancelled sooner says little about the connection: its caller may
+// simply have moved on.
 var silentConnectRetire = 5 * time.Second
 
 // slowConnect is how long a CONNECT that succeeds can take before it's logged.
@@ -382,7 +419,7 @@ func (t *h2Transport) releaseStream() {
 // carried nothing, and must still idle out.
 func (t *h2Transport) releaseReserved() {
 	if t.activeStreams.Add(-1) == 0 && t.retired.Load() {
-		t.close()
+		t.closeWithReason("retired, and its last stream ended")
 	}
 }
 
@@ -423,7 +460,7 @@ func (t *h2Transport) retireWithReason(reason string) {
 		t.log().Info("samizdat transport retired", t.logAttrs(reason)...)
 	}
 	if t.streamCount() == 0 {
-		t.close()
+		t.closeWithReason("retired with no streams")
 	}
 }
 

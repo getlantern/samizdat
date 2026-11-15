@@ -127,7 +127,7 @@ func (p *connPool) close() error {
 	close(p.closeCh)
 
 	for _, t := range p.transports {
-		t.close()
+		t.closeWithReason("client closed")
 	}
 	p.transports = nil
 	return nil

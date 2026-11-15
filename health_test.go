@@ -243,3 +243,54 @@ func TestClosedBeforeFirstStream(t *testing.T) {
 		t.Fatal("a transport whose connection closed is still open")
 	}
 }
+
+// TestSilenceAfterEarlyReadPings: a connection that reads something early in
+// a CONNECT and then goes silent is still pinged, and the CONNECT fails in
+// time for its caller to redial.
+func TestSilenceAfterEarlyReadPings(t *testing.T) {
+	setVar(t, &pingIfSilent, 100*time.Millisecond)
+	setVar(t, &pingTimeout, 50*time.Millisecond)
+	setVar(t, &silentConnectRetire, time.Hour)
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() { c1.Close(); c2.Close() })
+	go io.Copy(io.Discard, c2)
+	tr, err := newH2Transport(c1, "example.com:443", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr.activeStreams.Store(1)
+	go func() {
+		// SETTINGS arrive 30ms into the CONNECT; then nothing does.
+		time.Sleep(30 * time.Millisecond)
+		http2.NewFramer(c2, nil).WriteSettings()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := tr.openReserved(ctx, "example.com:443"); !connFatal(err) {
+		t.Fatalf("CONNECT returned %v, want a conn-fatal error", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("an early read kept the silence check from ever pinging")
+	}
+}
+
+// TestUnencodableDestinationNotLogged: a destination with no valid encoding
+// fails before reaching the connection, so its name stays out of the logs,
+// and the transport stays in use.
+func TestUnencodableDestinationNotLogged(t *testing.T) {
+	tr, logs := startQuietServer(t, 0)
+	tr.activeStreams.Store(1)
+	// Its second label fails punycode decoding, and the error quotes it.
+	const dest = "ü.xn--99999999999999.example:443"
+	_, err := tr.openReserved(context.Background(), dest)
+	if err == nil || connFatal(err) {
+		t.Fatalf("CONNECT returned %v, want a non-fatal error", err)
+	}
+	if strings.Contains(logs.String(), "99999999999999") || strings.Contains(logs.String(), "ü") {
+		t.Errorf("logs name the destination:\n%s", logs)
+	}
+	if tr.retired.Load() || tr.isClosed() {
+		t.Fatal("a bad destination retired the transport")
+	}
+}
