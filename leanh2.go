@@ -65,10 +65,12 @@ const (
 	// leanWakeRoom is how much room a download must have to be woken, so it
 	// refills a good deal at a time rather than waking for every frame the
 	// writer takes; another stream is woken as soon as what it's writing
-	// fits. A stream counts as a download once it has queued leanBulk since
-	// its queue last drained, or while it has leanWriteChunk queued.
+	// fits. A stream counts as a download once it has queued leanBulk without
+	// its queue sitting empty for leanBulkIdle, or while it has
+	// leanWriteChunk queued.
 	leanWakeRoom       = 192 << 10
 	leanBulk           = 1 << 20
+	leanBulkIdle       = time.Second
 	leanReadBuffer     = 32 << 10
 	leanFrameHeaderLen = 9
 	leanMaxWindow      = 1<<31 - 1 // the largest a flow-control window may grow
@@ -957,6 +959,11 @@ func (st *leanStream) endOutLocked(n int) {
 // queueDataLocked queues a DATA frame carrying payload for the writer, in
 // st's turn among the streams. c.mu must be held.
 func (st *leanStream) queueDataLocked(flags http2.Flags, payload []byte) {
+	if st.outLen() == 0 && st.queuedTotal > 0 && !st.drainedAt.IsZero() && time.Since(st.drainedAt) > leanBulkIdle {
+		// Idle a while: a download no longer, unless it queues as much
+		// again.
+		st.queuedTotal = 0
+	}
 	n := st.beginOutLocked()
 	st.out = appendFrameHeader(st.out, len(payload), http2.FrameData, flags, st.id)
 	st.out = append(st.out, payload...)
@@ -1067,9 +1074,7 @@ func (c *leanConn) takeDataLocked() []byte {
 		} else {
 			c.clearOutLocked(st)
 			st.inSched = false
-			// Drained: it counts as a download again only if it queues
-			// that much again.
-			st.queuedTotal = 0
+			st.drainedAt = time.Now()
 		}
 	}
 	return taken
@@ -1157,10 +1162,12 @@ type leanStream struct {
 	// room it's waiting for.
 	waitingRoom bool
 	wantRoom    int
-	// queuedTotal counts the DATA payload st has queued since its queue last
-	// drained, to tell a download from a stream with a little to send; see
-	// leanWakeRoom.
+	// queuedTotal counts the DATA payload st has queued since its queue was
+	// last left empty for leanBulkIdle, to tell a download from a stream
+	// with a little to send; see leanWakeRoom. drainedAt is when the writer
+	// last emptied its queue.
 	queuedTotal int64
+	drainedAt   time.Time
 	// waitingConn is set while st is in c.connWaiters.
 	waitingConn bool
 	// writing counts Writes in progress, so the drain doesn't end the

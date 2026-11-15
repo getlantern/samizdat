@@ -272,9 +272,9 @@ func TestLeanLargeWriteWoken(t *testing.T) {
 	t.Fatalf("never woken, with room %d", w.roomLocked())
 }
 
-// TestLeanDownloadClassResets: a stream that drains its queue is no longer
-// treated as a download, so a small write after one isn't held back for a
-// download's worth of room.
+// TestLeanDownloadClassResets: a stream whose queue sits empty for a while
+// is no longer treated as a download, so a small write after one isn't held
+// back for a download's worth of room; one refilling at once still is.
 func TestLeanDownloadClassResets(t *testing.T) {
 	c := newTestLeanConn()
 	st := newTestLeanStream(c, 1)
@@ -287,7 +287,18 @@ func TestLeanDownloadClassResets(t *testing.T) {
 	for st.outLen() > 0 {
 		c.takeDataLocked()
 	}
-	if st.queuedTotal != 0 {
-		t.Fatalf("queuedTotal %d after the queue drained, want 0", st.queuedTotal)
+	// A download refilling at once keeps its class.
+	st.queueDataLocked(0, []byte("more"))
+	if st.queuedTotal < leanBulk {
+		t.Fatal("a download refilling at once lost its class")
+	}
+	for st.outLen() > 0 {
+		c.takeDataLocked()
+	}
+	// One idle past leanBulkIdle loses it.
+	st.drainedAt = time.Now().Add(-2 * leanBulkIdle)
+	st.queueDataLocked(0, []byte("hi"))
+	if st.queuedTotal >= leanBulk {
+		t.Fatalf("queuedTotal %d after the stream sat idle, want it reset", st.queuedTotal)
 	}
 }
