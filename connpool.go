@@ -132,7 +132,7 @@ func (p *connPool) dial(ctx context.Context, a *dialAttempt) {
 		close(a.done)
 		p.mu.Unlock()
 		if orphan != nil {
-			orphan.close()
+			orphan.closeWithReason("client closed")
 		}
 	}()
 	t, a.err = p.createFunc(ctx)
@@ -171,7 +171,7 @@ func (p *connPool) cleanup() {
 			continue
 		}
 		if t.streamCount() == 0 && t.idleFor(now) >= p.idleTimeout {
-			t.close()
+			t.closeWithReason("idle")
 			continue
 		}
 		alive = append(alive, t)
@@ -191,7 +191,7 @@ func (p *connPool) close() error {
 	close(p.closeCh)
 
 	for _, t := range p.transports {
-		t.close()
+		t.closeWithReason("client closed")
 	}
 	p.transports = nil
 	return nil

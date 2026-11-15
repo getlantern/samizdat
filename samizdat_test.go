@@ -637,7 +637,7 @@ func TestH2StreamRWCCloseDrainsBeforeClosing(t *testing.T) {
 	rwc := &h2StreamRWC{
 		reader:       trc,
 		writer:       nopWriteCloser{},
-		transport:    &h2Transport{maxStreams: 100},
+		transport:    &h2Transport{maxStreams: 100, conn: &readTrackingConn{}},
 		tunnelCancel: func() {},
 	}
 	rwc.transport.activeStreams.Add(1)
@@ -660,6 +660,7 @@ func TestH2StreamRWCCloseWriteThenClose(t *testing.T) {
 		writer: pw,
 		transport: &h2Transport{
 			maxStreams: 100,
+			conn:       &readTrackingConn{},
 		},
 		tunnelCancel: func() {},
 	}
@@ -690,7 +691,7 @@ func TestConnPoolBasic(t *testing.T) {
 		server, client := net.Pipe()
 		_ = server
 		return &h2Transport{
-			tlsConn:    client,
+			conn:       &readTrackingConn{Conn: client},
 			serverAddr: "test:443",
 			maxStreams: 100,
 			localAddr:  &streamAddr{"tcp", "local"},
@@ -724,7 +725,7 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 func newTestTransport(rt http.RoundTripper) *h2Transport {
 	_, client := net.Pipe()
 	return &h2Transport{
-		tlsConn:     client,
+		conn:        &readTrackingConn{Conn: client},
 		h2Roundtrip: rt,
 		serverAddr:  "test:443",
 		maxStreams:  100,
@@ -1077,7 +1078,7 @@ func TestConnPoolKeepsTransportUntilIdleTimeout(t *testing.T) {
 	newTransport := func() *h2Transport {
 		c, peer := net.Pipe()
 		t.Cleanup(func() { peer.Close() })
-		tr := &h2Transport{tlsConn: c, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
+		tr := &h2Transport{conn: &readTrackingConn{Conn: c}, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
 		tr.idleSince.Store(time.Now().UnixNano())
 		return tr
 	}
@@ -1106,7 +1107,7 @@ func TestConnPoolKeepsTransportUntilIdleTimeout(t *testing.T) {
 func TestConnPoolNeverClosesBusyTransport(t *testing.T) {
 	c, peer := net.Pipe()
 	t.Cleanup(func() { peer.Close() })
-	busy := &h2Transport{tlsConn: c, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
+	busy := &h2Transport{conn: &readTrackingConn{Conn: c}, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
 	busy.activeStreams.Add(1)
 
 	p := &connPool{idleTimeout: -time.Second, transports: []*h2Transport{busy}}
@@ -1120,7 +1121,7 @@ func TestConnPoolNeverClosesBusyTransport(t *testing.T) {
 func TestClosingLastStreamRestartsIdleClock(t *testing.T) {
 	c, peer := net.Pipe()
 	t.Cleanup(func() { peer.Close() })
-	tr := &h2Transport{tlsConn: c, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
+	tr := &h2Transport{conn: &readTrackingConn{Conn: c}, h2Roundtrip: &http2.Transport{}, maxStreams: 10}
 	tr.idleSince.Store(time.Now().Add(-time.Hour).UnixNano())
 	tr.activeStreams.Add(1)
 	pr, pw := io.Pipe()

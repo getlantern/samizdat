@@ -10,8 +10,10 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sync"
+	"time"
 
 	utls "github.com/refraction-networking/utls"
 )
@@ -31,6 +33,9 @@ type Client struct {
 // servers. Set from SAMIZDAT_TEST_LEGACY_CLIENTS in tests.
 var testLegacyClients bool
 
+// maxConnWindow is the largest MaxReceiveBufferPerConn.
+const maxConnWindow = math.MaxInt32 - 65535
+
 func NewClient(config ClientConfig) (*Client, error) {
 	config.applyDefaults()
 	if testLegacyClients {
@@ -46,6 +51,16 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 	if config.ServerName == "" {
 		return nil, fmt.Errorf("ServerName is required")
+	}
+	// x/net silently replaces windows outside these ranges with its own
+	// defaults, which bring back the queueing the windows are set to avoid.
+	if w := config.MaxReceiveBufferPerStream; w < 1 || w > math.MaxInt32 {
+		return nil, fmt.Errorf("MaxReceiveBufferPerStream %d out of range [1, %d]", w, math.MaxInt32)
+	}
+	// x/net grants the connection window on top of HTTP/2's initial 65535
+	// bytes, and the sum may not pass 2^31-1.
+	if w := config.MaxReceiveBufferPerConn; w < 65535 || w > maxConnWindow {
+		return nil, fmt.Errorf("MaxReceiveBufferPerConn %d out of range [65535, %d]", w, maxConnWindow)
 	}
 	if n := len(config.ServerCertSPKISHA256); n != 0 && n != sha256.Size {
 		return nil, fmt.Errorf("ServerCertSPKISHA256 must be empty or %d bytes, got %d", sha256.Size, n)
@@ -173,8 +188,12 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	// shapingTimeout.
 	ctx, cancel := context.WithTimeout(ctx, c.config.ConnectTimeout)
 	defer cancel()
+	start := time.Now()
 	uConn, err := c.dialConn(ctx)
 	if err != nil {
+		if c.config.Logger != nil {
+			c.config.Logger.Warn("samizdat dial failed", "error", err, "took", time.Since(start))
+		}
 		return nil, err
 	}
 
@@ -189,10 +208,20 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	}
 
 	// Create H2 transport over the TLS connection
-	transport, err := newH2Transport(conn, c.config.ServerAddr, c.config.MaxStreamsPerConn)
+	transport, err := newH2Transport(conn, c.config.ServerAddr, c.config.MaxStreamsPerConn, receiveWindows{
+		perStream: c.config.MaxReceiveBufferPerStream,
+		perConn:   c.config.MaxReceiveBufferPerConn,
+	})
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)
+	}
+	if c.config.Logger != nil {
+		transport.logger = c.config.Logger
+		transport.log().Info("samizdat transport created",
+			"transport", transport.id,
+			"local", transport.localAddr,
+			"took", time.Since(start))
 	}
 
 	return transport, nil

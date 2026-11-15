@@ -10,6 +10,7 @@ package samizdat
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"time"
 )
@@ -88,10 +89,28 @@ type ClientConfig struct {
 	IdleTimeout       time.Duration // close idle connections after (default: 5m)
 	ConnectTimeout    time.Duration // TCP+TLS connect timeout (default: 15s)
 
+	// MaxReceiveBufferPerStream and MaxReceiveBufferPerConn bound how much
+	// the server may send ahead of what the client has read, per tunnel and
+	// per connection (defaults: 512KiB and 8MiB). Every new tunnel's response
+	// waits behind what is queued on its connection, so a per-tunnel window
+	// larger than the link carries in a second or two leaves new requests
+	// waiting seconds behind a download; a tunnel's throughput is at most its
+	// window over the round-trip time. The per-connection window must hold
+	// several tunnels' windows: one whose reader has stopped keeps its window
+	// full, and once those fill the connection's, every tunnel on it stalls.
+	// PerStream must be between 1 and 2^31-1, PerConn between 65535 and
+	// 2^31-1-65535.
+	MaxReceiveBufferPerStream int
+	MaxReceiveBufferPerConn   int
+
 	// Optional: custom dialer for the underlying TCP connection. The context
 	// it gets ends once the connection is set up, so the connection mustn't
 	// depend on it.
 	Dialer DialFunc
+
+	// Logger, if set, logs each connection's lifecycle and CONNECTs that
+	// fail or are slow. Destinations are never logged.
+	Logger *slog.Logger
 }
 
 // applyDefaults fills in zero-value fields with sensible defaults.
@@ -104,6 +123,12 @@ func (c *ClientConfig) applyDefaults() {
 	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = 5 * time.Minute
+	}
+	if c.MaxReceiveBufferPerStream == 0 {
+		c.MaxReceiveBufferPerStream = 512 << 10
+	}
+	if c.MaxReceiveBufferPerConn == 0 {
+		c.MaxReceiveBufferPerConn = 8 << 20
 	}
 	if c.ConnectTimeout <= 0 {
 		c.ConnectTimeout = 15 * time.Second
