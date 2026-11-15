@@ -33,6 +33,9 @@ type Client struct {
 // servers. Set from SAMIZDAT_TEST_LEGACY_CLIENTS in tests.
 var testLegacyClients bool
 
+// maxConnWindow is the largest MaxReceiveBufferPerConn.
+const maxConnWindow = math.MaxInt32 - 65535
+
 func NewClient(config ClientConfig) (*Client, error) {
 	config.applyDefaults()
 	if testLegacyClients {
@@ -54,8 +57,10 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if w := config.MaxReceiveBufferPerStream; w < 1 || w > math.MaxInt32 {
 		return nil, fmt.Errorf("MaxReceiveBufferPerStream %d out of range [1, %d]", w, math.MaxInt32)
 	}
-	if w := config.MaxReceiveBufferPerConn; w < 65535 || w > math.MaxInt32 {
-		return nil, fmt.Errorf("MaxReceiveBufferPerConn %d out of range [65535, %d]", w, math.MaxInt32)
+	// x/net grants the connection window on top of HTTP/2's initial 65535
+	// bytes, and the sum may not pass 2^31-1.
+	if w := config.MaxReceiveBufferPerConn; w < 65535 || w > maxConnWindow {
+		return nil, fmt.Errorf("MaxReceiveBufferPerConn %d out of range [65535, %d]", w, maxConnWindow)
 	}
 	if n := len(config.ServerCertSPKISHA256); n != 0 && n != sha256.Size {
 		return nil, fmt.Errorf("ServerCertSPKISHA256 must be empty or %d bytes, got %d", sha256.Size, n)

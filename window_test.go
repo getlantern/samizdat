@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"strings"
 	"testing"
@@ -196,10 +197,23 @@ func TestReceiveWindowRange(t *testing.T) {
 		{MaxReceiveBufferPerStream: -1},
 		{MaxReceiveBufferPerConn: 1000},
 		{MaxReceiveBufferPerConn: -5},
+		{MaxReceiveBufferPerConn: maxConnWindow + 1},
 	} {
 		cfg.ServerAddr, cfg.ServerName, cfg.PublicKey = "example.com:443", "example.com", pub
 		if _, err := NewClient(cfg); err == nil {
 			t.Errorf("NewClient accepted stream=%d conn=%d", cfg.MaxReceiveBufferPerStream, cfg.MaxReceiveBufferPerConn)
 		}
+	}
+	for _, cfg := range []ClientConfig{
+		{MaxReceiveBufferPerStream: 1, MaxReceiveBufferPerConn: 65535},
+		{MaxReceiveBufferPerStream: math.MaxInt32, MaxReceiveBufferPerConn: maxConnWindow},
+	} {
+		cfg.ServerAddr, cfg.ServerName, cfg.PublicKey = "example.com:443", "example.com", pub
+		c, err := NewClient(cfg)
+		if err != nil {
+			t.Errorf("NewClient refused stream=%d conn=%d: %v", cfg.MaxReceiveBufferPerStream, cfg.MaxReceiveBufferPerConn, err)
+			continue
+		}
+		c.Close()
 	}
 }

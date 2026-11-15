@@ -99,7 +99,7 @@ type ClientConfig struct {
 	// several tunnels' windows: one whose reader has stopped keeps its window
 	// full, and once those fill the connection's, every tunnel on it stalls.
 	// PerStream must be between 1 and 2^31-1, PerConn between 65535 and
-	// 2^31-1.
+	// 2^31-1-65535.
 	MaxReceiveBufferPerStream int
 	MaxReceiveBufferPerConn   int
 
