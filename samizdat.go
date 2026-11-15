@@ -103,7 +103,9 @@ type ClientConfig struct {
 	MaxReceiveBufferPerStream int
 	MaxReceiveBufferPerConn   int
 
-	// Optional: custom dialer for the underlying TCP connection
+	// Optional: custom dialer for the underlying TCP connection. The context
+	// it gets ends once the connection is set up, so the connection mustn't
+	// depend on it.
 	Dialer DialFunc
 
 	// Logger, if set, logs each connection's lifecycle and CONNECTs that
@@ -128,7 +130,7 @@ func (c *ClientConfig) applyDefaults() {
 	if c.MaxReceiveBufferPerConn == 0 {
 		c.MaxReceiveBufferPerConn = 8 << 20
 	}
-	if c.ConnectTimeout == 0 {
+	if c.ConnectTimeout <= 0 {
 		c.ConnectTimeout = 15 * time.Second
 	}
 }

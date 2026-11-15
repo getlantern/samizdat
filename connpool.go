@@ -2,6 +2,7 @@ package samizdat
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -16,6 +17,14 @@ type connPool struct {
 	createFunc  func(ctx context.Context) (*h2Transport, error)
 	closed      bool
 	closeCh     chan struct{}
+	// dialing is the transport being created, if any. One is created at a
+	// time: when many CONNECTs find no capacity at once, a burst of TLS
+	// handshakes to one server is conspicuous and costly to it, and the first
+	// new connection can usually carry them all.
+	dialing *dialAttempt
+	// onWait, if set, is called each time a caller starts waiting on a
+	// creation; tests use it to know who is waiting.
+	onWait func()
 }
 
 // newConnPool creates a connection pool that creates new transports via createFunc.
@@ -38,40 +47,95 @@ func newConnPool(maxStreams int, idleTimeout time.Duration, createFunc func(ctx 
 // must open a tunnel on it with openReserved.
 func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 	p.mu.Lock()
-
-	if p.closed {
-		p.mu.Unlock()
-		return nil, context.Canceled
-	}
-
-	// Find an existing transport with capacity
-	for _, t := range p.transports {
-		if !t.isClosed() && t.tryReserve() {
+	for {
+		if p.closed {
 			p.mu.Unlock()
-			return t, nil
+			return nil, context.Canceled
 		}
-	}
 
-	p.mu.Unlock()
+		// Find an existing transport with capacity
+		for _, t := range p.transports {
+			if !t.isClosed() && t.tryReserve() {
+				p.mu.Unlock()
+				return t, nil
+			}
+		}
 
-	// Create a new transport
-	t, err := p.createFunc(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	p.mu.Lock()
-	if p.closed {
-		// Closed while this one was dialing: close would never reach it.
+		// Wait for a transport to be created, and look again. The creation
+		// is shared, so it runs apart from whichever caller started it: one
+		// that gives up mustn't throw away the handshake the others wait on.
+		a := p.dialing
+		if a == nil {
+			a = &dialAttempt{done: make(chan struct{})}
+			p.dialing = a
+			go p.dial(context.WithoutCancel(ctx), a)
+		}
 		p.mu.Unlock()
-		t.closeWithReason("client closed")
-		return nil, context.Canceled
+		if p.onWait != nil {
+			p.onWait()
+		}
+		select {
+		case <-a.done:
+		case <-p.closeCh:
+			return nil, context.Canceled
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if a.err != nil {
+			// Every caller waiting on a failed creation fails with it at
+			// once, rather than each trying in turn against a server that
+			// isn't answering.
+			return nil, a.err
+		}
+		p.mu.Lock()
 	}
-	t.activeStreams.Add(1)
-	p.transports = append(p.transports, t)
-	p.mu.Unlock()
+}
 
-	return t, nil
+// dialAttempt is the creation of a transport that callers finding no
+// capacity wait on.
+type dialAttempt struct {
+	done chan struct{}
+	// err is the creation's error, set before done is closed.
+	err error
+}
+
+// dial creates a transport for a and adds it to the pool.
+func (p *connPool) dial(ctx context.Context, a *dialAttempt) {
+	// Closing the pool ends the dial: nothing will use what it makes.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-p.closeCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	var t *h2Transport
+	defer func() {
+		if r := recover(); r != nil {
+			a.err = fmt.Errorf("samizdat: creating transport: %v", r)
+		}
+		var orphan *h2Transport
+		p.mu.Lock()
+		if a.err == nil {
+			if p.closed {
+				// Closed while this one was dialing: close would never
+				// reach it.
+				orphan = t
+				a.err = context.Canceled
+			} else {
+				p.transports = append(p.transports, t)
+			}
+		}
+		p.dialing = nil
+		close(a.done)
+		p.mu.Unlock()
+		if orphan != nil {
+			orphan.closeWithReason("client closed")
+		}
+	}()
+	t, a.err = p.createFunc(ctx)
 }
 
 // cleanupLoop periodically removes closed and idle transports.

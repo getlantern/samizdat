@@ -179,6 +179,15 @@ func (c *Client) Close() error {
 // createTransport creates a new TLS+H2 connection to the server with
 // Reality-style auth embedded in the ClientHello.
 func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
+	// ConnectTimeout bounds the TCP and TLS setup, whatever the caller's
+	// deadline: the pool creates one transport at a time, so one stuck in a
+	// handshake would leave every CONNECT waiting on it. HTTP/2 adds no
+	// handshake to bound: x/net writes its preface without waiting for the
+	// server, and the first CONNECT then waits for its response under its
+	// own context. The shaping schedule that follows is bounded by
+	// shapingTimeout.
+	ctx, cancel := context.WithTimeout(ctx, c.config.ConnectTimeout)
+	defer cancel()
 	start := time.Now()
 	uConn, err := c.dialConn(ctx)
 	if err != nil {
