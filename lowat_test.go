@@ -46,3 +46,13 @@ func TestNotSentLowat(t *testing.T) {
 		t.Fatalf("TCP_NOTSENT_LOWAT is %d (%v), want %d", got, err, cfg.NotSentLowat)
 	}
 }
+
+// TestNotSentLowatDisabled: a negative NotSentLowat leaves the kernel's
+// default.
+func TestNotSentLowatDisabled(t *testing.T) {
+	cfg := ServerConfig{NotSentLowat: -1}
+	cfg.applyDefaults()
+	if cfg.NotSentLowat != -1 {
+		t.Fatalf("NotSentLowat %d after defaults, want -1 kept", cfg.NotSentLowat)
+	}
+}

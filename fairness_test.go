@@ -121,9 +121,13 @@ func TestLeanNewStreamNotBehindDownload(t *testing.T) {
 			break
 		}
 	}
-	// One chunk the writer may be sending and one turn of the download,
-	// beyond what the kernel held when the stream opened.
-	if limit := 2*leanWriteChunk + 32<<10; bulkBefore-inKernel > limit {
+	// Beyond what the kernel held when the stream opened, the download
+	// sends only what flows while the new stream's handler starts, which the
+	// client, reading as fast as loopback allows, sees as bytes: tens of
+	// KiB, a few hundred under the race detector. Sent behind everything
+	// queued, as one FIFO buffer did, it was the buffer's 512KiB more.
+	// TestLeanFullBufferNewStreamTakesTurn checks the writer's turns exactly.
+	if limit := leanMaxWriteBuffer - 64<<10; bulkBefore-inKernel > limit {
 		t.Fatalf("the new stream's response came after %d bytes of the download, %d of them held by the kernel; want at most %d more",
 			bulkBefore, inKernel, limit)
 	}

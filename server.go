@@ -326,9 +326,6 @@ func (s *Server) untrackSession(conn net.Conn) {
 // 4. If auth fails: masquerade (forward to real domain)
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
-	if s.config.NotSentLowat > 0 {
-		setNotSentLowat(conn, s.config.NotSentLowat)
-	}
 
 	// Set initial read deadline for the ClientHello
 	conn.SetReadDeadline(time.Now().Add(time.Duration(clientHelloTimeout.Load())))
@@ -402,6 +399,12 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 		return
 	}
 	defer s.untrackSession(conn)
+
+	// Only now: a connection passed to the cover site keeps the kernel's
+	// default, as the cover site's own connections have.
+	if s.config.NotSentLowat > 0 {
+		setNotSentLowat(conn, s.config.NotSentLowat)
+	}
 
 	// Create a connection that replays the ClientHello record first,
 	// then reads from the real connection

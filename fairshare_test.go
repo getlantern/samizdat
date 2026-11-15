@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/net/http2"
 )
@@ -17,8 +18,8 @@ func TestLeanStreamShareCapped(t *testing.T) {
 	for st.roomLocked() > 0 {
 		st.queueDataLocked(0, make([]byte, min(st.roomLocked(), 16<<10)))
 	}
-	if len(st.out) > leanMaxStreamQueue {
-		t.Fatalf("one stream queued %d bytes, over its share of %d", len(st.out), leanMaxStreamQueue)
+	if st.outLen() > leanMaxStreamQueue {
+		t.Fatalf("one stream queued %d bytes, over its share of %d", st.outLen(), leanMaxStreamQueue)
 	}
 	other := &leanStream{c: c, id: 3}
 	if other.roomLocked() <= 0 {
@@ -43,8 +44,8 @@ func TestLeanErrorResetDropsQueuedData(t *testing.T) {
 	st.queueDataLocked(0, make([]byte, 300))
 	c.connSendWin -= 300
 	c.resetStreamLocked(st, http2.ErrCodeCancel)
-	if len(st.out) != 0 || c.dataQueued != 0 {
-		t.Fatalf("queued data survived the reset: out=%d queued=%d", len(st.out), c.dataQueued)
+	if st.outLen() != 0 || c.dataQueued != 0 {
+		t.Fatalf("queued data survived the reset: out=%d queued=%d", st.outLen(), c.dataQueued)
 	}
 	if c.connSendWin != 1000 {
 		t.Fatalf("connection credit %d after the reset, want 1000 back", c.connSendWin)
@@ -66,7 +67,7 @@ func TestLeanGracefulResetFollowsData(t *testing.T) {
 	if len(c.wbuf) != 0 {
 		t.Fatal("the RST_STREAM went ahead of the response's data")
 	}
-	fr := http2.NewFramer(nil, bytes.NewReader(st.out))
+	fr := http2.NewFramer(nil, bytes.NewReader(st.out[st.outOff:]))
 	if f, _ := fr.ReadFrame(); f == nil || f.Header().Type != http2.FrameData {
 		t.Fatalf("first frame %v, want the DATA", f)
 	}
@@ -75,15 +76,17 @@ func TestLeanGracefulResetFollowsData(t *testing.T) {
 	}
 }
 
-// TestLeanSettingsAckFollowsData: data queued under the client's old
-// settings goes out ahead of the acknowledgement of its new ones.
+// TestLeanSettingsAckFollowsData: data queued under a larger maximum frame
+// size goes out ahead of the acknowledgement of a smaller one.
 func TestLeanSettingsAckFollowsData(t *testing.T) {
 	c := newTestLeanConn()
 	st := &leanStream{c: c, id: 1, cond: sync.NewCond(&c.mu), roomCond: sync.NewCond(&c.mu)}
 	c.peerInitWin = 65535
-	c.peerMaxFrame = 16384
+	c.peerMaxFrame = 32768
 	st.queueDataLocked(0, []byte("old"))
-	f, err := http2.NewFramer(nil, bytes.NewReader(appendSettings(nil, []http2.Setting{{ID: http2.SettingMaxFrameSize, Val: 32768}}))).ReadFrame()
+	// A smaller maximum frame size: frames queued under the old one may be
+	// too large for the new.
+	f, err := http2.NewFramer(nil, bytes.NewReader(appendSettings(nil, []http2.Setting{{ID: http2.SettingMaxFrameSize, Val: 16384}}))).ReadFrame()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,5 +102,142 @@ func TestLeanSettingsAckFollowsData(t *testing.T) {
 	}
 	if c.dataQueued != 0 || len(c.sched) != 0 {
 		t.Fatal("data stayed queued after the flush")
+	}
+}
+
+func newTestLeanStream(c *leanConn, id uint32) *leanStream {
+	st := &leanStream{c: c, id: id, cancel: func() {}, cond: sync.NewCond(&c.mu), roomCond: sync.NewCond(&c.mu), sendWin: 1 << 30}
+	c.streams[id] = st
+	return st
+}
+
+// TestLeanClientResetFreesRoom: a stream waiting for room in the write
+// buffer is woken when the client resets the streams holding it, though the
+// writer, with nothing left to send, takes nothing.
+func TestLeanClientResetFreesRoom(t *testing.T) {
+	c := newTestLeanConn()
+	c.connSendWin = 1 << 30
+	var bulk []*leanStream
+	for i := range leanMaxWriteBuffer / leanMaxStreamQueue {
+		st := newTestLeanStream(c, uint32(2*i+1))
+		for st.roomLocked() > 0 {
+			st.queueDataLocked(0, make([]byte, min(st.roomLocked(), 16<<10)))
+		}
+		bulk = append(bulk, st)
+	}
+	waiter := newTestLeanStream(c, 99)
+	if waiter.roomLocked() > 0 {
+		t.Fatal("the full buffer left room for another stream")
+	}
+	done := make(chan error, 1)
+	go func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		done <- waiter.waitForRoom(16 << 10)
+	}()
+	for {
+		c.mu.Lock()
+		waiting := waiter.waitingRoom
+		c.mu.Unlock()
+		if waiting {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	c.mu.Lock()
+	for _, st := range bulk {
+		st.markResetLocked()
+		c.dropOutLocked(st)
+	}
+	c.mu.Unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a stream waiting for room stayed waiting after the client reset the streams holding it")
+	}
+}
+
+// TestLeanStreamClosedFollowsQueuedFrames: a RST_STREAM(STREAM_CLOSED) for
+// a finished stream still sending follows the frames it queued.
+func TestLeanStreamClosedFollowsQueuedFrames(t *testing.T) {
+	c := newTestLeanConn()
+	st := newTestLeanStream(c, 1)
+	st.queueDataLocked(http2.FlagDataEndStream, []byte("bye"))
+	st.removed = true
+	delete(c.streams, 1)
+	c.closedOut = map[uint32]*leanStream{1: st}
+	c.rstLocked(1, http2.ErrCodeStreamClosed)
+	if len(c.wbuf) != 0 {
+		t.Fatal("the RST_STREAM went ahead of the finished stream's data")
+	}
+	fr := http2.NewFramer(nil, bytes.NewReader(st.out[st.outOff:]))
+	if f, _ := fr.ReadFrame(); f == nil || f.Header().Type != http2.FrameData {
+		t.Fatalf("first frame %v, want the DATA", f)
+	}
+	if f, _ := fr.ReadFrame(); f == nil || f.Header().Type != http2.FrameRSTStream {
+		t.Fatalf("second frame %v, want the RST_STREAM", f)
+	}
+}
+
+// TestLeanFullBufferNewStreamTakesTurn: with every share of the buffer
+// taken by downloads, a new stream's data still goes out within a turn of
+// the writer, rather than after the downloads drain.
+func TestLeanFullBufferNewStreamTakesTurn(t *testing.T) {
+	c := newTestLeanConn()
+	c.connSendWin = 1 << 30
+	for i := range leanMaxWriteBuffer / leanMaxStreamQueue {
+		st := newTestLeanStream(c, uint32(2*i+1))
+		for st.roomLocked() > 0 {
+			st.queueDataLocked(0, make([]byte, min(st.roomLocked(), 16<<10)))
+		}
+	}
+	// The writer takes a round, which frees room; the new stream queues
+	// into it, then the bulk streams refill theirs.
+	c.takeDataLocked()
+	small := newTestLeanStream(c, 99)
+	if small.roomLocked() <= 0 {
+		t.Fatal("no room for a new stream after the writer took a round")
+	}
+	small.queueDataLocked(0, []byte("hello"))
+	sent := 0
+	for range 2 * len(c.sched) {
+		b := c.takeDataLocked()
+		for fr := http2.NewFramer(nil, bytes.NewReader(b)); ; {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				break
+			}
+			if f.Header().StreamID == 99 {
+				if sent > 2*leanWriteChunk {
+					t.Fatalf("the new stream's data went out after %d bytes of the others'", sent)
+				}
+				return
+			}
+			sent += int(f.Header().Length)
+		}
+	}
+	t.Fatal("the new stream's data never went out")
+}
+
+// TestLeanSettingsKeepTurns: settings that leave queued frames valid don't
+// move the streams' data ahead of the frames that jump the line.
+func TestLeanSettingsKeepTurns(t *testing.T) {
+	c := newTestLeanConn()
+	st := newTestLeanStream(c, 1)
+	c.peerInitWin = 65535
+	c.peerMaxFrame = 16384
+	st.queueDataLocked(0, []byte("data"))
+	f, err := http2.NewFramer(nil, bytes.NewReader(appendSettings(nil, []http2.Setting{{ID: http2.SettingMaxFrameSize, Val: 32768}}))).ReadFrame()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.handleSettings(f.(*http2.SettingsFrame)); err != nil {
+		t.Fatal(err)
+	}
+	if c.dataQueued == 0 {
+		t.Fatal("a larger maximum frame size flushed the streams' data into the ordered frames")
 	}
 }
