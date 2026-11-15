@@ -22,6 +22,9 @@ type connPool struct {
 	// handshakes to one server is conspicuous and costly to it, and the first
 	// new connection can usually carry them all.
 	dialing *dialAttempt
+	// onWait, if set, is called each time a caller starts waiting on a
+	// creation; tests use it to know who is waiting.
+	onWait func()
 }
 
 // newConnPool creates a connection pool that creates new transports via createFunc.
@@ -68,6 +71,9 @@ func (p *connPool) getTransport(ctx context.Context) (*h2Transport, error) {
 			go p.dial(context.WithoutCancel(ctx), a)
 		}
 		p.mu.Unlock()
+		if p.onWait != nil {
+			p.onWait()
+		}
 		select {
 		case <-a.done:
 		case <-p.closeCh:

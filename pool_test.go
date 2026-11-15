@@ -13,6 +13,23 @@ import (
 	"time"
 )
 
+// countWaiters returns pool's count of callers that have started waiting on a
+// creation, and a function that blocks until it reaches n.
+func countWaiters(t *testing.T, pool *connPool) func(n int32) {
+	var waiting atomic.Int32
+	pool.onWait = func() { waiting.Add(1) }
+	return func(n int32) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for waiting.Load() < n {
+			if time.Now().After(deadline) {
+				t.Fatalf("%d callers waiting, want %d", waiting.Load(), n)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 // TestPoolCreatesOneTransportAtATime: CONNECTs that find no capacity at once
 // share the one transport being created rather than each dialing its own.
 func TestPoolCreatesOneTransportAtATime(t *testing.T) {
@@ -24,6 +41,7 @@ func TestPoolCreatesOneTransportAtATime(t *testing.T) {
 		return newTestTransport(okRoundTripper()), nil
 	})
 	defer pool.close()
+	waitFor := countWaiters(t, pool)
 
 	var wg sync.WaitGroup
 	for range 20 {
@@ -35,7 +53,7 @@ func TestPoolCreatesOneTransportAtATime(t *testing.T) {
 			}
 		}()
 	}
-	time.Sleep(50 * time.Millisecond)
+	waitFor(20)
 	close(release)
 	wg.Wait()
 	if n := creates.Load(); n != 1 {
@@ -57,6 +75,7 @@ func TestPoolFailedCreateFailsWaiters(t *testing.T) {
 		return newTestTransport(okRoundTripper()), nil
 	})
 	defer pool.close()
+	waitFor := countWaiters(t, pool)
 
 	errs := make(chan error, 5)
 	for range 5 {
@@ -65,7 +84,7 @@ func TestPoolFailedCreateFailsWaiters(t *testing.T) {
 			errs <- err
 		}()
 	}
-	time.Sleep(20 * time.Millisecond)
+	waitFor(5)
 	close(first)
 	for range 5 {
 		if err := <-errs; err == nil || err.Error() != "dial failed" {
@@ -91,6 +110,7 @@ func TestPoolCreateOutlivesItsStarter(t *testing.T) {
 		return newTestTransport(okRoundTripper()), nil
 	})
 	defer pool.close()
+	waitFor := countWaiters(t, pool)
 
 	starter, cancel := context.WithCancel(context.Background())
 	started := make(chan error, 1)
@@ -98,13 +118,13 @@ func TestPoolCreateOutlivesItsStarter(t *testing.T) {
 		_, err := pool.getTransport(starter)
 		started <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	waitFor(1)
 	waited := make(chan error, 1)
 	go func() {
 		_, err := pool.getTransport(context.Background())
 		waited <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	waitFor(2)
 	cancel()
 	if err := <-started; !errors.Is(err, context.Canceled) {
 		t.Fatalf("the starter got %v, want its own cancellation", err)
@@ -129,16 +149,15 @@ func TestPoolCloseWakesWaiters(t *testing.T) {
 		<-release
 		return nil, errors.New("closed")
 	})
+	waitFor := countWaiters(t, pool)
 	go pool.getTransport(context.Background())
-	for creates.Load() == 0 {
-		time.Sleep(time.Millisecond)
-	}
+	waitFor(1)
 	waited := make(chan error, 1)
 	go func() {
 		_, err := pool.getTransport(context.Background())
 		waited <- err
 	}()
-	time.Sleep(20 * time.Millisecond)
+	waitFor(2)
 	pool.close()
 	select {
 	case err := <-waited:
