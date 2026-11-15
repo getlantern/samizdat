@@ -53,7 +53,11 @@ const (
 	// write buffer, which on a slow link is seconds of a bulk download. No
 	// DATA frame carries more, whatever frame size the client accepts, so
 	// one frame can't make a chunk much larger.
-	leanWriteChunk     = 64 << 10
+	leanWriteChunk = 64 << 10
+	// leanMaxStreamQueue caps one stream's share of the write buffer, so a
+	// stream with a download to send can't keep the buffer full and a new
+	// stream waiting for room.
+	leanMaxStreamQueue = 64 << 10
 	leanReadBuffer     = 32 << 10
 	leanFrameHeaderLen = 9
 	leanMaxWindow      = 1<<31 - 1 // the largest a flow-control window may grow
@@ -165,8 +169,21 @@ type leanConn struct {
 	mu    sync.Mutex
 	wcond *sync.Cond
 
-	wbuf  []byte // stream frames queued for the writer, and RST_STREAM and GOAWAY
+	// wbuf holds the frames whose order on the connection matters: HEADERS,
+	// whose HPACK encoding follows the order they're queued in, and
+	// RST_STREAM, GOAWAY and the SETTINGS acknowledgement. The writer sends
+	// them ahead of the streams' DATA, so a new stream's response goes out
+	// at once rather than behind the data the other streams have queued.
+	wbuf  []byte
 	spare []byte // the writer's previous buffer, for reuse
+	// sched holds the streams with DATA queued in their out buffers, in the
+	// order the writer serves them: a chunk from each in turn, so a stream
+	// with a little to send isn't left behind one with a download's worth.
+	// dataQueued counts the bytes queued in all of them, and dspare is the
+	// writer's previous chunk of them, for reuse.
+	sched      []*leanStream
+	dataQueued int
+	dspare     []byte
 	// cbuf holds the control frames that have no place in the order of the
 	// frames in wbuf (PING acknowledgements, WINDOW_UPDATE, the first
 	// SETTINGS). The writer sends them ahead of wbuf, as x/net's server sends
@@ -356,6 +373,7 @@ func (c *leanConn) handleFrame(f http2.Frame) error {
 		}
 		if st := c.streams[f.StreamID]; st != nil && !st.reset {
 			st.markResetLocked()
+			c.dropOutLocked(st)
 			st.wakeLocked()
 			st.cancel()
 		}
@@ -417,6 +435,8 @@ func (c *leanConn) handleSettings(f *http2.SettingsFrame) error {
 	// client's previous settings: sent ahead of them, it would tell the
 	// client that frames sized or encoded for the old settings follow the
 	// new ones.
+	// The streams' DATA goes ahead of it too.
+	c.flushDataLocked()
 	c.wbuf = appendFrameHeader(c.wbuf, 0, http2.FrameSettings, http2.FlagSettingsAck, 0)
 	return c.queuedControlFrame()
 }
@@ -636,6 +656,7 @@ func (c *leanConn) resetStreamLocked(st *leanStream, code http2.ErrCode) {
 		return
 	}
 	st.markResetLocked()
+	c.dropOutLocked(st)
 	c.wbuf = appendRSTStream(c.wbuf, st.id, code)
 	c.queued()
 	st.wakeLocked()
@@ -649,17 +670,20 @@ func (c *leanConn) writeLoop() {
 	// cur is what's left to send of taken, the buffer the writer last took
 	// from wbuf.
 	var cur, taken []byte
+	// takenData is set while taken is a chunk of the streams' DATA rather
+	// than wbuf.
+	takenData := false
 	for {
 		c.mu.Lock()
-		if len(cur) == 0 && len(c.wbuf) == 0 && len(c.cbuf) == 0 && !c.closed {
+		if len(cur) == 0 && len(c.wbuf) == 0 && len(c.cbuf) == 0 && c.dataQueued == 0 && !c.closed {
 			c.writerIdle = true
 			c.scheduleTrimLocked()
-			for len(c.wbuf) == 0 && len(c.cbuf) == 0 && !c.closed {
+			for len(c.wbuf) == 0 && len(c.cbuf) == 0 && c.dataQueued == 0 && !c.closed {
 				c.wcond.Wait()
 			}
 			c.writerIdle = false
 		}
-		if len(cur) == 0 && len(c.wbuf) == 0 && len(c.cbuf) == 0 {
+		if len(cur) == 0 && len(c.wbuf) == 0 && len(c.cbuf) == 0 && (c.dataQueued == 0 || c.closed) {
 			c.mu.Unlock()
 			close(c.writerDone)
 			return
@@ -670,13 +694,23 @@ func (c *leanConn) writeLoop() {
 			c.cbuf, c.cspare = c.cspare[:0], nil
 			c.queuedPriority = 0
 		}
+		tookAny := false
 		if len(cur) == 0 && len(c.wbuf) > 0 {
 			taken = c.wbuf
 			cur = taken
+			takenData = false
 			c.wbuf, c.spare = c.spare[:0], nil
 			// Only now: the control frames in wbuf stay queued, and counted,
 			// while the writer works through the buffer it took before.
 			c.queuedControl = 0
+			tookAny = true
+		} else if len(cur) == 0 && c.dataQueued > 0 {
+			taken = c.takeDataLocked()
+			cur = taken
+			takenData = true
+			tookAny = true
+		}
+		if tookAny {
 			for _, st := range c.roomWaiters {
 				st.waitingRoom = false
 				st.roomCond.Broadcast()
@@ -714,7 +748,11 @@ func (c *leanConn) writeLoop() {
 			c.cspare = ctl[:0]
 		}
 		if len(cur) == 0 && taken != nil {
-			if c.spare == nil {
+			if takenData {
+				if c.dspare == nil {
+					c.dspare = taken[:0]
+				}
+			} else if c.spare == nil {
 				c.spare = taken[:0]
 			}
 			taken = nil
@@ -799,7 +837,7 @@ func (c *leanConn) close() {
 // writer stays idle for leanIdleTrimDelay, when there's anything to trim.
 // c.mu must be held.
 func (c *leanConn) scheduleTrimLocked() {
-	if cap(c.wbuf) <= leanIdleBufKeep && cap(c.spare) <= leanIdleBufKeep &&
+	if cap(c.wbuf) <= leanIdleBufKeep && cap(c.spare) <= leanIdleBufKeep && cap(c.dspare) <= leanIdleBufKeep &&
 		cap(c.cbuf) <= leanIdleBufKeep && cap(c.cspare) <= leanIdleBufKeep && !c.bc.overKeep(leanIdleBufKeep) {
 		return
 	}
@@ -815,8 +853,11 @@ func (c *leanConn) scheduleTrimLocked() {
 func (c *leanConn) trimIfIdle() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.writerIdle || len(c.wbuf) > 0 || len(c.cbuf) > 0 {
+	if !c.writerIdle || len(c.wbuf) > 0 || len(c.cbuf) > 0 || c.dataQueued > 0 {
 		return
+	}
+	if cap(c.dspare) > leanIdleBufKeep {
+		c.dspare = nil
 	}
 	if cap(c.cbuf) > leanIdleBufKeep {
 		c.cbuf = nil
@@ -837,7 +878,7 @@ func (c *leanConn) trimIfIdle() {
 // or the connection ends. c.mu must be held.
 func (st *leanStream) waitForRoom() error {
 	c := st.c
-	for len(c.wbuf) >= leanMaxWriteBuffer && !c.closed && !st.reset {
+	for st.roomLocked() <= 0 && !c.closed && !st.reset {
 		st.awaitRoomLocked()
 	}
 	if c.closed {
@@ -857,6 +898,90 @@ func (st *leanStream) awaitRoomLocked() {
 		st.c.roomWaiters = append(st.c.roomWaiters, st)
 	}
 	st.roomCond.Wait()
+}
+
+// roomLocked returns how much DATA payload st may queue now: what's left of
+// both the write buffer and st's share of it, less a frame header. c.mu must
+// be held.
+func (st *leanStream) roomLocked() int {
+	c := st.c
+	return min(leanMaxWriteBuffer-len(c.wbuf)-c.dataQueued, leanMaxStreamQueue-len(st.out)) - leanFrameHeaderLen
+}
+
+// queueDataLocked queues a DATA frame carrying payload for the writer, in
+// st's turn among the streams. c.mu must be held.
+func (st *leanStream) queueDataLocked(flags http2.Flags, payload []byte) {
+	c := st.c
+	n := len(st.out)
+	st.out = appendFrameHeader(st.out, len(payload), http2.FrameData, flags, st.id)
+	st.out = append(st.out, payload...)
+	c.dataQueued += len(st.out) - n
+	if !st.inSched {
+		st.inSched = true
+		c.sched = append(c.sched, st)
+	}
+	c.queued()
+}
+
+// dropOutLocked discards st's queued frames, when st is reset with an error:
+// the client wants nothing more on it. The connection's send credit they
+// took is returned. c.mu must be held.
+func (c *leanConn) dropOutLocked(st *leanStream) {
+	for b := st.out; len(b) >= leanFrameHeaderLen; {
+		n := int(b[0])<<16 | int(b[1])<<8 | int(b[2])
+		if http2.FrameType(b[3]) == http2.FrameData {
+			c.connSendWin += int64(n)
+		}
+		b = b[leanFrameHeaderLen+n:]
+	}
+	c.dataQueued -= len(st.out)
+	st.out = st.out[:0]
+	for _, w := range c.connWaiters {
+		w.waitingConn = false
+		w.cond.Broadcast()
+	}
+	clear(c.connWaiters)
+	c.connWaiters = c.connWaiters[:0]
+}
+
+// flushDataLocked moves every stream's queued frames into wbuf, for a frame
+// that must follow them. c.mu must be held.
+func (c *leanConn) flushDataLocked() {
+	for _, st := range c.sched {
+		c.wbuf = append(c.wbuf, st.out...)
+		st.out = st.out[:0]
+		st.inSched = false
+	}
+	clear(c.sched)
+	c.sched = c.sched[:0]
+	c.dataQueued = 0
+}
+
+// takeDataLocked takes the next stream's next chunk of frames, and puts the
+// stream back at the end of the line if it has more. c.mu must be held.
+func (c *leanConn) takeDataLocked() []byte {
+	for len(c.sched) > 0 {
+		st := c.sched[0]
+		c.sched[0] = nil
+		c.sched = c.sched[1:]
+		if len(st.out) == 0 {
+			st.inSched = false
+			continue
+		}
+		chunk := leanChunk(st.out)
+		taken := append(c.dspare[:0], chunk...)
+		c.dspare = nil
+		st.out = st.out[len(chunk):]
+		c.dataQueued -= len(chunk)
+		if len(st.out) > 0 {
+			c.sched = append(c.sched, st)
+		} else {
+			st.out = st.out[:0]
+			st.inSched = false
+		}
+		return taken
+	}
+	return nil
 }
 
 // awaitCreditLocked waits for send credit on st or the connection, or for st
@@ -894,6 +1019,11 @@ type leanStream struct {
 	draining bool
 	closed   bool // the handler closed the stream, or the drain ended
 	removed  bool // finish took the stream out of c.streams
+	// out holds st's DATA frames the writer hasn't taken, and a
+	// RST_STREAM(NO_ERROR) that must follow them; inSched is set while st is
+	// in c.sched.
+	out     []byte
+	inSched bool
 	// waitingRoom is set while st is in c.roomWaiters.
 	waitingRoom bool
 	// waitingConn is set while st is in c.connWaiters.
@@ -1177,8 +1307,7 @@ func (st *leanStream) endLocked(body []byte) {
 		if last {
 			flags = http2.FlagDataEndStream
 		}
-		c.wbuf = appendFrameHeader(c.wbuf, n, http2.FrameData, flags, st.id)
-		c.wbuf = append(c.wbuf, body[:n]...)
+		st.queueDataLocked(flags, body[:n])
 		st.sendWin -= int64(n)
 		c.connSendWin -= int64(n)
 		body = body[n:]
@@ -1195,9 +1324,18 @@ func (st *leanStream) endLocked(body []byte) {
 // held.
 func (st *leanStream) resetIfOpenLocked() {
 	if !st.remoteDone {
-		st.c.wbuf = appendRSTStream(st.c.wbuf, st.id, http2.ErrCodeNo)
+		c := st.c
+		if len(st.out) > 0 {
+			// Behind the end of the response, which it would otherwise
+			// overtake and cut off.
+			n := len(st.out)
+			st.out = appendRSTStream(st.out, st.id, http2.ErrCodeNo)
+			c.dataQueued += len(st.out) - n
+		} else {
+			c.wbuf = appendRSTStream(c.wbuf, st.id, http2.ErrCodeNo)
+		}
 		st.markResetLocked()
-		st.c.queued()
+		c.queued()
 	}
 }
 
@@ -1346,7 +1484,7 @@ func (sc *leanStreamConn) Write(b []byte) (int, error) {
 			if c.closed {
 				return written, errLeanConnClosed
 			}
-			if len(c.wbuf)+leanFrameHeaderLen >= leanMaxWriteBuffer {
+			if st.roomLocked() <= 0 {
 				st.awaitRoomLocked()
 				continue
 			}
@@ -1357,11 +1495,9 @@ func (sc *leanStreamConn) Write(b []byte) (int, error) {
 			break
 		}
 		// Bounded by the buffer's room too, so one large frame can't carry
-		// the buffer far past leanMaxWriteBuffer.
-		room := leanMaxWriteBuffer - len(c.wbuf) - leanFrameHeaderLen
-		n := min(len(b)-written, c.peerMaxFrame, leanWriteChunk, int(st.sendWin), int(c.connSendWin), room)
-		c.wbuf = appendFrameHeader(c.wbuf, n, http2.FrameData, 0, st.id)
-		c.wbuf = append(c.wbuf, b[written:written+n]...)
+		// the buffer, or st's share of it, far past its limit.
+		n := min(len(b)-written, c.peerMaxFrame, leanWriteChunk, int(st.sendWin), int(c.connSendWin), st.roomLocked())
+		st.queueDataLocked(0, b[written:written+n])
 		st.sendWin -= int64(n)
 		c.connSendWin -= int64(n)
 		written += n

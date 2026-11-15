@@ -326,6 +326,9 @@ func (s *Server) untrackSession(conn net.Conn) {
 // 4. If auth fails: masquerade (forward to real domain)
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
+	if s.config.NotSentLowat > 0 {
+		setNotSentLowat(conn, s.config.NotSentLowat)
+	}
 
 	// Set initial read deadline for the ClientHello
 	conn.SetReadDeadline(time.Now().Add(time.Duration(clientHelloTimeout.Load())))
