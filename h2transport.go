@@ -276,7 +276,9 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		// each getTransport until a later cleanup tick, producing sustained
 		// error bursts.
 		switch {
-		case stalled.Load():
+		case stalled.Load() || !stallArmed:
+			// stallArmed is false as soon as the stall fires, before
+			// stalled may be set.
 			t.retireWithReason("CONNECT unanswered for " + connectStall.String())
 			if ctx.Err() == nil {
 				err = fmt.Errorf("%w: %v", errConnUnusable, err)

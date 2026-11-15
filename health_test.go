@@ -3,6 +3,8 @@ package samizdat
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
 	"errors"
 	"io"
 	"log/slog"
@@ -608,5 +610,36 @@ func TestPoolCloseWakesWaiters(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("closing the pool left a waiter blocked")
+	}
+}
+
+// TestTransportSetupBoundedByConnectTimeout: a server that accepts the TCP
+// connection and never answers the TLS handshake fails the setup after
+// ConnectTimeout, even for a caller with no deadline, so the pool's one
+// create at a time can't wedge every CONNECT behind it.
+func TestTransportSetupBoundedByConnectTimeout(t *testing.T) {
+	key, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{config: ClientConfig{
+		ServerAddr:     "example.com:443",
+		ServerName:     "example.com",
+		PublicKey:      key.PublicKey().Bytes(),
+		ConnectTimeout: 100 * time.Millisecond,
+		Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+			c1, c2 := net.Pipe()
+			t.Cleanup(func() { c1.Close(); c2.Close() })
+			go io.Copy(io.Discard, c2)
+			return c1, nil
+		},
+	}}
+	c.config.applyDefaults()
+	start := time.Now()
+	if _, err := c.createTransport(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("setup against a server that never answers returned %v, want a deadline error", err)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("setup took %v, want about ConnectTimeout", took)
 	}
 }
