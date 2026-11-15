@@ -184,8 +184,17 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 		conn = newShapedConn(uConn, sched, true, marker, false)
 	}
 
-	// Create H2 transport over the TLS connection
+	// Create H2 transport over the TLS connection. It writes the HTTP/2
+	// preface at once, so the caller giving up closes the connection to
+	// end a write that blocks.
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	transport, err := newH2Transport(conn, c.config.ServerAddr, c.config.MaxStreamsPerConn)
+	if !stop() {
+		if err == nil {
+			transport.close()
+		}
+		return nil, fmt.Errorf("creating H2 transport: %w", ctx.Err())
+	}
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("creating H2 transport: %w", err)

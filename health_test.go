@@ -171,7 +171,10 @@ func TestIdleReusePings(t *testing.T) {
 // reading is alive, so it isn't closed even though its server never answers
 // the ping or the CONNECT.
 func TestReadingConnectionSurvivesUnansweredPing(t *testing.T) {
-	setVar(t, &pingIfSilent, 50*time.Millisecond)
+	// Every CONNECT pings at once, and the ping goes unanswered while the
+	// server's own frames keep arriving.
+	setVar(t, &pingIfIdle, 0)
+	setVar(t, &pingIfSilent, time.Hour)
 	setVar(t, &pingTimeout, 50*time.Millisecond)
 	setVar(t, &silentConnectRetire, time.Hour)
 	tr, _ := startQuietServer(t, 10*time.Millisecond)
