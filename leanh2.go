@@ -204,8 +204,10 @@ type leanConn struct {
 	// whose room in the write buffer it made.
 	tookFrom []*leanStream
 	// streamBufHeld is set once a stream's queue buffer grows past
-	// leanIdleStreamBufKeep, so an idle connection trims it.
-	streamBufHeld bool
+	// leanIdleStreamBufKeep, so an idle connection trims it, and
+	// drainTrimmedAt is when the writer last trimmed drained streams'.
+	streamBufHeld  bool
+	drainTrimmedAt time.Time
 	// closedOut holds the streams finished with frames still queued, so a
 	// RST_STREAM for one follows them.
 	closedOut map[uint32]*leanStream
@@ -628,10 +630,13 @@ func (c *leanConn) handleData(f *http2.DataFrame) error {
 		// give it back. A stream it already ended, or one that's gone, gets
 		// STREAM_CLOSED, as from x/net's server; a reset one has its answer.
 		c.creditConn(n)
+		// Only an answer queued in wbuf counts: one behind a finished
+		// stream's frames, or none, isn't drained by the writer's take.
 		switch {
 		case st == nil:
-			c.rstLocked(f.StreamID, http2.ErrCodeStreamClosed)
-			return c.queuedControlFrame()
+			if c.rstLocked(f.StreamID, http2.ErrCodeStreamClosed) {
+				return c.queuedControlFrame()
+			}
 		case !st.reset:
 			c.resetStreamLocked(st, http2.ErrCodeStreamClosed)
 			return c.queuedControlFrame()
@@ -680,18 +685,23 @@ func (c *leanConn) creditConn(n int64) {
 func (c *leanConn) resetStream(id uint32, code http2.ErrCode) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var queued bool
 	if st := c.streams[id]; st != nil {
-		c.resetStreamLocked(st, code)
+		queued = c.resetStreamLocked(st, code)
 	} else {
-		c.rstLocked(id, code)
+		queued = c.rstLocked(id, code)
+	}
+	if !queued {
+		return nil
 	}
 	return c.queuedControlFrame()
 }
 
-// resetStreamLocked ends st with RST_STREAM. c.mu must be held.
-func (c *leanConn) resetStreamLocked(st *leanStream, code http2.ErrCode) {
+// resetStreamLocked ends st with RST_STREAM, reporting whether it queued one:
+// a stream already reset has its answer. c.mu must be held.
+func (c *leanConn) resetStreamLocked(st *leanStream, code http2.ErrCode) bool {
 	if st.reset {
-		return
+		return false
 	}
 	st.markResetLocked()
 	c.dropOutLocked(st)
@@ -699,6 +709,7 @@ func (c *leanConn) resetStreamLocked(st *leanStream, code http2.ErrCode) {
 	c.queued()
 	st.wakeLocked()
 	st.cancel()
+	return true
 }
 
 // writeLoop sends what's queued until the connection closes: the control
@@ -744,6 +755,7 @@ func (c *leanConn) writeLoop() {
 			// Not kept past the wake: it would hold finished streams.
 			clear(c.tookFrom)
 			c.tookFrom = c.tookFrom[:0]
+			c.trimDrainedLocked(time.Now())
 		}
 		c.mu.Unlock()
 
@@ -873,6 +885,29 @@ func (c *leanConn) scheduleTrimLocked() {
 	} else {
 		c.trimTimer.Reset(leanIdleTrimDelay)
 	}
+}
+
+// trimDrainedLocked drops the queue buffers of streams that have sat empty
+// for leanBulkIdle, which the idle trim never reaches while the connection
+// stays busy. A stream refilling sooner, as a download does, keeps its
+// buffer. It looks at most once per leanBulkIdle. c.mu must be held.
+func (c *leanConn) trimDrainedLocked(now time.Time) {
+	if !c.streamBufHeld || now.Sub(c.drainTrimmedAt) < leanBulkIdle {
+		return
+	}
+	c.drainTrimmedAt = now
+	held := false
+	for _, st := range c.streams {
+		if cap(st.out) <= leanIdleStreamBufKeep {
+			continue
+		}
+		if st.outLen() == 0 && !st.drainedAt.IsZero() && now.Sub(st.drainedAt) >= leanBulkIdle {
+			st.out, st.outOff = nil, 0
+		} else {
+			held = true
+		}
+	}
+	c.streamBufHeld = held
 }
 
 // trimIfIdle drops write buffers over leanIdleBufKeep if the writer is still
@@ -1005,17 +1040,18 @@ func (st *leanStream) appendRSTLocked(code http2.ErrCode) {
 
 // rstLocked queues RST_STREAM for a stream that's gone: behind its queued
 // frames if it finished with some, which the RST_STREAM would otherwise
-// overtake. c.mu must be held.
-func (c *leanConn) rstLocked(id uint32, code http2.ErrCode) {
+// overtake. It reports whether it queued it in wbuf. c.mu must be held.
+func (c *leanConn) rstLocked(id uint32, code http2.ErrCode) bool {
 	if st := c.closedOut[id]; st != nil && st.outLen() > 0 {
 		// One answers every frame the client sends it: more would pile up
 		// outside the buffer's bound for as long as its frames wait.
 		if !st.rstQueued {
 			st.appendRSTLocked(code)
 		}
-		return
+		return false
 	}
 	c.wbuf = appendRSTStream(c.wbuf, id, code)
+	return true
 }
 
 // clearOutLocked empties st's queue, once the writer has taken it all or

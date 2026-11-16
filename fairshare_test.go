@@ -574,3 +574,59 @@ func TestLeanRefundCapped(t *testing.T) {
 		t.Fatalf("credit %d after the refund, past the largest window", c.connSendWin)
 	}
 }
+
+// TestLeanDrainedStreamBufsTrimmedWhileBusy: a stream whose queue has sat
+// empty for leanBulkIdle gives up its buffer while the connection stays
+// busy; one drained just now keeps it.
+func TestLeanDrainedStreamBufsTrimmedWhileBusy(t *testing.T) {
+	c := newTestLeanConn()
+	old, recent := newTestLeanStream(c, 1), newTestLeanStream(c, 3)
+	for _, st := range []*leanStream{old, recent} {
+		for st.roomLocked() > 0 {
+			st.queueDataLocked(0, make([]byte, min(st.roomLocked(), 16<<10)))
+		}
+	}
+	for c.dataQueued > 0 {
+		c.takeDataLocked()
+	}
+	now := time.Now()
+	old.drainedAt = now.Add(-2 * leanBulkIdle)
+	c.trimDrainedLocked(now)
+	if cap(old.out) > leanIdleStreamBufKeep {
+		t.Fatalf("a stream drained %v ago kept %d bytes of buffer", 2*leanBulkIdle, cap(old.out))
+	}
+	if cap(recent.out) <= leanIdleStreamBufKeep {
+		t.Fatal("a stream drained just now lost its buffer")
+	}
+	if !c.streamBufHeld {
+		t.Fatal("the connection forgot the buffer still held")
+	}
+}
+
+// TestLeanUnqueuedAnswersNotCounted: DATA for a finished stream whose RST
+// waits behind its own frames doesn't count toward the cap on answers the
+// writer hasn't taken, since none of it goes into wbuf.
+func TestLeanUnqueuedAnswersNotCounted(t *testing.T) {
+	c := newTestLeanConn()
+	c.lastStreamID = 1
+	c.connRecvAvail = leanConnRecvWindow
+	st := newTestLeanStream(c, 1)
+	st.queueDataLocked(http2.FlagDataEndStream, make([]byte, 1000))
+	st.removed = true
+	delete(c.streams, 1)
+	c.closedOut = map[uint32]*leanStream{1: st}
+	frame := appendFrameHeader(nil, 1, http2.FrameData, 0, 1)
+	frame = append(frame, 'x')
+	for range leanMaxQueuedControl + 10 {
+		f, err := http2.NewFramer(nil, bytes.NewReader(frame)).ReadFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.handleFrame(f); err != nil {
+			t.Fatalf("DATA for a finished stream ended the connection: %v", err)
+		}
+	}
+	if len(c.wbuf) != 0 {
+		t.Fatalf("%d bytes queued in wbuf", len(c.wbuf))
+	}
+}
