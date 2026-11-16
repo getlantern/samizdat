@@ -400,6 +400,12 @@ func (s *Server) handleAuthenticated(conn net.Conn, clientHelloRecord []byte, sh
 	}
 	defer s.untrackSession(conn)
 
+	// Only now: a connection passed to the cover site keeps the kernel's
+	// default, as the cover site's own connections have.
+	if s.config.NotSentLowat > 0 {
+		setNotSentLowat(conn, s.config.NotSentLowat)
+	}
+
 	// Create a connection that replays the ClientHello record first,
 	// then reads from the real connection
 	replayConn := newReplayConn(conn, clientHelloRecord)

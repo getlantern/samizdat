@@ -84,6 +84,10 @@ Measured against CenKL's model (first 10 packets, 800 flows, loopback): unshaped
 
 Every tunnelled connection is an HTTP/2 CONNECT stream on a pooled TLS connection carrying up to `MaxStreamsPerConn` (100) at once. The client reuses pooled connections where it can, so a censor counting TLS connections to the address sees few, though concurrent dials can open more than one. `ServerConfig.LeanH2` serves those streams with samizdat's own HTTP/2 server (`leanh2.go`), which sends the same frames as Go's x/net server but batches them into fewer TLS records and system calls: 66–90% less server CPU per GB downloaded in benchmarks ([#25](https://github.com/getlantern/samizdat/pull/25)).
 
+The streams take turns. The lean server keeps each stream's data in its own queue and sends about 16KiB of whole frames from each in turn (a larger frame goes out whole). Response headers go ahead of all of it. A new tunnel's response therefore waits behind the socket write already under way (up to 64KiB) and a turn of each running download, not behind everything the downloads have queued. `ServerConfig.NotSentLowat` (default 16KiB) sets `TCP_NOTSENT_LOWAT`, so unsent data waits in the server, where the turns apply, rather than in the kernel, where nothing can reorder it. It's a threshold rather than an exact bound. Linux holds writes back once unsent data passes it, though it can still add to a partly filled buffer. macOS applies it only to readiness.
+
+On a real 261ms path shaped to 5Mbit with 0.5% loss, a new tunnel opened while two downloads ran answered in 0.92s at the median, against 3.8s before this change. Throttled to 1.5Mbit with 1% loss, it answered in 1.9s, against 12.6s ([#38](https://github.com/getlantern/samizdat/pull/38)).
+
 ### Fragmentation
 
 - **ClientHello fragmentation** (`TCPFragmentation`): the ClientHello is written in pieces split around the SNI field, with a short random delay between them. It's best effort: a split can fall just outside the hostname, and separate writes don't guarantee separate TCP segments.
@@ -93,6 +97,7 @@ Every tunnelled connection is an HTTP/2 CONNECT stream on a pooled TLS connectio
 
 - **Timing isn't shaped.**
 - **Tunnelled TLS is still inside.** Applications using samizdat bring their own TLS. Multiplexing helps most with several concurrent streams.
+- **Streams share one TCP connection.** A lost packet holds up every stream on it until it's resent, and a new tunnel still waits for the write under way and a turn of each running download. In the test above, Shadowsocks, with one connection per tunnel, answered in 0.58s.
 - **Shaping covers 10 records.** After that, traffic is whatever the tunnelled applications send. The schedule fixes TLS record sizes; TCP can still split or merge them into packets.
 - **The model is one network's view:** one regional ISP, late 2025. Its data license is still being settled with the authors.
 - **The replay record is in memory and bounded.** A restarted server has forgotten the SessionIDs it accepted, and more than `ReplayCapacity` in one window shortens how long they're remembered.

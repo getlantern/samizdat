@@ -157,6 +157,19 @@ type ServerConfig struct {
 	// Limits
 	MaxConcurrentStreams int // per connection (default: 250)
 
+	// NotSentLowat bounds the data the kernel holds unsent on each
+	// connection, in bytes (default: 16KiB; below zero leaves the kernel's
+	// default). A tunnel's response goes out behind whatever the server has
+	// handed the kernel for the connection, so on a slow link a download
+	// left seconds of data there, ahead of every new tunnel; kept in the
+	// server instead, its queue lets each tunnel take its turn. It's set as
+	// TCP_NOTSENT_LOWAT on Linux and macOS, a threshold rather than an
+	// exact bound. Linux holds writes back once unsent data passes it,
+	// though it can still add to a partly filled buffer. macOS applies it
+	// to readiness alone, so there the kernel can still hold a send
+	// buffer's worth.
+	NotSentLowat int
+
 	// ReplayWindow is how long the server remembers an authenticated
 	// SessionID and refuses it again, sending the connection to the
 	// masquerade as if auth had failed. Each is remembered for between
@@ -220,6 +233,9 @@ func (c *ServerConfig) applyDefaults() {
 	}
 	if c.MaxConcurrentStreams == 0 {
 		c.MaxConcurrentStreams = 250
+	}
+	if c.NotSentLowat == 0 {
+		c.NotSentLowat = 16 << 10
 	}
 	if c.ReplayWindow == 0 {
 		c.ReplayWindow = 24 * time.Hour
