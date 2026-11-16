@@ -959,7 +959,8 @@ func (st *leanStream) waitForRoom(want int) error {
 }
 
 // awaitRoomLocked waits until the writer takes the write buffer, or st is
-// reset or closed. c.mu must be held.
+// reset or closed. want is DATA payload, as roomLocked counts it, so one
+// frame of that payload drained makes room for it. c.mu must be held.
 func (st *leanStream) awaitRoomLocked(want int) {
 	st.wantRoom = want
 	if !st.waitingRoom {
@@ -1522,7 +1523,7 @@ func (st *leanStream) endLocked(body []byte) {
 			if st.reset {
 				return
 			}
-			if err := st.waitForRoom(min(len(body), leanWriteChunk) + leanFrameHeaderLen); err != nil {
+			if err := st.waitForRoom(min(len(body), leanWriteChunk)); err != nil {
 				return
 			}
 			if len(body) == 0 || st.sendWin > 0 && c.connSendWin > 0 {
@@ -1742,7 +1743,7 @@ func (sc *leanStreamConn) Write(b []byte) (int, error) {
 			if st.roomLocked() <= 0 {
 				// No more than it can queue at once, or it waits for room
 				// it doesn't need while smaller writes take what's freed.
-				st.awaitRoomLocked(min(len(b)-written, c.peerMaxFrame, leanWriteChunk) + leanFrameHeaderLen)
+				st.awaitRoomLocked(min(len(b)-written, c.peerMaxFrame, leanWriteChunk))
 				continue
 			}
 			if st.sendWin <= 0 || c.connSendWin <= 0 {

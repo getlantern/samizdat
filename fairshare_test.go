@@ -548,7 +548,7 @@ func TestLeanLargeWriteWaitsForAChunk(t *testing.T) {
 		waiting, want := w.waitingRoom, w.wantRoom
 		c.mu.Unlock()
 		if waiting {
-			if limit := leanWriteChunk + leanFrameHeaderLen; want > limit {
+			if limit := leanWriteChunk; want > limit {
 				t.Errorf("a Write waits for %d bytes of room, more than the %d it can queue at once", want, limit)
 			}
 			break

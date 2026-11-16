@@ -163,9 +163,11 @@ type ServerConfig struct {
 	// handed the kernel for the connection, so on a slow link a download
 	// left seconds of data there, ahead of every new tunnel; kept in the
 	// server instead, its queue lets each tunnel take its turn. It's set as
-	// TCP_NOTSENT_LOWAT on Linux and macOS, but only Linux stops writes at
-	// the bound: macOS applies it to readiness alone, so there the kernel
-	// can still hold a send buffer's worth.
+	// TCP_NOTSENT_LOWAT on Linux and macOS, a threshold rather than an
+	// exact bound. Linux holds writes back once unsent data passes it,
+	// though it can still add to a partly filled buffer. macOS applies it
+	// to readiness alone, so there the kernel can still hold a send
+	// buffer's worth.
 	NotSentLowat int
 
 	// ReplayWindow is how long the server remembers an authenticated
