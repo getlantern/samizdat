@@ -245,8 +245,15 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		abandoned
 	)
 	var answer atomic.Int32
+	// The timer claims the CONNECT as the answer would, so one answered or
+	// given up on by its caller as the timer fires leaves the transport be.
 	answerTimeout := connectAnswerTimeout
-	answerTimer := time.AfterFunc(answerTimeout, func() { t.markDeaf(answerTimeout) })
+	answerTimer := time.AfterFunc(answerTimeout, func() {
+		if ctx.Err() == nil && answer.CompareAndSwap(waiting, abandoned) {
+			t.markDeaf(answerTimeout)
+			tunnelCancel()
+		}
+	})
 	answerDone := make(chan struct{})
 	go func() {
 		select {
