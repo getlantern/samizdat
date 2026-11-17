@@ -31,6 +31,19 @@ var discardLogger = slog.New(slog.DiscardHandler)
 // slowConnect is how long a CONNECT that succeeds can take before it's logged.
 const slowConnect = 3 * time.Second
 
+// connectAnswerTimeout is how long a CONNECT waits for the server's answer
+// before its transport is taken for deaf. Both servers answer before dialing
+// the destination, so the answer takes a round trip or two however slow the
+// destination is; one that doesn't come means the connection no longer carries
+// what the client sends, though what the server sends may still arrive. A var
+// so tests can shorten it.
+var connectAnswerTimeout = 5 * time.Second
+
+// errConnectUnanswered is the error of a CONNECT abandoned because its
+// transport went deaf. It's conn-fatal, so the dial retries on another
+// transport.
+var errConnectUnanswered = errors.New("samizdat: server did not answer CONNECT")
+
 // h2Transport manages a single TLS+HTTP/2 connection to the server and
 // multiplexes CONNECT tunnels over it as separate H2 streams.
 type h2Transport struct {
@@ -44,14 +57,20 @@ type h2Transport struct {
 	mu            sync.Mutex
 	activeStreams atomic.Int32
 	// retired is set when x/net's Transport stops using the connection for
-	// new streams (see errSecondDial). The pool stops handing the transport
-	// out, and it closes once its last stream ends.
+	// new streams (see errSecondDial), or when it's deaf (see markDeaf). The
+	// pool stops handing the transport out, and it closes once its last
+	// stream ends.
 	retired atomic.Bool
 	// idleSince is when a stream last closed, in Unix nanoseconds, or when
 	// the transport was created if no stream has.
 	idleSince  atomic.Int64
 	maxStreams int
 	closed     bool
+	// deaf is closed once a CONNECT on the transport has gone unanswered for
+	// connectAnswerTimeout, failing every CONNECT still waiting on it.
+	// Created on first use, under mu.
+	deaf       chan struct{}
+	deafMarked bool
 
 	id     uint64
 	logger *slog.Logger
@@ -217,9 +236,54 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	req.Host = destination
 	// Standard HTTP/2 CONNECT uses the :authority pseudo-header which is set from Host
 
+	// A CONNECT the server doesn't answer in time marks the transport deaf,
+	// which abandons it and every other CONNECT waiting on the transport.
+	// answer settles the race between the answer and the abandonment.
+	const (
+		waiting int32 = iota
+		answered
+		abandoned
+	)
+	var answer atomic.Int32
+	answerTimeout := connectAnswerTimeout
+	answerTimer := time.AfterFunc(answerTimeout, func() { t.markDeaf(answerTimeout) })
+	answerDone := make(chan struct{})
+	go func() {
+		select {
+		case <-t.deafSignal():
+			if answer.CompareAndSwap(waiting, abandoned) {
+				tunnelCancel()
+			}
+		case <-answerDone:
+		}
+	}()
+	settle := func() bool {
+		answerTimer.Stop()
+		close(answerDone)
+		return answer.CompareAndSwap(waiting, answered)
+	}
+
 	start := time.Now()
 	readBefore := t.conn.bytesRead.Load()
 	resp, err := t.h2Roundtrip.RoundTrip(req)
+	if !settle() {
+		// Abandoned as deaf; the transport is retired already, but its
+		// live tunnels carry on.
+		stop()
+		tunnelCancel()
+		pw.Close()
+		if err == nil {
+			resp.Body.Close()
+		}
+		t.log().Warn("samizdat CONNECT unanswered",
+			"transport", t.id,
+			"waited", time.Since(start),
+			"since_read", t.sinceRead(time.Now()),
+			"read_while_waiting", t.conn.bytesRead.Load() != readBefore,
+			"streams", t.streamCount(),
+			"age", time.Since(t.created))
+		return nil, fmt.Errorf("CONNECT to %s: %w", destination, errConnectUnanswered)
+	}
 	if err != nil {
 		stop()
 		tunnelCancel()
@@ -304,6 +368,9 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 // conn, and retiring the transport would tear down the healthy sibling streams
 // multiplexed over it.
 func connFatal(err error) bool {
+	if errors.Is(err, errConnectUnanswered) {
+		return true
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
@@ -358,6 +425,38 @@ func (t *h2Transport) retireWithReason(reason string) {
 	if t.streamCount() == 0 {
 		t.closeWithReason("retired with no streams")
 	}
+}
+
+// markDeaf retires the transport after a CONNECT on it went unanswered for
+// after, and fails every CONNECT still waiting on it so each retries elsewhere
+// at once rather than waiting out its own timeout.
+func (t *h2Transport) markDeaf(after time.Duration) {
+	t.mu.Lock()
+	if t.deafMarked {
+		t.mu.Unlock()
+		return
+	}
+	t.deafMarked = true
+	t.mu.Unlock()
+	// Retired before the waiters fail, so their retries can't take this
+	// transport again.
+	t.retireWithReason(fmt.Sprintf("a CONNECT went unanswered for %s", after))
+	t.mu.Lock()
+	if t.deaf == nil {
+		t.deaf = make(chan struct{})
+	}
+	close(t.deaf)
+	t.mu.Unlock()
+}
+
+// deafSignal returns a channel closed once the transport is marked deaf.
+func (t *h2Transport) deafSignal() <-chan struct{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.deaf == nil {
+		t.deaf = make(chan struct{})
+	}
+	return t.deaf
 }
 
 // closeWithReason closes the transport, logging why.
