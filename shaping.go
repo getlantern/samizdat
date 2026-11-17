@@ -175,7 +175,9 @@ type shapedConn struct {
 	out     []byte // queued by Write while the schedule runs
 	in      []byte // received while the schedule ran, not yet Read
 	shaping bool
-	err     error
+	// done is closed once the schedule has ended, however it ended.
+	done chan struct{}
+	err  error
 	// rdl and wdl are the caller's deadlines. While the schedule runs, Read
 	// and Write wait on cond, and the schedule's reads on Conn run without
 	// the caller's read deadline (a watchdog bounds the schedule instead),
@@ -211,6 +213,7 @@ func newShapedConn(conn net.Conn, sched []int, client bool, marker [shapingMarke
 		marker:     marker,
 		markerRead: markerRead,
 		shaping:    true,
+		done:       make(chan struct{}),
 		grace:      shapingGrace,
 		timeout:    shapingTimeout,
 	}
@@ -229,6 +232,9 @@ func (c *shapedConn) shapingActive() bool {
 	return c.shaping
 }
 
+// shapingDone returns a channel closed once the schedule has ended.
+func (c *shapedConn) shapingDone() <-chan struct{} { return c.done }
+
 func (c *shapedConn) run() {
 	// A peer that stops partway, reading or writing, would leave the
 	// schedule blocked on Conn; closing it fails the schedule.
@@ -243,6 +249,7 @@ func (c *shapedConn) run() {
 	pending := c.out
 	c.out = nil
 	c.shaping = false
+	close(c.done)
 	if err != nil {
 		c.err = err
 	} else {
