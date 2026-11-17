@@ -23,7 +23,7 @@ func advertisedWindows(t *testing.T, win receiveWindows) (perStream, perConn uin
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
-	tr, err := newH2Transport(c1, "example.com:443", 10, win)
+	tr, err := newH2Transport(c1, "example.com:443", 10, win, keepAlive{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestFailedConnectLogged(t *testing.T) {
 	defer c1.Close()
 	defer c2.Close()
 	go io.Copy(io.Discard, c2)
-	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{})
+	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{}, keepAlive{})
 	if err != nil {
 		t.Fatal(err)
 	}

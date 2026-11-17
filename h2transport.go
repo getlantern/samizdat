@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"golang.org/x/net/http/httpguts"
@@ -113,7 +112,13 @@ type receiveWindows struct {
 	perStream, perConn int
 }
 
-func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, win receiveWindows) (*h2Transport, error) {
+// keepAlive is when a transport pings a connection that has gone quiet, and
+// how long it waits for the reply. A zero or negative interval means no pings.
+type keepAlive struct {
+	interval, timeout time.Duration
+}
+
+func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, win receiveWindows, ka keepAlive) (*h2Transport, error) {
 	conn := &readTrackingConn{Conn: tlsConn}
 
 	// Create HTTP/2 client transport over the existing TLS connection.
@@ -146,6 +151,12 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, win rec
 	h2t.AllowHTTP = false
 	h2t.DisableCompression = true
 	h2t.StrictMaxConcurrentStreams = true
+	// x/net closes the connection when a ping goes unanswered, which fails
+	// its streams and sends the next CONNECT to a new connection.
+	if ka.interval > 0 {
+		h2t.ReadIdleTimeout = ka.interval
+		h2t.PingTimeout = ka.timeout
+	}
 
 	t := &h2Transport{
 		conn:        conn,
@@ -307,12 +318,18 @@ func connFatal(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	return errors.Is(err, net.ErrClosed) ||
+	if errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, errSecondDial) ||
 		errors.Is(err, io.EOF) ||
-		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, syscall.EPIPE)
+		errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	for _, errno := range fatalErrnos {
+		if errors.Is(err, errno) {
+			return true
+		}
+	}
+	return false
 }
 
 // tryReserve takes a stream slot if the transport has one, atomically, so
@@ -320,7 +337,7 @@ func connFatal(err error) bool {
 func (t *h2Transport) tryReserve() bool {
 	for {
 		n := t.activeStreams.Load()
-		if t.retired.Load() || int(n) >= t.maxStreams {
+		if t.retired.Load() || t.conn.closed.Load() || int(n) >= t.maxStreams {
 			return false
 		}
 		if t.activeStreams.CompareAndSwap(n, n+1) {
