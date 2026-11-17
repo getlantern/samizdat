@@ -285,8 +285,12 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	readBefore := t.conn.bytesRead.Load()
 	resp, err := t.h2Roundtrip.RoundTrip(req)
 	if !settle() {
-		// Abandoned as deaf; the transport is retired already, but its
-		// live tunnels carry on.
+		// Abandoned as deaf. The transport's live tunnels carry on, but the
+		// retry must not take it again: wait until it's retired, which
+		// markDeaf does before closing the deaf signal, since the timer
+		// claims the CONNECT before markDeaf runs and a second timer's
+		// markDeaf returns while the first is still retiring it.
+		<-t.deafSignal()
 		stop()
 		tunnelCancel()
 		pw.Close()
