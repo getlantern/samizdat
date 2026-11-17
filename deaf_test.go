@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -89,6 +90,26 @@ func TestNewTransportNotHeldToAnswerTimeout(t *testing.T) {
 	}
 	if tr.retired.Load() {
 		t.Error("a transport that has never answered must not be taken for deaf")
+	}
+}
+
+func TestShapingTransportNotHeldToAnswerTimeout(t *testing.T) {
+	shortenConnectAnswerTimeout(t, 50*time.Millisecond)
+	tr := answeredTestTransport(blockingRoundTripper)
+	// Answered once, with the schedule still running: CONNECTs can still
+	// wait behind it.
+	_, server := net.Pipe()
+	t.Cleanup(func() { server.Close() })
+	tr.conn = &readTrackingConn{Conn: &shapedConn{Conn: server, shaping: true}}
+
+	c, cancel := context.WithTimeout(ctx(t), 300*time.Millisecond)
+	defer cancel()
+	_, err := tr.openTunnel(c, "example.com:443")
+	if errors.Is(err, errConnectUnanswered) || err == nil {
+		t.Fatalf("openTunnel: got %v, want the caller's cancellation", err)
+	}
+	if tr.retired.Load() {
+		t.Error("a transport still shaping must not be taken for deaf")
 	}
 }
 
@@ -223,6 +244,19 @@ func TestDialRecoversFromDeafTransport(t *testing.T) {
 	}
 	if _, err := dial(); err != nil {
 		t.Fatalf("dial before muting: %v", err)
+	}
+	// Mute once shaping is over: until then, CONNECTs aren't held to the
+	// answer timeout.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		client.pool.mu.Lock()
+		shaping := slices.ContainsFunc(client.pool.transports, (*h2Transport).shapingActive)
+		client.pool.mu.Unlock()
+		if !shaping {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shaping never finished")
+		}
 	}
 
 	relay.mute()

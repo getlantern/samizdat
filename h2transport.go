@@ -36,10 +36,10 @@ const slowConnect = 3 * time.Second
 // the destination, so the answer takes a round trip or two however slow the
 // destination is; one that doesn't come means the connection no longer carries
 // what the client sends, though what the server sends may still arrive. Only a
-// transport that has answered a CONNECT is held to it: on a new one, the
-// first CONNECTs wait behind connection-start shaping, which takes several
-// round trips, and a slow path is no sign of a deaf one. A var so tests can
-// shorten it.
+// transport that has answered a CONNECT and finished connection-start shaping
+// is held to it: CONNECTs wait behind the shaping schedule, which takes
+// several round trips and passes data on before it ends, and a slow path is
+// no sign of a deaf one. A var so tests can shorten it.
 var connectAnswerTimeout = 5 * time.Second
 
 // errConnectUnanswered is the error of a CONNECT abandoned because its
@@ -254,7 +254,7 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	// The timer claims the CONNECT as the answer would, so one answered or
 	// given up on by its caller as the timer fires leaves the transport be.
 	var answerTimer *time.Timer
-	if t.answered.Load() {
+	if t.answered.Load() && !t.shapingActive() {
 		answerTimeout := connectAnswerTimeout
 		answerTimer = time.AfterFunc(answerTimeout, func() {
 			if ctx.Err() == nil && answer.CompareAndSwap(waiting, abandoned) {
@@ -466,6 +466,13 @@ func (t *h2Transport) markDeaf(after time.Duration) {
 	}
 	close(t.deaf)
 	t.mu.Unlock()
+}
+
+// shapingActive reports whether the transport's connection-start shaping
+// schedule is still running.
+func (t *h2Transport) shapingActive() bool {
+	sc, ok := t.conn.Conn.(*shapedConn)
+	return ok && sc.shapingActive()
 }
 
 // deafSignal returns a channel closed once the transport is marked deaf.
