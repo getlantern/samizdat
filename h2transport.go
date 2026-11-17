@@ -295,7 +295,9 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		tunnelCancel()
 		pw.Close()
 		if err == nil {
-			resp.Body.Close()
+			// An answer that came too late. Closing its body can write to
+			// the deaf connection and block, so not on the retry's path.
+			go resp.Body.Close()
 		}
 		t.log().Warn("samizdat CONNECT unanswered",
 			"transport", t.id,

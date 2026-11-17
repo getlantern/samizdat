@@ -52,24 +52,36 @@ func TestUnansweredConnectRetiresTransport(t *testing.T) {
 }
 
 func TestUnansweredConnectFailsOtherWaiters(t *testing.T) {
-	shortenConnectAnswerTimeout(t, 200*time.Millisecond)
-	tr := answeredTestTransport(blockingRoundTripper)
+	shortenConnectAnswerTimeout(t, 500*time.Millisecond)
+	entered := make(chan struct{}, 2)
+	tr := answeredTestTransport(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		entered <- struct{}{}
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	}))
 
-	// The first CONNECT starts the clock; the second, opened just before it
-	// runs out, must fail with it rather than waiting out its own.
+	// The first CONNECT starts the clock; the second, waiting from later,
+	// must fail with it rather than waiting out its own.
 	first := make(chan error, 1)
 	go func() {
 		_, err := tr.openTunnel(ctx(t), "a.example:443")
 		first <- err
 	}()
-	time.Sleep(150 * time.Millisecond)
+	<-entered
+	time.Sleep(200 * time.Millisecond)
+	second := make(chan error, 1)
+	go func() {
+		_, err := tr.openTunnel(ctx(t), "b.example:443")
+		second <- err
+	}()
+	<-entered
 	start := time.Now()
-	_, err := tr.openTunnel(ctx(t), "b.example:443")
+	err := <-second
 	if !errors.Is(err, errConnectUnanswered) {
 		t.Fatalf("second openTunnel: got %v, want errConnectUnanswered", err)
 	}
-	if took := time.Since(start); took > 150*time.Millisecond {
-		t.Errorf("second CONNECT waited %s; it should fail as soon as the transport is deaf", took)
+	if took := time.Since(start); took >= connectAnswerTimeout {
+		t.Errorf("second CONNECT waited %s, its own timeout; it should fail once the first's runs out", took)
 	}
 	if err := <-first; !errors.Is(err, errConnectUnanswered) {
 		t.Fatalf("first openTunnel: got %v, want errConnectUnanswered", err)
