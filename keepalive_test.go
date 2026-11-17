@@ -187,12 +187,19 @@ func TestDialContextRetriesAfterLostPing(t *testing.T) {
 // TestKeepAliveKeepsAnsweringConnection: a quiet connection whose server
 // answers pings stays open.
 func TestKeepAliveKeepsAnsweringConnection(t *testing.T) {
-	ka := keepAlive{interval: 20 * time.Millisecond, timeout: time.Second}
+	// The wait is several ping timeouts long, so the connection would close
+	// in it if the replies didn't count.
+	ka := keepAlive{interval: 20 * time.Millisecond, timeout: 100 * time.Millisecond}
 	tr, _ := openQuietTunnel(t, ka, true)
+	// The server sends nothing after the CONNECT reply but ping acks.
+	before := tr.conn.bytesRead.Load()
 
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	if tr.conn.closed.Load() {
 		t.Fatal("connection closed though its pings were answered")
+	}
+	if tr.conn.bytesRead.Load() == before {
+		t.Fatal("no ping was answered")
 	}
 }
 
