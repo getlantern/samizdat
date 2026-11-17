@@ -26,9 +26,17 @@ var blockingRoundTripper = roundTripperFunc(func(req *http.Request) (*http.Respo
 	return nil, req.Context().Err()
 })
 
+// answeredTestTransport is a transport that has answered a CONNECT before,
+// so its CONNECTs are held to connectAnswerTimeout.
+func answeredTestTransport(rt http.RoundTripper) *h2Transport {
+	tr := newTestTransport(rt)
+	tr.answered.Store(true)
+	return tr
+}
+
 func TestUnansweredConnectRetiresTransport(t *testing.T) {
 	shortenConnectAnswerTimeout(t, 100*time.Millisecond)
-	tr := newTestTransport(blockingRoundTripper)
+	tr := answeredTestTransport(blockingRoundTripper)
 
 	_, err := tr.openTunnel(ctx(t), "example.com:443")
 	if !errors.Is(err, errConnectUnanswered) {
@@ -44,7 +52,7 @@ func TestUnansweredConnectRetiresTransport(t *testing.T) {
 
 func TestUnansweredConnectFailsOtherWaiters(t *testing.T) {
 	shortenConnectAnswerTimeout(t, 200*time.Millisecond)
-	tr := newTestTransport(blockingRoundTripper)
+	tr := answeredTestTransport(blockingRoundTripper)
 
 	// The first CONNECT starts the clock; the second, opened just before it
 	// runs out, must fail with it rather than waiting out its own.
@@ -67,9 +75,26 @@ func TestUnansweredConnectFailsOtherWaiters(t *testing.T) {
 	}
 }
 
+func TestNewTransportNotHeldToAnswerTimeout(t *testing.T) {
+	shortenConnectAnswerTimeout(t, 50*time.Millisecond)
+	tr := newTestTransport(blockingRoundTripper)
+
+	// A new transport's first CONNECTs may wait behind connection-start
+	// shaping, so only the caller ends this one.
+	c, cancel := context.WithTimeout(ctx(t), 300*time.Millisecond)
+	defer cancel()
+	_, err := tr.openTunnel(c, "example.com:443")
+	if errors.Is(err, errConnectUnanswered) || err == nil {
+		t.Fatalf("openTunnel: got %v, want the caller's cancellation", err)
+	}
+	if tr.retired.Load() {
+		t.Error("a transport that has never answered must not be taken for deaf")
+	}
+}
+
 func TestCallerCancelDoesNotRetireTransport(t *testing.T) {
 	shortenConnectAnswerTimeout(t, time.Second)
-	tr := newTestTransport(blockingRoundTripper)
+	tr := answeredTestTransport(blockingRoundTripper)
 
 	c, cancel := context.WithTimeout(ctx(t), 50*time.Millisecond)
 	defer cancel()

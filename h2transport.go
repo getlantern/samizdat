@@ -35,8 +35,11 @@ const slowConnect = 3 * time.Second
 // before its transport is taken for deaf. Both servers answer before dialing
 // the destination, so the answer takes a round trip or two however slow the
 // destination is; one that doesn't come means the connection no longer carries
-// what the client sends, though what the server sends may still arrive. A var
-// so tests can shorten it.
+// what the client sends, though what the server sends may still arrive. Only a
+// transport that has answered a CONNECT is held to it: on a new one, the
+// first CONNECTs wait behind connection-start shaping, which takes several
+// round trips, and a slow path is no sign of a deaf one. A var so tests can
+// shorten it.
 var connectAnswerTimeout = 5 * time.Second
 
 // errConnectUnanswered is the error of a CONNECT abandoned because its
@@ -71,6 +74,9 @@ type h2Transport struct {
 	// Created on first use, under mu.
 	deaf       chan struct{}
 	deafMarked bool
+	// answered is set once the server has answered a CONNECT on the
+	// transport, from when its CONNECTs are held to connectAnswerTimeout.
+	answered atomic.Bool
 
 	id     uint64
 	logger *slog.Logger
@@ -247,13 +253,16 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	var answer atomic.Int32
 	// The timer claims the CONNECT as the answer would, so one answered or
 	// given up on by its caller as the timer fires leaves the transport be.
-	answerTimeout := connectAnswerTimeout
-	answerTimer := time.AfterFunc(answerTimeout, func() {
-		if ctx.Err() == nil && answer.CompareAndSwap(waiting, abandoned) {
-			t.markDeaf(answerTimeout)
-			tunnelCancel()
-		}
-	})
+	var answerTimer *time.Timer
+	if t.answered.Load() {
+		answerTimeout := connectAnswerTimeout
+		answerTimer = time.AfterFunc(answerTimeout, func() {
+			if ctx.Err() == nil && answer.CompareAndSwap(waiting, abandoned) {
+				t.markDeaf(answerTimeout)
+				tunnelCancel()
+			}
+		})
+	}
 	answerDone := make(chan struct{})
 	go func() {
 		select {
@@ -265,7 +274,9 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		}
 	}()
 	settle := func() bool {
-		answerTimer.Stop()
+		if answerTimer != nil {
+			answerTimer.Stop()
+		}
 		close(answerDone)
 		return answer.CompareAndSwap(waiting, answered)
 	}
@@ -327,6 +338,7 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	// Detach: stop propagating caller's context cancellation into the
 	// H2 stream now that the tunnel is established.
 	stop()
+	t.answered.Store(true)
 
 	if resp.StatusCode != http.StatusOK {
 		t.log().Warn("samizdat CONNECT refused",
