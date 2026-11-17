@@ -27,17 +27,9 @@ var blockingRoundTripper = roundTripperFunc(func(req *http.Request) (*http.Respo
 	return nil, req.Context().Err()
 })
 
-// answeredTestTransport is a transport that has answered a CONNECT before,
-// so its CONNECTs are held to connectAnswerTimeout.
-func answeredTestTransport(rt http.RoundTripper) *h2Transport {
-	tr := newTestTransport(rt)
-	tr.answered.Store(true)
-	return tr
-}
-
 func TestUnansweredConnectRetiresTransport(t *testing.T) {
 	shortenConnectAnswerTimeout(t, 100*time.Millisecond)
-	tr := answeredTestTransport(blockingRoundTripper)
+	tr := newTestTransport(blockingRoundTripper)
 
 	_, err := tr.openTunnel(ctx(t), "example.com:443")
 	if !errors.Is(err, errConnectUnanswered) {
@@ -54,7 +46,7 @@ func TestUnansweredConnectRetiresTransport(t *testing.T) {
 func TestUnansweredConnectFailsOtherWaiters(t *testing.T) {
 	shortenConnectAnswerTimeout(t, 500*time.Millisecond)
 	entered := make(chan struct{}, 2)
-	tr := answeredTestTransport(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+	tr := newTestTransport(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		entered <- struct{}{}
 		<-req.Context().Done()
 		return nil, req.Context().Err()
@@ -88,46 +80,62 @@ func TestUnansweredConnectFailsOtherWaiters(t *testing.T) {
 	}
 }
 
-func TestNewTransportNotHeldToAnswerTimeout(t *testing.T) {
-	shortenConnectAnswerTimeout(t, 50*time.Millisecond)
+func TestConnectDuringShapingTimedFromShapingEnd(t *testing.T) {
+	shortenConnectAnswerTimeout(t, 200*time.Millisecond)
 	tr := newTestTransport(blockingRoundTripper)
+	_, server := net.Pipe()
+	t.Cleanup(func() { server.Close() })
+	sc := &shapedConn{Conn: server, shaping: true, done: make(chan struct{})}
+	sc.cond = sync.NewCond(&sc.mu)
+	tr.conn = &readTrackingConn{Conn: sc}
 
-	// A new transport's first CONNECTs may wait behind connection-start
-	// shaping, so only the caller ends this one.
-	c, cancel := context.WithTimeout(ctx(t), 300*time.Millisecond)
-	defer cancel()
-	_, err := tr.openTunnel(c, "example.com:443")
-	if errors.Is(err, errConnectUnanswered) || err == nil {
-		t.Fatalf("openTunnel: got %v, want the caller's cancellation", err)
+	result := make(chan error, 1)
+	go func() {
+		_, err := tr.openTunnel(ctx(t), "example.com:443")
+		result <- err
+	}()
+	// While shaping runs, the CONNECT waits behind it however long it takes.
+	select {
+	case err := <-result:
+		t.Fatalf("CONNECT abandoned during shaping: %v", err)
+	case <-time.After(3 * connectAnswerTimeout):
 	}
 	if tr.retired.Load() {
-		t.Error("a transport that has never answered must not be taken for deaf")
+		t.Fatal("a transport still shaping must not be taken for deaf")
+	}
+
+	// Once shaping is over, it gets the full timeout and no more.
+	ended := time.Now()
+	close(sc.done)
+	err := <-result
+	if !errors.Is(err, errConnectUnanswered) {
+		t.Fatalf("openTunnel: got %v, want errConnectUnanswered", err)
+	}
+	if took := time.Since(ended); took < connectAnswerTimeout || took > 5*connectAnswerTimeout {
+		t.Errorf("CONNECT abandoned %s after shaping ended, want about %s", took, connectAnswerTimeout)
+	}
+	if !tr.retired.Load() {
+		t.Error("the transport must be retired once a CONNECT on it goes unanswered")
 	}
 }
 
-func TestShapingTransportNotHeldToAnswerTimeout(t *testing.T) {
-	shortenConnectAnswerTimeout(t, 50*time.Millisecond)
-	tr := answeredTestTransport(blockingRoundTripper)
-	// Answered once, with the schedule still running: CONNECTs can still
-	// wait behind it.
-	_, server := net.Pipe()
-	t.Cleanup(func() { server.Close() })
-	tr.conn = &readTrackingConn{Conn: &shapedConn{Conn: server, shaping: true}}
-
-	c, cancel := context.WithTimeout(ctx(t), 300*time.Millisecond)
-	defer cancel()
-	_, err := tr.openTunnel(c, "example.com:443")
-	if errors.Is(err, errConnectUnanswered) || err == nil {
-		t.Fatalf("openTunnel: got %v, want the caller's cancellation", err)
+func TestFirstConnectOnNewTransportHeldToAnswerTimeout(t *testing.T) {
+	shortenConnectAnswerTimeout(t, 100*time.Millisecond)
+	// A transport that has never answered, past shaping: its first CONNECT
+	// is held to the timeout like any other.
+	tr := newTestTransport(blockingRoundTripper)
+	_, err := tr.openTunnel(ctx(t), "example.com:443")
+	if !errors.Is(err, errConnectUnanswered) {
+		t.Fatalf("openTunnel: got %v, want errConnectUnanswered", err)
 	}
-	if tr.retired.Load() {
-		t.Error("a transport still shaping must not be taken for deaf")
+	if !tr.retired.Load() {
+		t.Error("the transport must be retired once a CONNECT on it goes unanswered")
 	}
 }
 
 func TestCallerCancelDoesNotRetireTransport(t *testing.T) {
 	shortenConnectAnswerTimeout(t, time.Second)
-	tr := answeredTestTransport(blockingRoundTripper)
+	tr := newTestTransport(blockingRoundTripper)
 
 	c, cancel := context.WithTimeout(ctx(t), 50*time.Millisecond)
 	defer cancel()

@@ -35,11 +35,12 @@ const slowConnect = 3 * time.Second
 // before its transport is taken for deaf. Both servers answer before dialing
 // the destination, so the answer takes a round trip or two however slow the
 // destination is; one that doesn't come means the connection no longer carries
-// what the client sends, though what the server sends may still arrive. Only a
-// transport that has answered a CONNECT and finished connection-start shaping
-// is held to it: CONNECTs wait behind the shaping schedule, which takes
-// several round trips and passes data on before it ends, and a slow path is
-// no sign of a deaf one. A var so tests can shorten it.
+// what the client sends, though what the server sends may still arrive. The
+// clock starts once connection-start shaping is over: CONNECTs wait behind its
+// schedule, which takes several round trips (and is bounded by shapingTimeout),
+// and a slow path is no sign of a deaf one. After it, the TLS handshake and
+// the schedule have shown the path carries both ways. A var so tests can
+// shorten it.
 var connectAnswerTimeout = 5 * time.Second
 
 // errConnectUnanswered is the error of a CONNECT abandoned because its
@@ -74,9 +75,6 @@ type h2Transport struct {
 	// Created on first use, under mu.
 	deaf       chan struct{}
 	deafMarked bool
-	// answered is set once the server has answered a CONNECT on the
-	// transport, from when its CONNECTs are held to connectAnswerTimeout.
-	answered atomic.Bool
 
 	id     uint64
 	logger *slog.Logger
@@ -251,32 +249,39 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 		abandoned
 	)
 	var answer atomic.Int32
-	// The timer claims the CONNECT as the answer would, so one answered or
-	// given up on by its caller as the timer fires leaves the transport be.
-	var answerTimer *time.Timer
-	if t.answered.Load() && !t.shapingActive() {
-		answerTimeout := connectAnswerTimeout
-		answerTimer = time.AfterFunc(answerTimeout, func() {
-			if ctx.Err() == nil && answer.CompareAndSwap(waiting, abandoned) {
-				t.markDeaf(answerTimeout)
-				tunnelCancel()
-			}
-		})
-	}
+	// The watcher abandons the CONNECT if the transport goes deaf, and starts
+	// its answer clock once shaping is over. The clock claims the CONNECT as
+	// the answer would, so one answered or given up on by its caller as it
+	// runs out leaves the transport be.
+	answerTimeout := connectAnswerTimeout
 	answerDone := make(chan struct{})
 	go func() {
-		select {
-		case <-t.deafSignal():
-			if answer.CompareAndSwap(waiting, abandoned) {
-				tunnelCancel()
+		shaped := t.shapingDone()
+		var expired <-chan time.Time
+		for {
+			select {
+			case <-shaped:
+				shaped = nil
+				timer := time.NewTimer(answerTimeout)
+				defer timer.Stop()
+				expired = timer.C
+			case <-expired:
+				if ctx.Err() == nil && answer.CompareAndSwap(waiting, abandoned) {
+					t.markDeaf(answerTimeout)
+					tunnelCancel()
+				}
+				return
+			case <-t.deafSignal():
+				if answer.CompareAndSwap(waiting, abandoned) {
+					tunnelCancel()
+				}
+				return
+			case <-answerDone:
+				return
 			}
-		case <-answerDone:
 		}
 	}()
 	settle := func() bool {
-		if answerTimer != nil {
-			answerTimer.Stop()
-		}
 		close(answerDone)
 		return answer.CompareAndSwap(waiting, answered)
 	}
@@ -344,7 +349,6 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	// Detach: stop propagating caller's context cancellation into the
 	// H2 stream now that the tunnel is established.
 	stop()
-	t.answered.Store(true)
 
 	if resp.StatusCode != http.StatusOK {
 		t.log().Warn("samizdat CONNECT refused",
@@ -479,6 +483,18 @@ func (t *h2Transport) markDeaf(after time.Duration) {
 func (t *h2Transport) shapingActive() bool {
 	sc, ok := t.conn.Conn.(*shapedConn)
 	return ok && sc.shapingActive()
+}
+
+// closedChan is an already-closed channel.
+var closedChan = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
+
+// shapingDone returns a channel closed once the transport's connection-start
+// shaping is over, at once for a connection that isn't shaped.
+func (t *h2Transport) shapingDone() <-chan struct{} {
+	if sc, ok := t.conn.Conn.(*shapedConn); ok {
+		return sc.shapingDone()
+	}
+	return closedChan
 }
 
 // deafSignal returns a channel closed once the transport is marked deaf.
