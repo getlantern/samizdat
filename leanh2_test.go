@@ -1418,3 +1418,31 @@ func TestLeanCloseErrorsMatchStandardErrors(t *testing.T) {
 		t.Errorf("message = %q", got)
 	}
 }
+
+// TestLeanH2EndsStreamWhenHandlerReturns checks that a client still sending
+// learns the destination closed as soon as the handler returns, not once the
+// drain timeout has passed.
+func TestLeanH2EndsStreamWhenHandlerReturns(t *testing.T) {
+	client := startLeanPair(t, func(ctx context.Context, conn net.Conn, dest string) {
+		conn.Write([]byte("bye"))
+		conn.Close()
+	})
+	c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := client.DialContext(c, "tcp", "closes:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	start := time.Now()
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "bye" {
+		t.Errorf("read %q, want %q", got, "bye")
+	}
+	if took := time.Since(start); took >= leanDrainTimeout/2 {
+		t.Errorf("EOF took %s; it should arrive once the handler returns", took)
+	}
+}

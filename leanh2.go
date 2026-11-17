@@ -1459,10 +1459,11 @@ func (st *leanStream) run(method, authority, scheme, path, protocol string, trun
 
 	st.runHandler(&leanStreamConn{st: st}, authority)
 
-	// Wait for the client's END_STREAM before ending the stream, so it
-	// closes normally rather than with RST_STREAM, as serveH2 does, and for
-	// writes from goroutines the handler left behind to finish, up to the
-	// drain timeout. Data still arriving is dropped meanwhile.
+	// End the response at once, after any writes from goroutines the handler
+	// left behind, so the client learns the destination closed without
+	// waiting; then wait for the client's END_STREAM, so the stream closes
+	// normally rather than with RST_STREAM, up to the drain timeout. Data
+	// still arriving is dropped meanwhile.
 	st.drainAndEnd()
 }
 
@@ -1483,13 +1484,24 @@ func (st *leanStream) drainAndEnd() {
 		st.cond.Broadcast()
 		c.mu.Unlock()
 	})
-	for (!st.remoteDone || st.writing > 0) && !st.reset && !c.closed && !timedOut {
+	for st.writing > 0 && !st.reset && !c.closed && !timedOut {
+		st.cond.Wait()
+	}
+	st.closed = true
+	st.wakeLocked()
+	if !st.endBodyLocked(nil) {
+		timer.Stop()
+		return
+	}
+	// The client has its EOF now, so it ends its side promptly; one that
+	// doesn't within the drain timeout gets RST_STREAM(NO_ERROR).
+	for !st.remoteDone && !st.reset && !c.closed && !timedOut {
 		st.cond.Wait()
 	}
 	timer.Stop()
-	st.closed = true
-	st.wakeLocked()
-	st.endLocked(nil)
+	if !st.reset && !c.closed {
+		st.resetIfOpenLocked()
+	}
 }
 
 // runHandler runs the Handler on the stream. A handler that panics resets
@@ -1514,6 +1526,14 @@ func (st *leanStream) runHandler(conn net.Conn, destination string) {
 // endLocked sends body, if any, with END_STREAM, and RST_STREAM(NO_ERROR) if
 // the client hasn't ended its side. c.mu must be held.
 func (st *leanStream) endLocked(body []byte) {
+	if st.endBodyLocked(body) {
+		st.resetIfOpenLocked()
+	}
+}
+
+// endBodyLocked sends body, if any, with END_STREAM, reporting whether it
+// did: a stream reset meanwhile gets nothing. c.mu must be held.
+func (st *leanStream) endBodyLocked(body []byte) bool {
 	c := st.c
 	// The body goes out in as few DATA frames as the send windows allow,
 	// one for a short body as x/net sends it, with END_STREAM on the last.
@@ -1521,10 +1541,10 @@ func (st *leanStream) endLocked(body []byte) {
 	for {
 		for {
 			if st.reset {
-				return
+				return false
 			}
 			if err := st.waitForRoom(min(len(body), leanWriteChunk)); err != nil {
-				return
+				return false
 			}
 			if len(body) == 0 || st.sendWin > 0 && c.connSendWin > 0 {
 				break
@@ -1554,7 +1574,7 @@ func (st *leanStream) endLocked(body []byte) {
 			break
 		}
 	}
-	st.resetIfOpenLocked()
+	return true
 }
 
 // resetIfOpenLocked sends RST_STREAM(NO_ERROR) once the response has ended
