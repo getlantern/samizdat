@@ -91,10 +91,11 @@ type ClientConfig struct {
 
 	// KeepAliveInterval is how long a connection can read nothing before the
 	// client pings it, and KeepAliveTimeout how long the reply can take
-	// before the connection is closed (defaults: 15s and 10s). Without the
-	// pings, a connection that a network drops silently looks alive until
-	// TCP gives up on it, which can take minutes. A negative
-	// KeepAliveInterval turns them off.
+	// before the connection is closed (defaults: 15s and 10s). Each
+	// connection uses an interval up to a quarter shorter or longer, so they
+	// don't all ping together. Without the pings, a connection that a
+	// network drops silently looks alive until TCP gives up on it, which can
+	// take minutes. A negative KeepAliveInterval turns them off.
 	KeepAliveInterval time.Duration
 	KeepAliveTimeout  time.Duration
 

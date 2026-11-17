@@ -14,10 +14,10 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-// serveQuietH2 is an HTTP/2 server for one connection that answers every
-// CONNECT with a 200 and then sends nothing more. It answers pings only if
-// ackPings is set.
-func serveQuietH2(conn net.Conn, ackPings bool) {
+// serveQuietH2 is an HTTP/2 server for one connection that sends nothing
+// after its SETTINGS except, if asked, a 200 for each CONNECT and replies to
+// pings.
+func serveQuietH2(conn net.Conn, answerConnects, ackPings bool) {
 	preface := make([]byte, len(http2.ClientPreface))
 	if _, err := io.ReadFull(conn, preface); err != nil {
 		return
@@ -37,6 +37,9 @@ func serveQuietH2(conn net.Conn, ackPings bool) {
 				err = fr.WriteSettingsAck()
 			}
 		case *http2.HeadersFrame:
+			if !answerConnects {
+				continue
+			}
 			var block bytes.Buffer
 			hpack.NewEncoder(&block).WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
 			err = fr.WriteHeaders(http2.HeadersFrameParam{
@@ -87,7 +90,7 @@ func openQuietTunnel(t *testing.T, ka keepAlive, ackPings bool) (*h2Transport, n
 	// A TCP pair, not net.Pipe: both ends write their SETTINGS before
 	// reading, which deadlocks on an unbuffered pipe.
 	c1, c2 := tcpPair(t)
-	go serveQuietH2(c2, ackPings)
+	go serveQuietH2(c2, true, ackPings)
 
 	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{}, ka)
 	if err != nil {
@@ -138,6 +141,46 @@ func TestKeepAliveClosesSilentConnection(t *testing.T) {
 	}
 	if tr.tryReserve() {
 		t.Fatal("transport with a closed connection still takes new streams")
+	}
+}
+
+// TestDialContextRetriesAfterLostPing: a CONNECT still waiting when its
+// connection's ping goes unanswered must be retried on a new connection.
+func TestDialContextRetriesAfterLostPing(t *testing.T) {
+	dead1, dead2 := tcpPair(t)
+	go serveQuietH2(dead2, false, false)
+	live1, live2 := tcpPair(t)
+	go serveQuietH2(live2, true, true)
+
+	ka := keepAlive{interval: 20 * time.Millisecond, timeout: 20 * time.Millisecond}
+	var transports []*h2Transport
+	for _, c := range []net.Conn{dead1, live1} {
+		tr, err := newH2Transport(c, "example.com:443", 10, receiveWindows{}, ka)
+		if err != nil {
+			t.Fatal(err)
+		}
+		transports = append(transports, tr)
+	}
+	created := 0
+	pool := newConnPool(10, time.Hour, func(context.Context) (*h2Transport, error) {
+		if created >= len(transports) {
+			return nil, fmt.Errorf("no transport left")
+		}
+		created++
+		return transports[created-1], nil
+	})
+	defer pool.close()
+	c := &Client{pool: pool}
+
+	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := c.DialContext(dialCtx, "tcp", "example.org:443")
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	conn.Close()
+	if created != 2 {
+		t.Errorf("created %d transports, want 2", created)
 	}
 }
 
@@ -216,5 +259,25 @@ func TestConnFatalErrnos(t *testing.T) {
 	}
 	if connFatal(fmt.Errorf("CONNECT: %w", syscall.EINVAL)) {
 		t.Error("connFatal(EINVAL) = true")
+	}
+}
+
+func TestPingJitter(t *testing.T) {
+	const d = 15 * time.Second
+	seen := map[time.Duration]bool{}
+	for range 1000 {
+		got := pingJitter(d)
+		if got < d*3/4 || got > d*5/4 {
+			t.Fatalf("pingJitter(%v) = %v, outside a quarter either way", d, got)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 2 {
+		t.Error("pingJitter returned the same interval every time")
+	}
+	for _, d := range []time.Duration{0, -1} {
+		if got := pingJitter(d); got != d {
+			t.Errorf("pingJitter(%v) = %v, want it unchanged", d, got)
+		}
 	}
 }

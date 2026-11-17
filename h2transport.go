@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"sync"
@@ -20,6 +21,10 @@ import (
 // errSecondDial is what h2Transport's x/net Transport gets if it tries to dial
 // a second connection; see newH2Transport.
 var errSecondDial = errors.New("samizdat: HTTP/2 transport has only one connection")
+
+// errPingLost marks a CONNECT that failed because its connection's ping went
+// unanswered. x/net reports that with an error nothing can match.
+var errPingLost = errors.New("samizdat: connection lost: ping unanswered")
 
 // transportIDs numbers transports for logs.
 var transportIDs atomic.Uint64
@@ -57,6 +62,9 @@ type h2Transport struct {
 	// closeLogged is set once a close has been logged, so two paths closing
 	// it at once log it once.
 	closeLogged atomic.Bool
+	// pingLost is set when x/net closes the connection over an unanswered
+	// ping, before it fails the connection's streams.
+	pingLost atomic.Bool
 	// created is when the transport was created.
 	created time.Time
 }
@@ -169,8 +177,22 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, win rec
 		created:     time.Now(),
 	}
 	t.idleSince.Store(time.Now().UnixNano())
+	h2t.CountError = func(errType string) {
+		if errType == "conn_close_lost_ping" {
+			t.pingLost.Store(true)
+		}
+	}
 
 	return t, nil
+}
+
+// pingJitter varies d at random by up to a quarter either way, so a client's
+// connections don't all ping on one clock.
+func pingJitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return d - d/4 + rand.N(d/2+1)
 }
 
 // openReserved issues an HTTP/2 CONNECT request to open a tunnel to the
@@ -231,6 +253,9 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 	start := time.Now()
 	readBefore := t.conn.bytesRead.Load()
 	resp, err := t.h2Roundtrip.RoundTrip(req)
+	if err != nil && t.pingLost.Load() {
+		err = fmt.Errorf("%w: %w", errPingLost, err)
+	}
 	if err != nil {
 		stop()
 		tunnelCancel()
@@ -320,6 +345,7 @@ func connFatal(err error) bool {
 	}
 	if errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, errSecondDial) ||
+		errors.Is(err, errPingLost) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
