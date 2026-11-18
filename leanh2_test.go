@@ -643,7 +643,7 @@ func TestLeanH2ClosesOnRapidReset(t *testing.T) {
 func TestRetiredTransportKeepsItsStreams(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
-	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{})
+	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{}, keepAlive{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -804,7 +804,7 @@ func TestLeanH2ResetReleasesUnreadUpload(t *testing.T) {
 func TestRetiredTransportWaitsForOpeningStream(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
-	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{})
+	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{}, keepAlive{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1082,7 +1082,7 @@ func TestPoolClosedWhileDialing(t *testing.T) {
 		pool.close()
 		c1, c2 := net.Pipe()
 		t.Cleanup(func() { c2.Close() })
-		tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{})
+		tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{}, keepAlive{})
 		created <- tr
 		return tr, err
 	})
@@ -1219,7 +1219,7 @@ func TestLeanH2ConnWindowUpdateWakesOnlyWaiters(t *testing.T) {
 func TestFailedOpenLeavesIdleSince(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
-	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{})
+	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{}, keepAlive{})
 	if err != nil {
 		t.Fatal(err)
 	}
