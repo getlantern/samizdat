@@ -207,8 +207,9 @@ func testStalledUploads(t *testing.T, lean bool) {
 		io.Copy(conn, conn)
 	})
 
-	// Four uploads the server can't pass on: 4MiB of its windows.
-	for range 4 {
+	// Uploads the server can't pass on, holding all but one tunnel's worth of
+	// the connection's window.
+	for range serverConnRecvWindow/serverStreamRecvWindow - 1 {
 		c, err := client.DialContext(context.Background(), "tcp", "stalled.example:443")
 		if err != nil {
 			t.Fatal(err)
@@ -231,11 +232,14 @@ func testStalledUploads(t *testing.T, lean bool) {
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(5 * time.Second))
-	// In a goroutine: a Write held up by flow control ignores the deadline.
-	go c.Write([]byte("hello"))
-	got := make([]byte, 5)
-	if _, err := io.ReadFull(c, got); err != nil || string(got) != "hello" {
-		t.Fatalf("a tunnel beside stalled uploads read %q, %v", got, err)
+	// More than the window left, so the server has to return what the echo
+	// reads as it goes. In a goroutine: a Write held up by flow control
+	// ignores the deadline.
+	msg := bytes.Repeat([]byte("samizdat"), 2*serverStreamRecvWindow/8)
+	go c.Write(msg)
+	got := make([]byte, len(msg))
+	if n, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("a tunnel beside stalled uploads echoed %d of %d bytes: %v", n, len(msg), err)
 	}
 }
 
