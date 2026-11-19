@@ -35,13 +35,13 @@ import (
 // uses: CONNECT streams, flow control, SETTINGS, PING, RST_STREAM and GOAWAY.
 // It never pushes and ignores priorities.
 
-// The settings and windows x/net's http2.Server advertises by default. The
-// lean server copies them, so its SETTINGS frame is the same.
+// The settings and windows the x/net server advertises (see newH2Server).
+// The lean server copies them, so its SETTINGS frame is the same.
 const (
 	leanMaxReadFrameSize  = 1 << 20
 	leanMaxHeaderListSize = http.DefaultMaxHeaderBytes + 32*10
-	leanStreamRecvWindow  = 1 << 20
-	leanConnRecvWindow    = 1 << 20
+	leanStreamRecvWindow  = serverStreamRecvWindow
+	leanConnRecvWindow    = serverConnRecvWindow
 
 	leanInitialPeerWindow = 65535 // until the client's SETTINGS says otherwise
 	leanDefaultMaxFrame   = 16384 // the client sends no SETTINGS_MAX_FRAME_SIZE
@@ -657,8 +657,10 @@ func (c *leanConn) handleData(f *http2.DataFrame) error {
 	} else {
 		st.recv.write(data)
 	}
+	// Even with nothing to return: the client's window just shrank, so
+	// credit held back may be due now.
+	c.creditConn(unread)
 	if unread > 0 {
-		c.creditConn(unread)
 		st.creditStream(unread)
 	}
 	if f.StreamEnded() {
@@ -668,11 +670,18 @@ func (c *leanConn) handleData(f *http2.DataFrame) error {
 	return nil
 }
 
-// creditConn returns n consumed bytes to the client's connection window,
-// batching WINDOW_UPDATEs. c.mu must be held.
+// creditConn returns n consumed bytes to the client's connection window.
+// WINDOW_UPDATEs are batched, but not once the client has no more window
+// left than it's owed, as with x/net's server: stalled streams may be
+// holding the rest, so the credit could be all that lets it send again.
+// c.mu must be held.
 func (c *leanConn) creditConn(n int64) {
 	c.connRecvUnacked += n
-	if c.connRecvUnacked >= leanConnRecvWindow/leanWindowUpdateDivisor {
+	if c.connRecvUnacked == 0 {
+		return
+	}
+	if c.connRecvUnacked >= leanConnRecvWindow/leanWindowUpdateDivisor ||
+		c.connRecvUnacked >= c.connRecvAvail {
 		c.cbuf = appendWindowUpdate(c.cbuf, 0, uint32(c.connRecvUnacked))
 		c.connRecvAvail += c.connRecvUnacked
 		c.connRecvUnacked = 0

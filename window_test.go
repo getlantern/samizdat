@@ -187,6 +187,62 @@ func TestStuckTunnelsLeaveOthersFlowing(t *testing.T) {
 	}
 }
 
+// TestStalledUploadsLeaveOthersFlowing: tunnels whose destinations have
+// stopped reading keep the server's windows full, and must not use up the
+// connection's window before the rest of its tunnels can send.
+func TestStalledUploadsLeaveOthersFlowing(t *testing.T) {
+	t.Run("xnet", func(t *testing.T) { testStalledUploads(t, false) })
+	t.Run("lean", func(t *testing.T) { testStalledUploads(t, true) })
+}
+
+func testStalledUploads(t *testing.T, lean bool) {
+	stop := make(chan struct{})
+	defer close(stop)
+	client, _, _ := startShapingPairWith(t, lean, true, true, func(ctx context.Context, conn net.Conn, destination string) {
+		defer conn.Close()
+		if destination == "stalled.example:443" {
+			<-stop // a destination that has stopped reading
+			return
+		}
+		io.Copy(conn, conn)
+	})
+
+	// Uploads the server can't pass on, holding all but one tunnel's worth of
+	// the connection's window.
+	for range serverConnRecvWindow/serverStreamRecvWindow - 1 {
+		c, err := client.DialContext(context.Background(), "tcp", "stalled.example:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		go func() {
+			buf := make([]byte, 64<<10)
+			for range 32 {
+				if _, err := c.Write(buf); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	time.Sleep(500 * time.Millisecond) // for their windows to fill
+
+	c, err := client.DialContext(context.Background(), "tcp", "echo.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	// More than the window left, so the server has to return what the echo
+	// reads as it goes. In a goroutine: a Write held up by flow control
+	// ignores the deadline.
+	msg := bytes.Repeat([]byte("samizdat"), 2*serverStreamRecvWindow/8)
+	go c.Write(msg)
+	got := make([]byte, len(msg))
+	if n, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("a tunnel beside stalled uploads echoed %d of %d bytes: %v", n, len(msg), err)
+	}
+}
+
 // TestReceiveWindowRange: windows x/net would silently replace with its own
 // defaults are refused.
 func TestReceiveWindowRange(t *testing.T) {

@@ -530,10 +530,22 @@ func ShortIDFromContext(ctx context.Context) ([8]byte, bool) {
 // Stream priorities are ignored either way, which a CONNECT tunnel doesn't use.
 func newH2Server(maxStreams int) *http2.Server {
 	return &http2.Server{
-		MaxConcurrentStreams: uint32(maxStreams),
-		NewWriteScheduler:    http2.NewRandomWriteScheduler,
+		MaxConcurrentStreams:         uint32(maxStreams),
+		MaxUploadBufferPerStream:     serverStreamRecvWindow,
+		MaxUploadBufferPerConnection: serverConnRecvWindow,
+		NewWriteScheduler:            http2.NewRandomWriteScheduler,
 	}
 }
+
+// How much a client may send ahead of what its destinations have read, per
+// tunnel and per connection, on either HTTP/2 server. A tunnel whose
+// destination stops reading keeps its window full, so the connection's holds
+// several: otherwise one stalled upload stops every other tunnel's uploads.
+// Memory is only used while uploads are actually backed up.
+const (
+	serverStreamRecvWindow = 1 << 20
+	serverConnRecvWindow   = 8 * serverStreamRecvWindow
+)
 
 // serveH2 serves HTTP/2 over the authenticated TLS connection, handling
 // CONNECT requests to establish proxy tunnels. rawConn is the accepted

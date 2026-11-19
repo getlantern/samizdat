@@ -39,12 +39,19 @@ type h2Peer struct {
 // returns a client connected to it.
 func startH2Pair(t *testing.T, lean bool, handler ConnHandler) *h2Peer {
 	t.Helper()
+	return startH2PairStreams(t, lean, 4, handler)
+}
+
+// startH2PairStreams is startH2Pair with a server that allows maxStreams
+// concurrent streams.
+func startH2PairStreams(t *testing.T, lean bool, maxStreams int, handler ConnHandler) *h2Peer {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	s := &Server{config: ServerConfig{MaxConcurrentStreams: 4, Handler: handler}}
+	s := &Server{config: ServerConfig{MaxConcurrentStreams: maxStreams, Handler: handler}}
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
@@ -742,12 +749,14 @@ func TestLeanH2LingeringWriteIsNotTruncated(t *testing.T) {
 }
 
 // TestLeanH2ResetReleasesUnreadUpload: data buffered for a stream the client
-// resets must go back to the shared connection window at once, even while
-// its handler is stuck, or sibling uploads stall.
+// resets must go back to the shared connection window, even while its
+// handler is stuck, or sibling uploads stall. Here stuck streams have used
+// up the whole window, so the credit can't be held back for a batch.
 func TestLeanH2ResetReleasesUnreadUpload(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
-	p := startH2Pair(t, true, func(ctx context.Context, conn net.Conn, dest string) {
+	stuck := leanConnRecvWindow / leanStreamRecvWindow
+	p := startH2PairStreams(t, true, stuck, func(ctx context.Context, conn net.Conn, dest string) {
 		if dest == "stuck:1" {
 			<-release // reads nothing and ignores its context
 			return
@@ -756,46 +765,58 @@ func TestLeanH2ResetReleasesUnreadUpload(t *testing.T) {
 		conn.Write([]byte(strconv.FormatInt(n, 10)))
 	})
 	p.handshake(t)
-	go func() {
+	// nextFrame returns the next frame on the stream that match accepts.
+	nextFrame := func(match func(http2.Frame) bool) http2.Frame {
+		t.Helper()
 		for {
-			if _, err := p.fr.ReadFrame(); err != nil {
-				return
+			f, err := p.fr.ReadFrame()
+			if err != nil {
+				t.Fatalf("connection lost: %v", err)
+			}
+			if match(f) {
+				return f
 			}
 		}
-	}()
-	// Fill the connection window (1 MiB) on stream 1, then reset it.
-	p.request(t, 1, "CONNECT", "stuck:1", false)
+	}
+	connCredit := func(f http2.Frame) bool {
+		wu, ok := f.(*http2.WindowUpdateFrame)
+		return ok && wu.StreamID == 0
+	}
+	nextFrame(connCredit) // the server's initial grant
+
+	// Fill the connection window with uploads nothing reads, then reset one.
 	chunk := make([]byte, 16384)
-	for sent := 0; sent < 1<<20-16384; sent += len(chunk) {
-		if err := p.fr.WriteData(1, false, chunk); err != nil {
-			t.Fatal(err)
+	upload := func(id uint32, dest string) {
+		t.Helper()
+		p.request(t, id, "CONNECT", dest, false)
+		for sent := 0; sent < leanStreamRecvWindow; sent += len(chunk) {
+			if err := p.fr.WriteData(id, false, chunk); err != nil {
+				t.Fatal(err)
+			}
 		}
+	}
+	for i := range stuck {
+		upload(uint32(2*i+1), "stuck:1")
 	}
 	if err := p.fr.WriteRSTStream(1, http2.ErrCodeCancel); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(200 * time.Millisecond)
-	// The server has credited the connection window back only if it
-	// released stream 1's buffered data: probe by checking the server
-	// accepts 1 MiB more on another stream without a FLOW_CONTROL error.
-	p.request(t, 3, "CONNECT", "count:1", false)
-	for sent := 0; sent < 1<<20-16384; sent += len(chunk) {
-		if err := p.fr.WriteData(3, false, chunk); err != nil {
-			t.Fatal(err)
-		}
+	if got := nextFrame(connCredit).(*http2.WindowUpdateFrame).Increment; got < leanStreamRecvWindow {
+		t.Fatalf("the reset returned %d bytes of connection window, want %d", got, leanStreamRecvWindow)
 	}
-	if err := p.fr.WriteData(3, true, nil); err != nil {
+
+	// And the server takes that much more, on a stream in the freed slot.
+	probe := uint32(2*stuck + 1)
+	upload(probe, "count:1")
+	if err := p.fr.WriteData(probe, true, nil); err != nil {
 		t.Fatal(err)
 	}
-	// A server that kept stream 1's bytes would see stream 3 overrun the
-	// connection window and drop the connection.
-	time.Sleep(300 * time.Millisecond)
-	if err := p.fr.WritePing(false, [8]byte{}); err != nil {
-		t.Fatalf("connection dropped: %v", err)
-	}
-	time.Sleep(100 * time.Millisecond)
-	if err := p.fr.WritePing(false, [8]byte{}); err != nil {
-		t.Fatalf("connection dropped: %v", err)
+	f := nextFrame(func(f http2.Frame) bool {
+		_, ok := f.(*http2.DataFrame)
+		return ok && f.Header().StreamID == probe
+	})
+	if got, want := string(f.(*http2.DataFrame).Data()), strconv.Itoa(leanStreamRecvWindow); got != want {
+		t.Fatalf("the new stream's handler got %s bytes, want %s", got, want)
 	}
 }
 
