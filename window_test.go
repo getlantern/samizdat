@@ -187,6 +187,58 @@ func TestStuckTunnelsLeaveOthersFlowing(t *testing.T) {
 	}
 }
 
+// TestStalledUploadsLeaveOthersFlowing: tunnels whose destinations have
+// stopped reading keep the server's windows full, and must not use up the
+// connection's window before the rest of its tunnels can send.
+func TestStalledUploadsLeaveOthersFlowing(t *testing.T) {
+	t.Run("xnet", func(t *testing.T) { testStalledUploads(t, false) })
+	t.Run("lean", func(t *testing.T) { testStalledUploads(t, true) })
+}
+
+func testStalledUploads(t *testing.T, lean bool) {
+	stop := make(chan struct{})
+	defer close(stop)
+	client, _, _ := startShapingPairWith(t, lean, true, true, func(ctx context.Context, conn net.Conn, destination string) {
+		defer conn.Close()
+		if destination == "stalled.example:443" {
+			<-stop // a destination that has stopped reading
+			return
+		}
+		io.Copy(conn, conn)
+	})
+
+	// Four uploads the server can't pass on: 4MiB of its windows.
+	for range 4 {
+		c, err := client.DialContext(context.Background(), "tcp", "stalled.example:443")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		go func() {
+			buf := make([]byte, 64<<10)
+			for range 32 {
+				if _, err := c.Write(buf); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	time.Sleep(500 * time.Millisecond) // for their windows to fill
+
+	c, err := client.DialContext(context.Background(), "tcp", "echo.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	// In a goroutine: a Write held up by flow control ignores the deadline.
+	go c.Write([]byte("hello"))
+	got := make([]byte, 5)
+	if _, err := io.ReadFull(c, got); err != nil || string(got) != "hello" {
+		t.Fatalf("a tunnel beside stalled uploads read %q, %v", got, err)
+	}
+}
+
 // TestReceiveWindowRange: windows x/net would silently replace with its own
 // defaults are refused.
 func TestReceiveWindowRange(t *testing.T) {

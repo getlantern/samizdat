@@ -35,13 +35,13 @@ import (
 // uses: CONNECT streams, flow control, SETTINGS, PING, RST_STREAM and GOAWAY.
 // It never pushes and ignores priorities.
 
-// The settings and windows x/net's http2.Server advertises by default. The
-// lean server copies them, so its SETTINGS frame is the same.
+// The settings and windows the x/net server advertises (see newH2Server).
+// The lean server copies them, so its SETTINGS frame is the same.
 const (
 	leanMaxReadFrameSize  = 1 << 20
 	leanMaxHeaderListSize = http.DefaultMaxHeaderBytes + 32*10
-	leanStreamRecvWindow  = 1 << 20
-	leanConnRecvWindow    = 1 << 20
+	leanStreamRecvWindow  = serverStreamRecvWindow
+	leanConnRecvWindow    = serverConnRecvWindow
 
 	leanInitialPeerWindow = 65535 // until the client's SETTINGS says otherwise
 	leanDefaultMaxFrame   = 16384 // the client sends no SETTINGS_MAX_FRAME_SIZE
