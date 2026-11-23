@@ -209,7 +209,9 @@ func testStalledUploads(t *testing.T, lean bool) {
 
 	// Uploads the server can't pass on, holding all but one tunnel's worth of
 	// the connection's window.
-	for range serverConnRecvWindow/serverStreamRecvWindow - 1 {
+	stalled := serverConnRecvWindow/serverStreamRecvWindow - 1
+	filled := make(chan struct{}, stalled)
+	for range stalled {
 		c, err := client.DialContext(context.Background(), "tcp", "stalled.example:443")
 		if err != nil {
 			t.Fatal(err)
@@ -217,14 +219,21 @@ func testStalledUploads(t *testing.T, lean bool) {
 		defer c.Close()
 		go func() {
 			buf := make([]byte, 64<<10)
-			for range 32 {
-				if _, err := c.Write(buf); err != nil {
+			for written := 0; written < 2*serverStreamRecvWindow; {
+				n, err := c.Write(buf)
+				if written < serverStreamRecvWindow && written+n >= serverStreamRecvWindow {
+					filled <- struct{}{}
+				}
+				written += n
+				if err != nil {
 					return
 				}
 			}
 		}()
 	}
-	time.Sleep(500 * time.Millisecond) // for their windows to fill
+	for range stalled {
+		waitFor(t, filled, "a stalled upload to write a full window")
+	}
 
 	c, err := client.DialContext(context.Background(), "tcp", "echo.example:443")
 	if err != nil {
