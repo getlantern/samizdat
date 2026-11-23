@@ -3,6 +3,7 @@ package samizdat
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -266,6 +267,26 @@ func TestConnFatalErrnos(t *testing.T) {
 	}
 	if connFatal(fmt.Errorf("CONNECT: %w", syscall.EINVAL)) {
 		t.Error("connFatal(EINVAL) = true")
+	}
+}
+
+func TestMarkPingLost(t *testing.T) {
+	var tr h2Transport
+	lost := errors.New("http2: client connection lost")
+	if got := tr.markPingLost(lost); connFatal(got) {
+		t.Errorf("without a lost ping, %v is conn-fatal", got)
+	}
+
+	tr.pingLost.Store(true)
+	if got := tr.markPingLost(lost); !connFatal(got) {
+		t.Errorf("after a lost ping, %v is not conn-fatal", got)
+	}
+	reset := http2.StreamError{StreamID: 3, Code: http2.ErrCodeRefusedStream}
+	if got := tr.markPingLost(reset); got != error(reset) {
+		t.Errorf("stream reset became %v", got)
+	}
+	if tr.markPingLost(nil) != nil {
+		t.Error("nil error was wrapped")
 	}
 }
 

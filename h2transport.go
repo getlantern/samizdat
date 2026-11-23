@@ -346,9 +346,7 @@ func (t *h2Transport) openReserved(ctx context.Context, destination string) (net
 			"age", time.Since(t.created))
 		return nil, fmt.Errorf("CONNECT to %s: %w", destination, errConnectUnanswered)
 	}
-	if err != nil && t.pingLost.Load() {
-		err = fmt.Errorf("%w: %w", errPingLost, err)
-	}
+	err = t.markPingLost(err)
 	if err != nil {
 		stop()
 		tunnelCancel()
@@ -452,6 +450,15 @@ func connFatal(err error) bool {
 		}
 	}
 	return false
+}
+
+// markPingLost wraps err in errPingLost if the connection lost a ping. A
+// stream reset is about that stream alone, so it's left as it is even then.
+func (t *h2Transport) markPingLost(err error) error {
+	if err == nil || !t.pingLost.Load() || errors.As(err, new(http2.StreamError)) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errPingLost, err)
 }
 
 // tryReserve takes a stream slot if the transport has one, atomically, so
