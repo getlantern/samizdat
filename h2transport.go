@@ -183,7 +183,11 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, win rec
 	h2t.DisableCompression = true
 	h2t.StrictMaxConcurrentStreams = true
 	// x/net closes the connection when a ping goes unanswered, which fails
-	// its streams and sends the next CONNECT to a new connection.
+	// its streams and sends the next CONNECT to a new connection. It pings
+	// pooled connections with no streams too, until IdleTimeout closes them,
+	// so a dead one is gone before a CONNECT waits out connectAnswerTimeout
+	// on it. A ping sent during connection-start shaping rides the
+	// schedule's next record; it isn't held until the schedule ends.
 	if ka.interval > 0 {
 		h2t.ReadIdleTimeout = ka.interval
 		h2t.PingTimeout = ka.timeout
