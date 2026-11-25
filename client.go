@@ -214,6 +214,9 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 	transport, err := newH2Transport(conn, c.config.ServerAddr, c.config.MaxStreamsPerConn, receiveWindows{
 		perStream: c.config.MaxReceiveBufferPerStream,
 		perConn:   c.config.MaxReceiveBufferPerConn,
+	}, keepAlive{
+		interval: pingJitter(c.config.KeepAliveInterval),
+		timeout:  c.config.KeepAliveTimeout,
 	})
 	if err != nil {
 		conn.Close()

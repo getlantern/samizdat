@@ -89,6 +89,17 @@ type ClientConfig struct {
 	IdleTimeout       time.Duration // close idle connections after (default: 5m)
 	ConnectTimeout    time.Duration // TCP+TLS connect timeout (default: 15s)
 
+	// KeepAliveInterval is how long a connection can read nothing before the
+	// client pings it, and KeepAliveTimeout how long the reply can take
+	// before the connection is closed (defaults: 15s and 10s). Each
+	// connection uses an interval up to a quarter shorter or longer, so they
+	// don't all ping together. Idle connections are pinged too, until
+	// IdleTimeout closes them. Without the pings, a connection that a
+	// network drops silently looks alive until TCP gives up on it, which can
+	// take minutes. A negative KeepAliveInterval turns them off.
+	KeepAliveInterval time.Duration
+	KeepAliveTimeout  time.Duration
+
 	// MaxReceiveBufferPerStream and MaxReceiveBufferPerConn bound how much
 	// the server may send ahead of what the client has read, per tunnel and
 	// per connection (defaults: 512KiB and 8MiB). Every new tunnel's response
@@ -123,6 +134,12 @@ func (c *ClientConfig) applyDefaults() {
 	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = 5 * time.Minute
+	}
+	if c.KeepAliveInterval == 0 {
+		c.KeepAliveInterval = 15 * time.Second
+	}
+	if c.KeepAliveTimeout <= 0 {
+		c.KeepAliveTimeout = 10 * time.Second
 	}
 	if c.MaxReceiveBufferPerStream == 0 {
 		c.MaxReceiveBufferPerStream = 512 << 10

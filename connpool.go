@@ -167,6 +167,11 @@ func (p *connPool) cleanup() {
 	now := time.Now()
 	alive := make([]*h2Transport, 0, len(p.transports))
 	for _, t := range p.transports {
+		// A connection closed under its transport, by a lost ping say, takes
+		// no new streams; the transport goes once the ones it had have ended.
+		if t.conn.closed.Load() {
+			t.retireWithReason("connection closed under the transport")
+		}
 		if t.isClosed() {
 			continue
 		}
