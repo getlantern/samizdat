@@ -10,7 +10,7 @@ The name comes from the Russian *самиздат*: banned writing, copied by ha
 
 | Technique | Source | Samizdat's answer |
 |---|---|---|
-| Fingerprinting the start of a connection by packet sizes and directions | CenKL, IEEE S&P 2027 | The first 10 TLS records after the handshake follow sizes and directions drawn from the authors' model of 326.5M real TLS flows; Go's dynamic record sizing is off |
+| Fingerprinting the start of a connection by packet sizes and directions | CenKL, IEEE S&P 2027 | The first 10 packets after the handshake follow sizes and directions drawn from the authors' model of 326.5M real TLS flows, in TLS records that span packets the way a real server's do; Go's dynamic record sizing is off |
 | Active probing, including replaying a captured handshake | Alice et al., IMC 2020; REALITY replay PoC, net4people #576 | Every connection that doesn't authenticate, or repeats a SessionID, is forwarded byte for byte to the real cover site, including probes that aren't TLS; accepted SessionIDs are remembered and refused again |
 | Copying an authentication tag into another handshake | — | Version 2 tags are bound to the whole ClientHello and the client's key share |
 | First-packet entropy and length (Shadowsocks) | Alice et al., IMC 2020 | A standard TLS 1.3 ClientHello from uTLS with Chrome's fingerprint |
@@ -32,7 +32,7 @@ Client                                       Server
   |    auth tag in the SessionID               |  verify tag; if it fails or repeats,
   |  <---- ServerHello, server's certificate   |  forward everything to the cover site
   |                                            |
-  |  first 10 TLS records: shaped schedule     |  same schedule, from the same TLS secret
+  |  first 10 packets: shaped schedule         |  same schedule, from the same TLS secret
   |    (HTTP/2 preface, SETTINGS, CONNECT      |
   |     carried inside, padded to size)        |
   |                                            |
@@ -72,8 +72,9 @@ After reading the ClientHello to check its tag, the server forwards it and every
 CenKL (Ortwein et al., IEEE S&P 2027) found that every proxy it tested could be told from real TLS within the first few packets after the handshake, and that HTTP/2 tunnels in particular open with a distinctive preface, SETTINGS and CONNECT. Following the authors' ProxyShaper (`shaping.go`, `shapingmodel.go`):
 
 - Both ends export 40 bytes of keying material from the TLS session. 32 bytes seed a ChaCha8 sampler; 8 bytes key an HMAC over the schedule, whose first 8 bytes are the marker.
-- The sampler draws 10 records' sizes and directions from the authors' released order-1 Markov model (`shaping_model.bin.gz`), each conditioned on the previous one. Sizes above 1,448 bytes, which a Linux sender with TCP timestamps splits into two packets, are left out.
-- During the schedule each side sends exactly its scheduled records: a 2-byte length, queued HTTP/2 bytes, then padding (the client's first record starts with the 8-byte marker). After the 10th record, data passes straight through.
+- The sampler draws 10 packets' sizes and directions from the authors' released order-1 Markov model (`shaping_model.bin.gz`), each conditioned on the previous one. Sizes above 1,448 bytes, which a Linux sender with TCP timestamps splits into two packets, are left out.
+- The packets become TLS records. A full-size (1,448-byte) packet and the next packet from the same side are one record, which TCP cuts back into those packets, as when a real server writes a record larger than a packet; every other packet is a record of its own. Censors can read record lengths from the record headers, and one record per packet, none longer than a packet, isn't what real servers send. Clients from before this send one record per packet under a different marker, and servers accept both.
+- During the schedule each side sends exactly its planned records: a 2-byte length, queued HTTP/2 bytes, then padding (the client's first record starts with the 8-byte marker). After the 10th record, data passes straight through.
 - The server reads the client's first 8 bytes: the marker means a shaping client; an HTTP/2 preface means an older client, served as before. `ClientConfig.DisableShaping` stops a client shaping, which works with any server; `ServerConfig.DisableShaping` stops a server accepting shaping clients, so its clients must disable it too.
 - Shaping applies to authenticated HTTP/2 connections; the masquerade path and `SessionHandler` connections aren't shaped.
 - Go's dynamic TLS record sizing is off on both ends, and while a server accepts shaping it issues no session tickets: both added tells of their own.
@@ -98,7 +99,7 @@ On a real 261ms path shaped to 5Mbit with 0.5% loss, a new tunnel opened while t
 - **Timing isn't shaped.**
 - **Tunnelled TLS is still inside.** Applications using samizdat bring their own TLS. Multiplexing helps most with several concurrent streams.
 - **Streams share one TCP connection.** A lost packet holds up every stream on it until it's resent, and a new tunnel still waits for the write under way and a turn of each running download. In the test above, Shadowsocks, with one connection per tunnel, answered in 0.58s.
-- **Shaping covers 10 records.** After that, traffic is whatever the tunnelled applications send. The schedule fixes TLS record sizes; TCP can still split or merge them into packets.
+- **Shaping covers 10 packets.** After that, traffic is whatever the tunnelled applications send. The schedule fixes TLS record sizes; on a path whose MSS is under 1,448 bytes, or when records go out back to back, TCP can still split or merge them into other packets.
 - **The model is one network's view:** one regional ISP, late 2025. Its data license is still being settled with the authors.
 - **The replay record is in memory and bounded.** A restarted server has forgotten the SessionIDs it accepted, and more than `ReplayCapacity` in one window shortens how long they're remembered.
 - **Not independently reviewed.** Version 2 auth hasn't had an outside cryptographic review.

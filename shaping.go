@@ -21,12 +21,21 @@ import (
 // exchange and CONNECT, which CenKL (Ortwein et al., IEEE S&P 2027) found
 // distinguish HTTP/2 proxies from real TLS within the first few packets.
 // With shaping, client and server instead exchange the first
-// shapingRecords TLS records on a schedule of sizes and directions drawn
-// from CenKL's model of real TLS (shapingmodel.go), as its ProxyShaper does:
+// shapingRecords packets on a schedule of sizes and directions drawn from
+// CenKL's model of real TLS (shapingmodel.go), as its ProxyShaper does:
 //
 //   - Both ends export keying material from the TLS session and seed the
 //     same sampler with it, so they draw the same schedule without sending
-//     it. The schedule's first record is always the client's.
+//     it. The schedule's first packet is always the client's.
+//   - The packets become TLS records. A full-size packet (shapingMaxPacket)
+//     and the next packet from the same side are one record, as when a real
+//     server writes a record larger than a packet: TCP cuts it into the
+//     scheduled packets, and only the first carries a record header. Every
+//     other packet is a record of its own. Censors read record lengths from
+//     the headers, and one record per packet, with none longer than a
+//     packet, isn't what real servers send. Clients that came before
+//     this, the legacy plan, send a record per packet; servers accept
+//     both.
 //   - On its turn, a side sends exactly one record of the scheduled size:
 //     a 2-byte length, that much of what it has queued to send, and padding.
 //     With nothing queued it sends padding alone. It reads exactly the
@@ -34,19 +43,18 @@ import (
 //   - The client's first record starts with a marker from the keying
 //     material and the schedule. A server that accepts shaping reads the
 //     client's first 8 bytes: the marker means a shaping client that drew
-//     the server's schedule, anything else (an HTTP/2 preface) a client
+//     the server's records, anything else (an HTTP/2 preface) a client
 //     that doesn't shape, whose bytes are replayed. A client that drew
-//     another schedule, from another version of the model or the sampler,
-//     sends another marker, and the connection fails at once as a bad
-//     HTTP/2 preface rather than partway through mismatched records.
+//     other records, from another version of the model, the sampler or the
+//     way packets become records, sends another marker, and the connection
+//     fails at once as a bad HTTP/2 preface rather than partway through
+//     mismatched records.
 //   - After the schedule both sides pass data straight through.
 //
-// The schedule fixes TLS record sizes and directions (dynamic record sizing
-// is off on both sides, so one Write is one record). The model is of TCP
-// packets, and a record usually leaves as one packet of its size, but TCP
-// may split one larger than the path's MSS (a 1460-byte record on a path
-// whose MSS is 1448) or coalesce records written back to back. Timing isn't
-// shaped.
+// Dynamic record sizing is off on both sides, so one Write is one record.
+// A record leaves as the packets it was planned from on a path whose MSS
+// is shapingMaxPacket, but TCP cuts at a smaller MSS where the path has one
+// and may coalesce records written back to back. Timing isn't shaped.
 
 const (
 	shapingRecords = 10
@@ -70,26 +78,66 @@ const (
 // side's next turn. A variable for tests.
 var shapingGrace = 5 * time.Millisecond
 
-// shapingSchedule derives the schedule and the client's marker from a TLS
-// session's exported keying material.
-func shapingSchedule(ekm func(label string, context []byte, length int) ([]byte, error)) ([]int, [shapingMarkerLen]byte, error) {
-	km, err := ekm(shapingLabel, nil, 32+shapingMarkerLen)
-	if err != nil {
-		return nil, [shapingMarkerLen]byte{}, err
-	}
-	sched, err := shapingDraw([32]byte(km[:32]))
-	if err != nil {
-		return nil, [shapingMarkerLen]byte{}, err
-	}
-	return sched, shapingMarker(km[32:], sched), nil
+// shapingPlan is what a shaped connection runs: the signed on-the-wire
+// sizes of its records, positive for client to server, and the marker a
+// client running them sends.
+type shapingPlan struct {
+	records []int
+	marker  [shapingMarkerLen]byte
 }
 
-// shapingMarker is the marker a client that drew sched sends: the two ends
-// each draw the schedule from their own copy of the model, and the marker
-// matches only if they drew the same one.
-func shapingMarker(secret []byte, sched []int) [shapingMarkerLen]byte {
+// shapingUseLegacy makes clients run the legacy plan. For tests.
+var shapingUseLegacy bool
+
+// shapingPlans derives, from a TLS session's exported keying material, the
+// plan clients run and the legacy plan of clients from before records
+// spanned packets, which servers accept as well until those clients are
+// gone.
+func shapingPlans(ekm func(label string, context []byte, length int) ([]byte, error)) (current, legacy shapingPlan, err error) {
+	km, err := ekm(shapingLabel, nil, 32+shapingMarkerLen)
+	if err != nil {
+		return shapingPlan{}, shapingPlan{}, err
+	}
+	packets, err := shapingDraw([32]byte(km[:32]))
+	if err != nil {
+		return shapingPlan{}, shapingPlan{}, err
+	}
+	secret := km[32:]
+	records := shapingSpanRecords(packets)
+	current = shapingPlan{records: records, marker: shapingMarker(secret, true, records)}
+	legacy = shapingPlan{records: packets, marker: shapingMarker(secret, false, packets)}
+	return current, legacy, nil
+}
+
+// shapingSpanRecords turns a schedule of packets into records: a
+// full-size packet and the next packet from the same side are one record,
+// which TCP cuts back into those packets, and every other packet is a
+// record of its own.
+func shapingSpanRecords(packets []int) []int {
+	var records []int
+	open := false // the last record ends in a full-size packet
+	for _, p := range packets {
+		if n := len(records); open && (p > 0) == (records[n-1] > 0) && abs(records[n-1])+abs(p) <= shapingMaxSize {
+			records[n-1] += p // same sign, so the record grows in its direction
+		} else {
+			records = append(records, p)
+		}
+		open = abs(p) == shapingMaxPacket
+	}
+	return records
+}
+
+// shapingMarker is the marker a client that planned records sends: the two
+// ends each plan them from their own copy of the model, and the marker
+// matches only if they planned the same ones. spanning marks the plans whose
+// records span packets, so their markers differ from the legacy plan's for
+// the same records.
+func shapingMarker(secret []byte, spanning bool, records []int) [shapingMarkerLen]byte {
 	mac := hmac.New(sha256.New, secret)
-	for _, s := range sched {
+	if spanning {
+		mac.Write([]byte{2})
+	}
+	for _, s := range records {
 		binary.Write(mac, binary.BigEndian, int32(s))
 	}
 	var marker [shapingMarkerLen]byte
@@ -489,14 +537,14 @@ func (c *replayedTLSConn) Read(b []byte) (int, error) {
 // bytes to tell whether it shapes. A variable for tests.
 var shapingPeekTimeout = 10 * time.Second
 
-// acceptShaping tells a shaping client from one that doesn't by its first
-// bytes, and returns the connection to serve HTTP/2 on.
+// acceptShaping tells a shaping client, of either plan, from one that
+// doesn't by its first bytes, and returns the connection to serve HTTP/2 on.
 func acceptShaping(tc *tls.Conn) (net.Conn, error) {
 	state := tc.ConnectionState()
 	if state.Version != tls.VersionTLS13 {
 		return tc, nil
 	}
-	sched, marker, err := shapingSchedule(state.ExportKeyingMaterial)
+	current, legacy, err := shapingPlans(state.ExportKeyingMaterial)
 	if err != nil {
 		return nil, err
 	}
@@ -507,8 +555,10 @@ func acceptShaping(tc *tls.Conn) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if first != marker {
-		return &replayedTLSConn{Conn: tc, prefix: first[:]}, nil
+	for _, p := range []shapingPlan{current, legacy} {
+		if first == p.marker {
+			return &shapedTLSConn{shapedConn: newShapedConn(tc, p.records, false, p.marker, true), tls: tc}, nil
+		}
 	}
-	return &shapedTLSConn{shapedConn: newShapedConn(tc, sched, false, marker, true), tls: tc}, nil
+	return &replayedTLSConn{Conn: tc, prefix: first[:]}, nil
 }
