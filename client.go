@@ -199,12 +199,15 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 
 	var conn net.Conn = uConn
 	if state := uConn.ConnectionState(); !c.config.DisableShaping && state.Version == utls.VersionTLS13 {
-		sched, marker, err := shapingSchedule(state.ExportKeyingMaterial)
+		plan, legacy, err := shapingPlans(state.ExportKeyingMaterial)
 		if err != nil {
 			uConn.Close()
 			return nil, fmt.Errorf("shaping: %w", err)
 		}
-		conn = newShapedConn(uConn, sched, true, marker, false)
+		if shapingUseLegacy {
+			plan = legacy
+		}
+		conn = newShapedConn(uConn, plan.records, true, plan.marker, false)
 	}
 
 	// Create H2 transport over the TLS connection

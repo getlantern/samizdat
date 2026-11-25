@@ -26,35 +26,72 @@ func fixedEKM(seed byte) func(string, []byte, int) ([]byte, error) {
 }
 
 // TestShapingScheduleDeterministic: the same keying material gives both ends
-// the same schedule and marker, different material a different schedule,
-// and every schedule fits the framing and starts with the client.
+// the same plans and markers, different material a different schedule,
+// every schedule fits the framing and starts with the client, and the
+// current plan's records carry the legacy plan's packets.
 func TestShapingScheduleDeterministic(t *testing.T) {
-	a, ma, err := shapingSchedule(fixedEKM(1))
+	a, la, err := shapingPlans(fixedEKM(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, mb, _ := shapingSchedule(fixedEKM(1))
-	if !slices.Equal(a, b) || ma != mb {
-		t.Fatalf("same keying material, different schedules: %v / %v", a, b)
+	b, lb, _ := shapingPlans(fixedEKM(1))
+	if !slices.Equal(a.records, b.records) || a.marker != b.marker || !slices.Equal(la.records, lb.records) || la.marker != lb.marker {
+		t.Fatalf("same keying material, different plans: %v / %v", a.records, b.records)
 	}
-	if len(a) != shapingRecords {
-		t.Fatalf("schedule of %d records, want %d", len(a), shapingRecords)
+	if len(la.records) != shapingPackets {
+		t.Fatalf("schedule of %d packets, want %d", len(la.records), shapingPackets)
+	}
+	if a.marker == la.marker {
+		t.Fatal("current and legacy plans share a marker")
 	}
 	differ := false
 	for seed := byte(2); seed < 200; seed++ {
-		s, _, err := shapingSchedule(fixedEKM(seed))
+		cur, legacy, err := shapingPlans(fixedEKM(seed))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !shapingScheduleFits(s) {
-			t.Fatalf("seed %d: schedule %v doesn't fit the framing", seed, s)
+		if !shapingScheduleFits(legacy.records) {
+			t.Fatalf("seed %d: schedule %v doesn't fit the framing", seed, legacy.records)
 		}
-		if !slices.Equal(s, a) {
+		if !slices.Equal(cur.records, shapingSpanRecords(legacy.records)) {
+			t.Fatalf("seed %d: records %v aren't the packets %v spanned", seed, cur.records, legacy.records)
+		}
+		if !slices.Equal(legacy.records, la.records) {
 			differ = true
 		}
 	}
 	if !differ {
 		t.Fatal("every seed gave the same schedule")
+	}
+}
+
+// TestShapingSpanRecords: a full-size packet and the next from the same side
+// are one record, through a run of them; a full-size packet followed by the
+// other side's, or ending the schedule, is a record of its own; and no
+// record outgrows a TLS record.
+func TestShapingSpanRecords(t *testing.T) {
+	const f = shapingMaxPacket
+	for _, c := range []struct{ packets, records []int }{
+		{[]int{100, -200, 300}, []int{100, -200, 300}},
+		{[]int{100, -f, -f, -300, 50}, []int{100, -(2*f + 300), 50}},
+		{[]int{100, -f, -f}, []int{100, -2 * f}},
+		{[]int{f, -f, 20, -f}, []int{f, -f, 20, -f}},
+		{[]int{f, 20, -30}, []int{f + 20, -30}},
+		{[]int{100, -1440, -300}, []int{100, -1440, -300}},
+		{[]int{100, -300, -f}, []int{100, -300, -f}},
+	} {
+		if got := shapingSpanRecords(c.packets); !slices.Equal(got, c.records) {
+			t.Errorf("packets %v: records %v, want %v", c.packets, got, c.records)
+		}
+	}
+	long := []int{1}
+	for range 14 {
+		long = append(long, -f)
+	}
+	for _, r := range shapingSpanRecords(long) {
+		if abs(r) > shapingMaxSize {
+			t.Fatalf("record of %d bytes from %v", abs(r), long)
+		}
 	}
 }
 
@@ -269,7 +306,8 @@ func TestShapingEndToEnd(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if !slices.Equal(scheds[true], scheds[false]) || len(scheds[true]) != shapingRecords {
+			// Records that span packets make fewer records than packets.
+			if !slices.Equal(scheds[true], scheds[false]) || len(scheds[true]) == 0 || len(scheds[true]) > shapingPackets {
 				t.Fatalf("client schedule %v, server %v", scheds[true], scheds[false])
 			}
 			var mine = map[bool][]int{}
@@ -283,6 +321,38 @@ func TestShapingEndToEnd(t *testing.T) {
 				t.Errorf("server records %v don't include its schedule %v", got[:min(len(got), 20)], mine[false])
 			}
 		})
+	}
+}
+
+// TestShapingRecordsSpanPackets: a server's full-size packets and the
+// packets after them go out as one record, on both HTTP/2 servers, and a
+// legacy client, sending a record per packet, still works against the same
+// server, which then answers it in kind.
+func TestShapingRecordsSpanPackets(t *testing.T) {
+	const f = shapingMaxPacket
+	shapingScheduleOverride = []int{100, -f, -f, -300, 200, -f, -100, 50, -f, 60}
+	defer func() { shapingScheduleOverride = nil }()
+	for _, legacy := range []bool{false, true} {
+		for _, lean := range []bool{false, true} {
+			t.Run(fmt.Sprintf("legacy=%v/lean=%v", legacy, lean), func(t *testing.T) {
+				shapingUseLegacy = legacy
+				defer func() { shapingUseLegacy = false }()
+				client, fromServer, fromClient := startShapingPair(t, lean, true, true)
+				if err := echoThrough(t, client, 64<<10); err != nil {
+					t.Fatal(err)
+				}
+				wantServer, wantClient := []int{2*f + 300, f + 100, f}, []int{100, 200, 50, 60}
+				if legacy {
+					wantServer = []int{f, f, 300, f, 100, f}
+				}
+				if got := appDataRecordSizes(t, fromServer.bytes()); !containsRun(got, wantServer) {
+					t.Errorf("server records %v don't include %v", got[:min(len(got), 20)], wantServer)
+				}
+				if got := appDataRecordSizes(t, fromClient.bytes()); !containsRun(got, wantClient) {
+					t.Errorf("client records %v don't include %v", got[:min(len(got), 20)], wantClient)
+				}
+			})
+		}
 	}
 }
 
@@ -611,30 +681,36 @@ func TestShapingParseRejectsMissingFirstRow(t *testing.T) {
 func TestShapingMarkerBindsSchedule(t *testing.T) {
 	secret := []byte("12345678")
 	a := []int{100, -200, 300}
-	if shapingMarker(secret, a) != shapingMarker(secret, slices.Clone(a)) {
-		t.Fatal("same schedule, different markers")
-	}
-	for _, b := range [][]int{{100, -200, 301}, {100, 200, 300}, {100, -200}, {100, -200, 300, 40}} {
-		if shapingMarker(secret, a) == shapingMarker(secret, b) {
-			t.Errorf("schedules %v and %v share a marker", a, b)
+	for _, spanning := range []bool{false, true} {
+		if shapingMarker(secret, spanning, a) != shapingMarker(secret, spanning, slices.Clone(a)) {
+			t.Fatal("same schedule, different markers")
+		}
+		for _, b := range [][]int{{100, -200, 301}, {100, 200, 300}, {100, -200}, {100, -200, 300, 40}} {
+			if shapingMarker(secret, spanning, a) == shapingMarker(secret, spanning, b) {
+				t.Errorf("schedules %v and %v share a marker", a, b)
+			}
+		}
+		if shapingMarker(secret, spanning, a) == shapingMarker([]byte("87654321"), spanning, a) {
+			t.Error("different keying material, same marker")
 		}
 	}
-	if shapingMarker(secret, a) == shapingMarker([]byte("87654321"), a) {
-		t.Error("different keying material, same marker")
+	// Records that are the same under both plans still get two markers.
+	if shapingMarker(secret, false, a) == shapingMarker(secret, true, a) {
+		t.Error("legacy and spanning plans share a marker")
 	}
 
 	// The same keying material under two models gives two markers.
-	_, withModel, err := shapingSchedule(fixedEKM(1))
+	withModel, _, err := shapingPlans(fixedEKM(1))
 	if err != nil {
 		t.Fatal(err)
 	}
 	shapingScheduleOverride = []int{100, -200, 300}
 	defer func() { shapingScheduleOverride = nil }()
-	_, withOther, err := shapingSchedule(fixedEKM(1))
+	withOther, _, err := shapingPlans(fixedEKM(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if withModel == withOther {
+	if withModel.marker == withOther.marker {
 		t.Fatal("two schedules from the same keying material share a marker")
 	}
 }
@@ -680,7 +756,7 @@ func TestShapingScheduleCapsPackets(t *testing.T) {
 	rng := mrand.New(mrand.NewChaCha8([32]byte{7}))
 	at1448 := 0
 	for range 5000 {
-		for _, s := range m.schedule(rng, shapingRecords, true) {
+		for _, s := range m.schedule(rng, shapingPackets, true) {
 			if abs(s) > shapingMaxPacket {
 				t.Fatalf("schedule asks for a %d-byte packet", abs(s))
 			}
