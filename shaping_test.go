@@ -38,8 +38,8 @@ func TestShapingScheduleDeterministic(t *testing.T) {
 	if !slices.Equal(a.records, b.records) || a.marker != b.marker || !slices.Equal(la.records, lb.records) || la.marker != lb.marker {
 		t.Fatalf("same keying material, different plans: %v / %v", a.records, b.records)
 	}
-	if len(la.records) != shapingRecords {
-		t.Fatalf("schedule of %d packets, want %d", len(la.records), shapingRecords)
+	if len(la.records) != shapingPackets {
+		t.Fatalf("schedule of %d packets, want %d", len(la.records), shapingPackets)
 	}
 	if a.marker == la.marker {
 		t.Fatal("current and legacy plans share a marker")
@@ -307,7 +307,7 @@ func TestShapingEndToEnd(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			// Records that span packets make fewer records than packets.
-			if !slices.Equal(scheds[true], scheds[false]) || len(scheds[true]) == 0 || len(scheds[true]) > shapingRecords {
+			if !slices.Equal(scheds[true], scheds[false]) || len(scheds[true]) == 0 || len(scheds[true]) > shapingPackets {
 				t.Fatalf("client schedule %v, server %v", scheds[true], scheds[false])
 			}
 			var mine = map[bool][]int{}
@@ -756,7 +756,7 @@ func TestShapingScheduleCapsPackets(t *testing.T) {
 	rng := mrand.New(mrand.NewChaCha8([32]byte{7}))
 	at1448 := 0
 	for range 5000 {
-		for _, s := range m.schedule(rng, shapingRecords, true) {
+		for _, s := range m.schedule(rng, shapingPackets, true) {
 			if abs(s) > shapingMaxPacket {
 				t.Fatalf("schedule asks for a %d-byte packet", abs(s))
 			}

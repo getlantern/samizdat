@@ -21,7 +21,7 @@ import (
 // exchange and CONNECT, which CenKL (Ortwein et al., IEEE S&P 2027) found
 // distinguish HTTP/2 proxies from real TLS within the first few packets.
 // With shaping, client and server instead exchange the first
-// shapingRecords packets on a schedule of sizes and directions drawn from
+// shapingPackets packets on a schedule of sizes and directions drawn from
 // CenKL's model of real TLS (shapingmodel.go), as its ProxyShaper does:
 //
 //   - Both ends export keying material from the TLS session and seed the
@@ -53,11 +53,13 @@ import (
 //
 // Dynamic record sizing is off on both sides, so one Write is one record.
 // A record leaves as the packets it was planned from on a path whose MSS
-// is shapingMaxPacket, but TCP cuts at a smaller MSS where the path has one
-// and may coalesce records written back to back. Timing isn't shaped.
+// is shapingMaxPacket. On another path TCP cuts at that path's MSS: where
+// it's 1460 (no TCP timestamps), a record that spans packets leaves as full
+// 1460-byte packets, as a real server's would. TCP may also coalesce
+// records written back to back. Timing isn't shaped.
 
 const (
-	shapingRecords = 10
+	shapingPackets = 10
 	// tls13RecordOverhead is a TLS 1.3 record's header, AEAD tag and inner
 	// content type: 5 + 16 + 1 bytes for both AES-GCM and ChaCha20-Poly1305.
 	tls13RecordOverhead = 22
@@ -157,7 +159,7 @@ func shapingDraw(seed [32]byte) ([]int, error) {
 	rng := rand.New(rand.NewChaCha8(seed))
 	var sched []int
 	for range shapingTries {
-		sched = model.schedule(rng, shapingRecords, true)
+		sched = model.schedule(rng, shapingPackets, true)
 		if shapingScheduleFits(sched) {
 			return sched, nil
 		}
