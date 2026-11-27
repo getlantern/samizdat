@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -15,10 +16,16 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-// serveQuietH2 is an HTTP/2 server for one connection that sends nothing
-// after its SETTINGS except, if asked, a 200 for each CONNECT and replies to
-// pings.
-func serveQuietH2(conn net.Conn, answerConnects, ackPings bool) {
+// quietH2 is an HTTP/2 server for one connection that sends nothing after
+// its SETTINGS except what it's asked to: a 200 for each CONNECT, replies to
+// pings, and each DATA frame back on its stream.
+type quietH2 struct {
+	answerConnects, ackPings, echo bool
+	// pings counts the pings it has received.
+	pings atomic.Int32
+}
+
+func (q *quietH2) serve(conn net.Conn) {
 	preface := make([]byte, len(http2.ClientPreface))
 	if _, err := io.ReadFull(conn, preface); err != nil {
 		return
@@ -38,7 +45,7 @@ func serveQuietH2(conn net.Conn, answerConnects, ackPings bool) {
 				err = fr.WriteSettingsAck()
 			}
 		case *http2.HeadersFrame:
-			if !answerConnects {
+			if !q.answerConnects {
 				continue
 			}
 			var block bytes.Buffer
@@ -48,8 +55,16 @@ func serveQuietH2(conn net.Conn, answerConnects, ackPings bool) {
 				BlockFragment: block.Bytes(),
 				EndHeaders:    true,
 			})
+		case *http2.DataFrame:
+			if q.echo && len(f.Data()) > 0 {
+				err = fr.WriteData(f.StreamID, false, bytes.Clone(f.Data()))
+			}
 		case *http2.PingFrame:
-			if ackPings && !f.IsAck() {
+			if f.IsAck() {
+				continue
+			}
+			q.pings.Add(1)
+			if q.ackPings {
 				err = fr.WritePing(true, f.Data)
 			}
 		}
@@ -57,6 +72,12 @@ func serveQuietH2(conn net.Conn, answerConnects, ackPings bool) {
 			return
 		}
 	}
+}
+
+// serveQuietH2 serves one connection with a quietH2 that answers CONNECTs as
+// asked and acks pings as asked.
+func serveQuietH2(conn net.Conn, answerConnects, ackPings bool) {
+	(&quietH2{answerConnects: answerConnects, ackPings: ackPings}).serve(conn)
 }
 
 // tcpPair returns the two ends of a loopback TCP connection.
@@ -84,14 +105,20 @@ func tcpPair(t *testing.T) (net.Conn, net.Conn) {
 	return c1, c2
 }
 
-// openQuietTunnel opens a tunnel on a new transport whose server is
-// serveQuietH2.
+// openQuietTunnel opens a tunnel on a new transport whose server answers
+// CONNECTs and acks pings if asked.
 func openQuietTunnel(t *testing.T, ka keepAlive, ackPings bool) (*h2Transport, net.Conn) {
+	t.Helper()
+	return openTunnelOn(t, ka, &quietH2{answerConnects: true, ackPings: ackPings})
+}
+
+// openTunnelOn opens a tunnel on a new transport served by q.
+func openTunnelOn(t *testing.T, ka keepAlive, q *quietH2) (*h2Transport, net.Conn) {
 	t.Helper()
 	// A TCP pair, not net.Pipe: both ends write their SETTINGS before
 	// reading, which deadlocks on an unbuffered pipe.
 	c1, c2 := tcpPair(t)
-	go serveQuietH2(c2, true, ackPings)
+	go q.serve(c2)
 
 	tr, err := newH2Transport(c1, "example.com:443", 10, receiveWindows{}, ka)
 	if err != nil {
@@ -111,107 +138,150 @@ func openQuietTunnel(t *testing.T, ka keepAlive, ackPings bool) (*h2Transport, n
 	return tr, tunnel
 }
 
-// TestKeepAliveClosesSilentConnection: a connection whose server stops
-// answering must be closed by an unanswered ping, failing its tunnels and
-// taking no new ones, instead of looking alive until TCP gives up.
-func TestKeepAliveClosesSilentConnection(t *testing.T) {
-	ka := keepAlive{interval: 50 * time.Millisecond, timeout: 50 * time.Millisecond}
-	tr, tunnel := openQuietTunnel(t, ka, false)
+// waitUntil polls cond until it holds or 5 seconds pass.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal(what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestQuietConnectionIsNotPinged: a connection carrying a tunnel that sends
+// nothing is never pinged, however long it stays quiet. Pings on a clock
+// would keep a phone's radio awake and repeat at a fixed interval on an
+// otherwise silent connection.
+func TestQuietConnectionIsNotPinged(t *testing.T) {
+	ka := keepAlive{interval: 20 * time.Millisecond, timeout: 100 * time.Millisecond}
+	q := &quietH2{answerConnects: true, ackPings: true}
+	tr, _ := openTunnelOn(t, ka, q)
+
+	time.Sleep(300 * time.Millisecond) // fifteen intervals
+	if n := q.pings.Load(); n != 0 {
+		t.Fatalf("quiet connection was pinged %d times", n)
+	}
+	if tr.conn.closed.Load() {
+		t.Fatal("quiet connection was closed")
+	}
+}
+
+// TestAnsweredWriteIsNotPinged: a tunnel write that something is read after,
+// within the interval, starts no ping.
+func TestAnsweredWriteIsNotPinged(t *testing.T) {
+	ka := keepAlive{interval: 200 * time.Millisecond, timeout: time.Second}
+	q := &quietH2{answerConnects: true, ackPings: true, echo: true}
+	_, tunnel := openTunnelOn(t, ka, q)
+
+	for range 3 {
+		if _, err := tunnel.Write([]byte("hello")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(tunnel, make([]byte, 5)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(400 * time.Millisecond) // two intervals
+	if n := q.pings.Load(); n != 0 {
+		t.Fatalf("answered writes started %d pings", n)
+	}
+}
+
+// TestUnansweredWriteIsPingedOnce: a tunnel write with nothing read after it
+// starts one ping; its reply keeps the connection open and nothing follows
+// it until the next write.
+func TestUnansweredWriteIsPingedOnce(t *testing.T) {
+	ka := keepAlive{interval: 20 * time.Millisecond, timeout: 500 * time.Millisecond}
+	q := &quietH2{answerConnects: true, ackPings: true}
+	tr, tunnel := openTunnelOn(t, ka, q)
+
+	if _, err := tunnel.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "unanswered write never started a ping", func() bool { return q.pings.Load() > 0 })
+	time.Sleep(200 * time.Millisecond) // ten intervals
+	if n := q.pings.Load(); n != 1 {
+		t.Fatalf("one unanswered write started %d pings", n)
+	}
+	if tr.conn.closed.Load() {
+		t.Fatal("connection closed though its ping was answered")
+	}
+
+	// The next unanswered write starts the next ping.
+	if _, err := tunnel.Write([]byte("again")); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "second unanswered write never started a ping", func() bool { return q.pings.Load() == 2 })
+}
+
+// TestUnansweredPingClosesConnection: when a tunnel's write and the ping
+// after it both go unanswered, the connection is closed: its tunnels fail,
+// it takes no new ones, and what fails on it is marked conn-fatal so the
+// dial retries elsewhere, instead of looking alive until TCP gives up.
+func TestUnansweredPingClosesConnection(t *testing.T) {
+	ka := keepAlive{interval: 20 * time.Millisecond, timeout: 50 * time.Millisecond}
+	q := &quietH2{answerConnects: true}
+	tr, tunnel := openTunnelOn(t, ka, q)
 
 	readErr := make(chan error, 1)
 	go func() {
 		_, err := tunnel.Read(make([]byte, 1))
 		readErr <- err
 	}()
+	if _, err := tunnel.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case err := <-readErr:
 		if err == nil {
-			t.Fatal("read on a silent connection returned data")
+			t.Fatal("read on a dead connection returned data")
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("tunnel still open long after the ping went unanswered")
+		t.Fatal("tunnel still open long after its ping went unanswered")
 	}
-
-	// x/net fails the streams just before it closes the connection.
-	deadline := time.Now().Add(5 * time.Second)
-	for !tr.conn.closed.Load() {
-		if time.Now().After(deadline) {
-			t.Fatal("connection still open after the ping went unanswered")
-		}
-		time.Sleep(5 * time.Millisecond)
+	waitUntil(t, "connection still open after its ping went unanswered", tr.conn.closed.Load)
+	if !tr.pingLost.Load() {
+		t.Fatal("closed over an unanswered ping without marking it lost")
 	}
 	if tr.tryReserve() {
 		t.Fatal("transport with a closed connection still takes new streams")
 	}
-}
-
-// TestDialContextRetriesAfterLostPing: a CONNECT still waiting when its
-// connection's ping goes unanswered must be retried on a new connection.
-func TestDialContextRetriesAfterLostPing(t *testing.T) {
-	dead1, dead2 := tcpPair(t)
-	go serveQuietH2(dead2, false, false)
-	live1, live2 := tcpPair(t)
-	go serveQuietH2(live2, true, true)
-
-	ka := keepAlive{interval: 20 * time.Millisecond, timeout: 20 * time.Millisecond}
-	var transports []*h2Transport
-	for _, c := range []net.Conn{dead1, live1} {
-		tr, err := newH2Transport(c, "example.com:443", 10, receiveWindows{}, ka)
-		if err != nil {
-			t.Fatal(err)
-		}
-		transports = append(transports, tr)
-	}
-	created := 0
-	pool := newConnPool(10, time.Hour, func(context.Context) (*h2Transport, error) {
-		if created >= len(transports) {
-			return nil, fmt.Errorf("no transport left")
-		}
-		created++
-		return transports[created-1], nil
-	})
-	defer pool.close()
-	c := &Client{pool: pool}
-
-	dialCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, err := c.DialContext(dialCtx, "tcp", "example.org:443")
-	if err != nil {
-		t.Fatalf("DialContext: %v", err)
-	}
-	conn.Close()
-	if created != 2 {
-		t.Errorf("created %d transports, want 2", created)
+	if q.pings.Load() != 1 {
+		t.Fatalf("server saw %d pings, want 1", q.pings.Load())
 	}
 }
 
-// TestKeepAliveKeepsAnsweringConnection: a quiet connection whose server
-// answers pings stays open.
-func TestKeepAliveKeepsAnsweringConnection(t *testing.T) {
-	// The wait is several ping timeouts long, so the connection would close
-	// in it if the replies didn't count.
-	ka := keepAlive{interval: 20 * time.Millisecond, timeout: 100 * time.Millisecond}
-	tr, _ := openQuietTunnel(t, ka, true)
-	// The server sends nothing after the CONNECT reply but ping acks.
-	before := tr.conn.bytesRead.Load()
-
-	time.Sleep(500 * time.Millisecond)
-	if tr.conn.closed.Load() {
-		t.Fatal("connection closed though its pings were answered")
+// TestNoKeepAliveLeavesUnansweredWrite: with pings off, an unanswered write
+// starts nothing and the connection stays open.
+func TestNoKeepAliveLeavesUnansweredWrite(t *testing.T) {
+	q := &quietH2{answerConnects: true, ackPings: true}
+	tr, tunnel := openTunnelOn(t, keepAlive{}, q)
+	if _, err := tunnel.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
 	}
-	if tr.conn.bytesRead.Load() == before {
-		t.Fatal("no ping was answered")
-	}
-}
-
-// TestNoKeepAliveLeavesSilentConnection: with pings off, nothing is sent on a
-// quiet connection and it stays open.
-func TestNoKeepAliveLeavesSilentConnection(t *testing.T) {
-	tr, _ := openQuietTunnel(t, keepAlive{}, false)
 
 	time.Sleep(200 * time.Millisecond)
 	if tr.conn.closed.Load() {
 		t.Fatal("connection closed with keepalive off")
+	}
+	if n := q.pings.Load(); n != 0 {
+		t.Fatalf("keepalive off, but %d pings sent", n)
+	}
+}
+
+// TestSecondConnectionRefused: once x/net won't open streams on the
+// connection, the pool refuses instead of handing x/net a second one.
+func TestSecondConnectionRefused(t *testing.T) {
+	tr, _ := openQuietTunnel(t, keepAlive{}, true)
+	cc := tr.pool.clientConn()
+	if cc == nil {
+		t.Fatal("no ClientConn after a CONNECT")
+	}
+	cc.SetDoNotReuse()
+	if _, err := tr.pool.GetClientConn(nil, "example.com:443"); !errors.Is(err, errSecondDial) {
+		t.Fatalf("GetClientConn on a spent connection = %v, want errSecondDial", err)
 	}
 }
 
@@ -248,7 +318,7 @@ func TestPoolDropsTransportWithClosedConnection(t *testing.T) {
 func TestKeepAliveDefaults(t *testing.T) {
 	var c ClientConfig
 	c.applyDefaults()
-	if c.KeepAliveInterval != 15*time.Second || c.KeepAliveTimeout != 10*time.Second {
+	if c.KeepAliveInterval != 5*time.Second || c.KeepAliveTimeout != 10*time.Second {
 		t.Errorf("defaults = %v, %v", c.KeepAliveInterval, c.KeepAliveTimeout)
 	}
 	off := ClientConfig{KeepAliveInterval: -1}
@@ -287,25 +357,5 @@ func TestMarkPingLost(t *testing.T) {
 	}
 	if tr.markPingLost(nil) != nil {
 		t.Error("nil error was wrapped")
-	}
-}
-
-func TestPingJitter(t *testing.T) {
-	const d = 15 * time.Second
-	seen := map[time.Duration]bool{}
-	for range 1000 {
-		got := pingJitter(d)
-		if got < d*3/4 || got > d*5/4 {
-			t.Fatalf("pingJitter(%v) = %v, outside a quarter either way", d, got)
-		}
-		seen[got] = true
-	}
-	if len(seen) < 2 {
-		t.Error("pingJitter returned the same interval every time")
-	}
-	for _, d := range []time.Duration{0, -1} {
-		if got := pingJitter(d); got != d {
-			t.Errorf("pingJitter(%v) = %v, want it unchanged", d, got)
-		}
 	}
 }

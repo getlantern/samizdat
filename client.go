@@ -215,7 +215,7 @@ func (c *Client) createTransport(ctx context.Context) (*h2Transport, error) {
 		perStream: c.config.MaxReceiveBufferPerStream,
 		perConn:   c.config.MaxReceiveBufferPerConn,
 	}, keepAlive{
-		interval: pingJitter(c.config.KeepAliveInterval),
+		interval: c.config.KeepAliveInterval,
 		timeout:  c.config.KeepAliveTimeout,
 	})
 	if err != nil {

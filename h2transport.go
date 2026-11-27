@@ -2,12 +2,10 @@ package samizdat
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"net"
 	"net/http"
 	"sync"
@@ -23,7 +21,7 @@ import (
 var errSecondDial = errors.New("samizdat: HTTP/2 transport has only one connection")
 
 // errPingLost marks a CONNECT that failed because its connection's ping went
-// unanswered. x/net reports that with an error nothing can match.
+// unanswered and the transport closed the connection (see checkUnanswered).
 var errPingLost = errors.New("samizdat: connection lost: ping unanswered")
 
 // transportIDs numbers transports for logs.
@@ -85,9 +83,17 @@ type h2Transport struct {
 	// closeLogged is set once a close has been logged, so two paths closing
 	// it at once log it once.
 	closeLogged atomic.Bool
-	// pingLost is set when x/net closes the connection over an unanswered
-	// ping, before it fails the connection's streams.
+	// pingLost is set when the transport closes the connection over an
+	// unanswered ping, before x/net fails the connection's streams.
 	pingLost atomic.Bool
+	// pool holds the connection's x/net ClientConn, which pings go through.
+	pool *onePool
+	ka   keepAlive
+	// checkMu guards checkArmed and checkTimer, which runs checkUnanswered
+	// while a tunnel's write has had nothing read after it.
+	checkMu    sync.Mutex
+	checkArmed bool
+	checkTimer *time.Timer
 	// created is when the transport was created.
 	created time.Time
 }
@@ -101,6 +107,9 @@ type readTrackingConn struct {
 	// zero if none has.
 	lastRead  atomic.Int64
 	bytesRead atomic.Int64
+	// unanswered is when a tunnel first wrote something that nothing has
+	// been read since, in Unix nanoseconds, or zero once something has.
+	unanswered atomic.Int64
 	// readErr is the first error a read returned.
 	readErr atomic.Pointer[error]
 	// closed is set once anything closes the connection.
@@ -112,6 +121,7 @@ func (c *readTrackingConn) Read(b []byte) (int, error) {
 	if n > 0 {
 		c.bytesRead.Add(int64(n))
 		c.lastRead.Store(time.Now().UnixNano())
+		c.unanswered.Store(0)
 	}
 	// An error after the connection was closed here is that close's, and
 	// says nothing about why.
@@ -143,8 +153,9 @@ type receiveWindows struct {
 	perStream, perConn int
 }
 
-// keepAlive is when a transport pings a connection that has gone quiet, and
-// how long it waits for the reply. A zero or negative interval means no pings.
+// keepAlive is how long a transport lets a tunnel's write go with nothing
+// read on the connection before it pings it, and how long it waits for the
+// reply. A zero or negative interval means no pings.
 type keepAlive struct {
 	interval, timeout time.Duration
 }
@@ -161,10 +172,9 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, win rec
 	// for a stream slot instead, and any later dial is refused.
 	//
 	// x/net takes receive windows only from an http.Transport's HTTP2Config,
-	// through ConfigureTransports, which also gives the transport a pool that
-	// never dials; clearing ConnPool restores the default one, which dials
-	// through DialTLSContext.
-	var dialed atomic.Bool
+	// through ConfigureTransports. Its connection pool is replaced by onePool,
+	// which holds this one connection and refuses where x/net's own pool
+	// would dial another.
 	h2t, err := http2.ConfigureTransports(&http.Transport{HTTP2: &http.HTTP2Config{
 		MaxReceiveBufferPerStream:     win.perStream,
 		MaxReceiveBufferPerConnection: win.perConn,
@@ -172,26 +182,18 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, win rec
 	if err != nil {
 		return nil, err
 	}
-	h2t.ConnPool = nil
-	h2t.DialTLSContext = func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-		if dialed.Swap(true) {
-			return nil, errSecondDial
-		}
-		return conn, nil
-	}
+	pool := &onePool{h2t: h2t, conn: conn}
+	h2t.ConnPool = pool
 	h2t.AllowHTTP = false
 	h2t.DisableCompression = true
 	h2t.StrictMaxConcurrentStreams = true
-	// x/net closes the connection when a ping goes unanswered, which fails
-	// its streams and sends the next CONNECT to a new connection. It pings
-	// pooled connections with no streams too, until IdleTimeout closes them,
-	// so a dead one is gone before a CONNECT waits out connectAnswerTimeout
-	// on it. A ping sent during connection-start shaping rides the
-	// schedule's next record; it isn't held until the schedule ends.
-	if ka.interval > 0 {
-		h2t.ReadIdleTimeout = ka.interval
-		h2t.PingTimeout = ka.timeout
-	}
+	// No ReadIdleTimeout: x/net would ping every connection that reads
+	// nothing for that long, quiet tunnels and idle pooled connections
+	// alike, for as long as they stay open. On a phone that keeps the radio
+	// awake, and a small exchange at a fixed interval on an otherwise silent
+	// connection is easy to spot. The transport pings only when a tunnel's
+	// write has gone unanswered (see checkUnanswered). A dead idle connection
+	// is found by the next CONNECT, which connectAnswerTimeout bounds.
 
 	t := &h2Transport{
 		conn:        conn,
@@ -202,24 +204,124 @@ func newH2Transport(tlsConn net.Conn, serverAddr string, maxStreams int, win rec
 		maxStreams:  maxStreams,
 		id:          transportIDs.Add(1),
 		created:     time.Now(),
+		pool:        pool,
+		ka:          ka,
 	}
 	t.idleSince.Store(time.Now().UnixNano())
-	h2t.CountError = func(errType string) {
-		if errType == "conn_close_lost_ping" {
-			t.pingLost.Store(true)
-		}
-	}
 
 	return t, nil
 }
 
-// pingJitter varies d at random by up to a quarter either way, so a client's
-// connections don't all ping on one clock.
-func pingJitter(d time.Duration) time.Duration {
-	if d <= 0 {
-		return d
+// onePool is x/net's connection pool for a transport's one connection. It
+// hands out the connection while x/net would still open streams on it, and
+// otherwise refuses with errSecondDial, where x/net's own pool would dial a
+// second: that would get this same connection back and write a new preface
+// into the middle of its frames. Holding the ClientConn is also what lets
+// the transport ping it.
+type onePool struct {
+	h2t  *http2.Transport
+	conn net.Conn
+
+	mu sync.Mutex
+	cc *http2.ClientConn
+	// err is NewClientConn's, if it failed.
+	err error
+}
+
+func (p *onePool) GetClientConn(req *http.Request, addr string) (*http2.ClientConn, error) {
+	p.mu.Lock()
+	if p.cc == nil && p.err == nil {
+		p.cc, p.err = p.h2t.NewClientConn(p.conn)
 	}
-	return d - d/4 + rand.N(d/2+1)
+	cc, err := p.cc, p.err
+	p.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if !cc.ReserveNewRequest() {
+		return nil, errSecondDial
+	}
+	return cc, nil
+}
+
+// MarkDead does nothing: a dead ClientConn refuses ReserveNewRequest.
+func (p *onePool) MarkDead(*http2.ClientConn) {}
+
+// clientConn returns the connection's ClientConn, or nil before the first
+// CONNECT has created it.
+func (p *onePool) clientConn() *http2.ClientConn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cc
+}
+
+// noteWrite records that a tunnel wrote to the connection, and arms
+// checkUnanswered if it isn't already waiting on an earlier write.
+func (t *h2Transport) noteWrite() {
+	if t.ka.interval <= 0 || !t.conn.unanswered.CompareAndSwap(0, time.Now().UnixNano()) {
+		return
+	}
+	t.checkMu.Lock()
+	defer t.checkMu.Unlock()
+	t.armCheckLocked(t.ka.interval)
+}
+
+// armCheckLocked runs checkUnanswered after d, unless it's already due.
+// checkMu must be held.
+func (t *h2Transport) armCheckLocked(d time.Duration) {
+	if t.checkArmed {
+		return
+	}
+	t.checkArmed = true
+	if t.checkTimer == nil {
+		t.checkTimer = time.AfterFunc(d, t.checkUnanswered)
+	} else {
+		t.checkTimer.Reset(d)
+	}
+}
+
+// checkUnanswered pings the connection if a tunnel's write has had nothing
+// read after it for the keepalive interval, and closes the connection if the
+// reply doesn't come within the keepalive timeout. Pinging only then,
+// rather than on a clock, costs nothing on a quiet connection: the radio is
+// already awake for the write, and an idle connection sends nothing. It
+// finds a connection a network dropped silently when a tunnel needs it,
+// instead of when TCP gives up on its unacknowledged data, minutes later.
+func (t *h2Transport) checkUnanswered() {
+	t.checkMu.Lock()
+	since := t.conn.unanswered.Load()
+	if since == 0 || t.isClosed() {
+		t.checkArmed = false
+		t.checkMu.Unlock()
+		return
+	}
+	if wait := t.ka.interval - time.Since(time.Unix(0, since)); wait > 0 {
+		t.checkTimer.Reset(wait)
+		t.checkMu.Unlock()
+		return
+	}
+	// Still armed while the ping runs, so writes meanwhile don't start a
+	// second one.
+	t.checkMu.Unlock()
+
+	if cc := t.pool.clientConn(); cc != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), t.ka.timeout)
+		err := cc.Ping(ctx)
+		cancel()
+		if err != nil && !t.isClosed() {
+			t.pingLost.Store(true)
+			t.closeWithReason("ping unanswered")
+			return
+		}
+	}
+
+	t.checkMu.Lock()
+	defer t.checkMu.Unlock()
+	t.checkArmed = false
+	// The reply cleared unanswered; a write since then sets it again.
+	if t.conn.unanswered.Load() != 0 && !t.isClosed() {
+		t.armCheckLocked(t.ka.interval)
+	}
 }
 
 // openReserved issues an HTTP/2 CONNECT request to open a tunnel to the
@@ -646,6 +748,9 @@ func (s *h2StreamRWC) Read(b []byte) (int, error) {
 }
 
 func (s *h2StreamRWC) Write(b []byte) (int, error) {
+	if len(b) > 0 {
+		s.transport.noteWrite()
+	}
 	return s.writer.Write(b)
 }
 
